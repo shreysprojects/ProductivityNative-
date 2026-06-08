@@ -30,8 +30,14 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
+# env files — never commit secrets
+.env
+.env.*
 .env*.local
+
+# Supabase CLI local state (project ref, pooler url, org id — not secrets, but
+# infra metadata that shouldn't be committed)
+supabase/.temp/
 
 # typescript
 *.tsbuildinfo

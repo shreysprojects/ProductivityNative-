@@ -1,0 +1,115 @@
+import { View, Text, Pressable, StyleSheet } from 'react-native'
+import { Tabs, Redirect } from 'expo-router'
+import { useAuth } from '../../lib/AuthContext'
+import { useTheme } from '../../lib/ThemeContext'
+import { Ionicons } from '@expo/vector-icons'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import SessionBanner from '../../components/SessionBanner'
+import ProductivityModal from '../../components/ProductivityModal'
+
+const TABS = [
+  { name: 'index',    label: 'Routines',  icon: 'today-outline',      iconActive: 'today' },
+  { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant' },
+  { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass' },
+  { name: 'calendar', label: 'Calendar',  icon: 'calendar-outline',    iconActive: 'calendar' },
+  { name: 'settings', label: 'Profile',   icon: 'person-outline',      iconActive: 'person' },
+]
+
+function CustomTabBar({ state, navigation, theme }) {
+  const insets = useSafeAreaInsets()
+
+  return (
+    <View style={{ backgroundColor: theme.tabBar }}>
+      <SessionBanner />
+    <View style={[tb.bar, {
+      backgroundColor: theme.tabBar,
+      paddingBottom: Math.max(insets.bottom, 10),
+    }]}>
+      {TABS.map((tab) => {
+        const routeIndex = state.routes.findIndex(r => r.name === tab.name)
+        if (routeIndex === -1) return null
+        const focused = state.index === routeIndex
+
+        return (
+          <Pressable
+            key={tab.name}
+            style={tb.item}
+            onPress={() => { if (!focused) navigation.navigate(tab.name) }}
+          >
+            <View style={[tb.pill, focused && {
+                backgroundColor: theme.accent + '22',
+                borderColor: theme.accent,
+              }]}>
+              <Ionicons
+                name={focused ? tab.iconActive : tab.icon}
+                size={23}
+                color={focused ? theme.accent : theme.muted}
+              />
+            </View>
+            <Text style={[tb.label, { color: focused ? theme.accent : theme.muted }]}>
+              {tab.label}
+            </Text>
+          </Pressable>
+        )
+      })}
+    </View>
+    </View>
+  )
+}
+
+const tb = StyleSheet.create({
+  bar: {
+    flexDirection: 'row',
+    paddingTop: 10,
+    elevation: 0,
+  },
+  item: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 5,
+  },
+  pill: {
+    width: 56,
+    height: 36,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  label: {
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.2,
+  },
+})
+
+export default function TabsLayout() {
+  const { user, loading, profile, profileLoading } = useAuth()
+  const { theme } = useTheme()
+
+  if (loading) return null
+  if (!user) return <Redirect href="/(auth)/login" />
+  if (!profileLoading && !profile) return <Redirect href="/(auth)/complete-profile" />
+
+  return (
+    <>
+    <ProductivityModal />
+    <Tabs
+      tabBar={(props) => <CustomTabBar {...props} theme={theme} />}
+      screenOptions={{
+        headerStyle: { backgroundColor: theme.header },
+        headerShadowVisible: false,
+        headerTintColor: theme.text,
+        headerTitleStyle: { fontWeight: '700', fontSize: 17 },
+      }}
+    >
+      <Tabs.Screen name="index"    options={{ title: 'My Routines' }} />
+      <Tabs.Screen name="meals"    options={{ title: 'Nutrition' }} />
+      <Tabs.Screen name="calendar" options={{ title: 'Calendar' }} />
+      <Tabs.Screen name="settings" options={{ title: 'Profile' }} />
+      <Tabs.Screen name="explore"  options={{ title: 'Explore Routines' }} />
+    </Tabs>
+    </>
+  )
+}
