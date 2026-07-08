@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert } from 'react-native'
 import { Image } from 'expo-image'
 import { router, useLocalSearchParams } from 'expo-router'
+import * as ImagePicker from 'expo-image-picker'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
 import { getWorkoutPlan, getLastWorkoutLog, saveWorkoutLog, today } from '../lib/storage'
+import { saveFitPhoto } from '../lib/photoStorage'
 
 const COLOR_DEFAULT = '#2b7fff'
 const COL = { set: 40, prev: 76, check: 46 }
@@ -41,6 +43,7 @@ export default function WorkoutRun() {
   const [elapsedMs,    setElapsedMs]    = useState(0)
   const [overviewOpen, setOverviewOpen] = useState(false)
   const [timeModes,    setTimeModes]    = useState({}) // exerciseIdx → true=time, false=weight
+  const [progressPhoto, setProgressPhoto] = useState(null)
 
   const intervalRef  = useRef(null)
   const elapsedRef   = useRef(null)
@@ -211,6 +214,31 @@ export default function WorkoutRun() {
         exercises: finalLog,
       })
     }
+    Alert.alert(
+      '📸 Progress photo?',
+      'Capture how you look today — watch your transformation build day by day on the fitness calendar.',
+      [
+        { text: 'Not today', style: 'cancel' },
+        { text: 'Take photo', onPress: takeProgressPhoto },
+      ]
+    )
+  }
+
+  async function takeProgressPhoto() {
+    if (!user) return
+    const perm = await ImagePicker.requestCameraPermissionsAsync()
+    if (!perm.granted) {
+      Alert.alert('Camera access needed', 'Allow camera access in your device settings to take progress photos.')
+      return
+    }
+    const result = await ImagePicker.launchCameraAsync({ quality: 0.6 })
+    if (result.canceled || !result.assets?.[0]?.uri) return
+    try {
+      const saved = await saveFitPhoto(user.id, today(), result.assets[0].uri)
+      setProgressPhoto(saved)
+    } catch {
+      Alert.alert('Could not save photo', 'Please try again.')
+    }
   }
 
   // ── Loading ──────────────────────────────────────────────────────────────
@@ -317,6 +345,22 @@ export default function WorkoutRun() {
               </View>
             )
           })}
+          {progressPhoto ? (
+            <View style={s.photoCard}>
+              <Image source={{ uri: progressPhoto }} style={s.photoPreview} contentFit="cover" />
+              <Pressable style={s.photoRetake} onPress={takeProgressPhoto}>
+                <Text style={s.photoRetakeText}>↻ Retake</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <Pressable style={s.photoBtn} onPress={takeProgressPhoto}>
+              <Text style={{ fontSize: 20 }}>📸</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={s.photoBtnTitle}>Take a progress photo</Text>
+                <Text style={s.photoBtnSub}>See your transformation on the fitness calendar</Text>
+              </View>
+            </Pressable>
+          )}
           <Pressable style={s.finishBtn} onPress={() => router.back()}>
             <Text style={s.finishBtnText}>← Back to Fitness</Text>
           </Pressable>
@@ -334,7 +378,7 @@ export default function WorkoutRun() {
   const isTimedExercise = timeModes[exerciseIdx] ?? false
 
   return (
-    <View style={s.page}>
+    <KeyboardAvoidingView style={s.page} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={s.exContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
         {/* Top row: exit | timer/rest | settings */}
@@ -624,7 +668,7 @@ export default function WorkoutRun() {
           </View>
         </View>
       </Modal>
-    </View>
+    </KeyboardAvoidingView>
   )
 }
 
@@ -842,6 +886,18 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
     alignItems: 'center', width: '100%', marginTop: 16,
   },
   finishBtnText: { color: '#fff', fontWeight: '800', fontSize: 16 },
+
+  photoBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, width: '100%',
+    borderRadius: 16, borderWidth: 1.5, borderStyle: 'dashed', borderColor: COLOR + '66',
+    backgroundColor: COLOR + '0d', padding: 14, marginTop: 16,
+  },
+  photoBtnTitle: { color: theme.text, fontWeight: '700', fontSize: 15 },
+  photoBtnSub: { color: theme.subtext, fontSize: 12, marginTop: 2 },
+  photoCard: { width: '100%', marginTop: 16, alignItems: 'center' },
+  photoPreview: { width: '100%', height: 260, borderRadius: 16 },
+  photoRetake: { paddingVertical: 10 },
+  photoRetakeText: { color: COLOR, fontWeight: '700', fontSize: 13 },
 
   // Overview bottom sheet
   ovOverlay: { flex: 1, justifyContent: 'flex-end' },

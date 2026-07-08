@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { View, Text, Pressable, StyleSheet } from 'react-native'
 import { Tabs, Redirect } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
@@ -6,17 +7,20 @@ import { Ionicons } from '@expo/vector-icons'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import SessionBanner from '../../components/SessionBanner'
 import ProductivityModal from '../../components/ProductivityModal'
+import { getSections, onSectionsChange, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 
 const TABS = [
-  { name: 'index',    label: 'Routines',  icon: 'today-outline',      iconActive: 'today' },
-  { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant' },
-  { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass' },
-  { name: 'calendar', label: 'Calendar',  icon: 'calendar-outline',    iconActive: 'calendar' },
+  { name: 'index',    label: 'Routines',  icon: 'today-outline',       iconActive: 'today' },
+  { name: 'habits',   label: 'Habits',    icon: 'flame-outline',       iconActive: 'flame' },
+  { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant', sectionKey: 'tabMeals' },
+  { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass',    sectionKey: 'tabExplore' },
+  { name: 'calendar', label: 'Calendar',  icon: 'calendar-outline',    iconActive: 'calendar',   sectionKey: 'tabCalendar' },
   { name: 'settings', label: 'Profile',   icon: 'person-outline',      iconActive: 'person' },
 ]
 
-function CustomTabBar({ state, navigation, theme }) {
+function CustomTabBar({ state, navigation, theme, sections }) {
   const insets = useSafeAreaInsets()
+  const visibleTabs = TABS.filter(t => !t.sectionKey || sections[t.sectionKey] !== false)
 
   return (
     <View style={{ backgroundColor: theme.tabBar }}>
@@ -25,7 +29,7 @@ function CustomTabBar({ state, navigation, theme }) {
       backgroundColor: theme.tabBar,
       paddingBottom: Math.max(insets.bottom, 10),
     }]}>
-      {TABS.map((tab) => {
+      {visibleTabs.map((tab) => {
         const routeIndex = state.routes.findIndex(r => r.name === tab.name)
         if (routeIndex === -1) return null
         const focused = state.index === routeIndex
@@ -87,6 +91,13 @@ const tb = StyleSheet.create({
 export default function TabsLayout() {
   const { user, loading, profile, profileLoading } = useAuth()
   const { theme } = useTheme()
+  const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
+
+  useEffect(() => {
+    if (!user) return
+    getSections(user.id).then(setSections)
+    return onSectionsChange(setSections)
+  }, [user])
 
   if (loading) return null
   if (!user) return <Redirect href="/(auth)/login" />
@@ -96,7 +107,7 @@ export default function TabsLayout() {
     <>
     <ProductivityModal />
     <Tabs
-      tabBar={(props) => <CustomTabBar {...props} theme={theme} />}
+      tabBar={(props) => <CustomTabBar {...props} theme={theme} sections={sections} />}
       screenOptions={{
         headerStyle: { backgroundColor: theme.header },
         headerShadowVisible: false,
@@ -105,6 +116,7 @@ export default function TabsLayout() {
       }}
     >
       <Tabs.Screen name="index"    options={{ title: 'My Routines' }} />
+      <Tabs.Screen name="habits"   options={{ title: 'Habits' }} />
       <Tabs.Screen name="meals"    options={{ title: 'Nutrition' }} />
       <Tabs.Screen name="calendar" options={{ title: 'Calendar' }} />
       <Tabs.Screen name="settings" options={{ title: 'Profile' }} />

@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import {
   Modal, View, Text, TextInput, Pressable, ActivityIndicator,
-  StyleSheet, SafeAreaView, ScrollView,
+  StyleSheet, SafeAreaView, ScrollView, KeyboardAvoidingView, Platform,
 } from 'react-native'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import { MACRO_GROUPS } from './AddMealModal'
@@ -148,7 +148,7 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
 
   return (
     <Modal visible animationType="slide" onRequestClose={onClose}>
-      <View style={{ flex: 1, backgroundColor: '#000' }}>
+      <KeyboardAvoidingView style={{ flex: 1, backgroundColor: '#000' }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         {!scanned && (
           <CameraView
             style={StyleSheet.absoluteFill}
@@ -322,7 +322,7 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
             </Pressable>
           </View>
         )}
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   )
 }

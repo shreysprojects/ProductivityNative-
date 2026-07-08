@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   View, Text, Pressable, StyleSheet, Modal, ScrollView,
-  TextInput, ActivityIndicator, Alert, Platform,
+  TextInput, ActivityIndicator, Alert, Platform, KeyboardAvoidingView,
 } from 'react-native'
 import { useAuth } from '../lib/AuthContext'
 import { supabase } from '../lib/supabase'
@@ -150,7 +150,7 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <View style={m.overlay}>
+      <KeyboardAvoidingView style={m.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <Pressable style={m.bg} onPress={onClose} />
         <View style={[m.sheet, { backgroundColor: theme.card }]}>
           <Pressable onPress={onClose} hitSlop={16}>
@@ -290,7 +290,7 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
           )}
 
         </View>
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   )
 }

@@ -12,10 +12,12 @@ import {
 } from '../lib/goals'
 import { saveUserGoals } from '../lib/goalsStorage'
 import { saveGymSplit } from '../lib/storage'
+import { saveSections, FOCUS_PRESETS } from '../lib/sectionsStorage'
+import { seedStarterWorkouts } from '../lib/starterWorkouts'
 import { muscleColor, muscleTextColor } from '../lib/splitData'
 
 const ACCENT = '#6366f1'
-const TOTAL_STEPS = 5  // steps 1–5; step 0 = welcome (no bar)
+const TOTAL_STEPS = 6  // steps 1–6; step 0 = welcome (no bar)
 const DAY_ABBR = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -81,7 +83,10 @@ export default function Onboarding() {
   const [step, setStep] = useState(0)
   const [saving, setSaving] = useState(false)
 
-  // Step 1: body stats
+  // Step 1: focus (controls which app sections are visible)
+  const [focus, setFocus] = useState(null)
+
+  // Step 2: body stats
   const [weightVal, setWeightVal]   = useState('')
   const [weightUnit, setWeightUnit] = useState(appUnit === 'kg' ? 'kg' : 'lbs')
   const [heightMode, setHeightMode] = useState('ft')  // 'ft' | 'cm'
@@ -164,6 +169,7 @@ export default function Onboarding() {
   async function handleSkip() {
     if (!user || saving) return
     setSaving(true)
+    await saveSections(user.id, FOCUS_PRESETS[focus ?? 'all'])
     await saveUserGoals(user.id, { onboardingDone: true, fitnessGoal: 'none', skipped: true })
     setSaving(false)
     router.replace('/(tabs)')
@@ -172,6 +178,7 @@ export default function Onboarding() {
   async function handleNoGoal() {
     if (!user || saving) return
     setSaving(true)
+    await saveSections(user.id, FOCUS_PRESETS[focus ?? 'all'])
     await saveUserGoals(user.id, { onboardingDone: true, fitnessGoal: 'none' })
     setSaving(false)
     router.replace('/(tabs)')
@@ -191,8 +198,17 @@ export default function Onboarding() {
       carbs: finalCarbs, fat: finalFat,
       isCustom, onboardingDone: true,
     }
+    await saveSections(user.id, FOCUS_PRESETS[focus ?? 'all'])
     await saveUserGoals(user.id, goals)
-    if (split) await saveGymSplit(user.id, split).catch(() => {})
+    if (split) {
+      await saveGymSplit(user.id, split).catch(() => {})
+      // Pre-build starter workout plans matched to their goal, then land
+      // the new user directly on the Fitness routine to see them.
+      await seedStarterWorkouts(user.id, split, fitnessGoal)
+      setSaving(false)
+      router.replace('/routine/Fitness')
+      return
+    }
     setSaving(false)
     router.replace('/(tabs)')
   }
@@ -226,6 +242,42 @@ export default function Onboarding() {
           </Pressable>
         </View>
       </View>
+    )
+  }
+
+  function renderFocus() {
+    const opts = [
+      { key: 'habits',       emoji: '🎯', label: 'Routines & habits',     sub: 'Daily routines, habit tracking, weekly goals' },
+      { key: 'fitness',      emoji: '💪', label: 'Fitness & nutrition',   sub: 'Workouts, gym splits, meals and macros' },
+      { key: 'productivity', emoji: '📚', label: 'Productivity',          sub: 'Deep work sessions, planning, weekly goals' },
+      { key: 'all',          emoji: '✨', label: 'A bit of everything',   sub: 'Show me all the features' },
+    ]
+    return (
+      <ScrollView contentContainerStyle={ob.stepContent}>
+        <Text style={[ob.stepTitle, { color: theme.text }]}>What do you want to focus on?</Text>
+        <Text style={[ob.stepSub, { color: theme.subtext }]}>
+          We'll start you with just the sections that matter to you. You can turn anything on later in settings.
+        </Text>
+        <View style={{ gap: 10, marginTop: 8 }}>
+          {opts.map(opt => (
+            <OptionCard
+              key={opt.key}
+              emoji={opt.emoji}
+              label={opt.label}
+              sub={opt.sub}
+              selected={focus === opt.key}
+              onPress={() => setFocus(opt.key)}
+              theme={theme}
+            />
+          ))}
+        </View>
+        <Pressable
+          style={[ob.primaryBtn, { backgroundColor: ACCENT, marginTop: 24 }, !focus && { opacity: 0.4 }]}
+          onPress={() => focus && next()}
+        >
+          <Text style={ob.primaryBtnText}>Continue  →</Text>
+        </Pressable>
+      </ScrollView>
     )
   }
 
@@ -626,10 +678,10 @@ export default function Onboarding() {
           onPress={handleFinish}
           disabled={saving}
         >
-          <Text style={ob.primaryBtnText}>{saving ? 'Saving…' : 'Start Using the App  →'}</Text>
+          <Text style={ob.primaryBtnText}>{saving ? 'Building your starter workouts…' : 'Start Using the App  →'}</Text>
         </Pressable>
 
-        <Pressable style={ob.editGoalsBtn} onPress={() => setStep(1)}>
+        <Pressable style={ob.editGoalsBtn} onPress={() => setStep(2)}>
           <Text style={[ob.editGoalsBtnText, { color: theme.subtext }]}>← Edit my goals</Text>
         </Pressable>
       </ScrollView>
@@ -647,11 +699,12 @@ export default function Onboarding() {
         </View>
       )}
       {step === 0 && renderWelcome()}
-      {step === 1 && renderBodyStats()}
-      {step === 2 && renderFitnessGoal()}
-      {step === 3 && renderActivityLevel()}
-      {step === 4 && renderWorkoutDays()}
-      {step === 5 && renderResults()}
+      {step === 1 && renderFocus()}
+      {step === 2 && renderBodyStats()}
+      {step === 3 && renderFitnessGoal()}
+      {step === 4 && renderActivityLevel()}
+      {step === 5 && renderWorkoutDays()}
+      {step === 6 && renderResults()}
     </SafeAreaView>
   )
 }
