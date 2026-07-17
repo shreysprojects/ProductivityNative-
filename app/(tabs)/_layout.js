@@ -11,11 +11,12 @@ import { getSections, onSectionsChange, DEFAULT_SECTIONS } from '../../lib/secti
 
 const TABS = [
   { name: 'index',    label: 'Routines',  icon: 'today-outline',       iconActive: 'today' },
-  { name: 'habits',   label: 'Habits',    icon: 'flame-outline',       iconActive: 'flame' },
-  { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant', sectionKey: 'tabMeals' },
-  { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass',    sectionKey: 'tabExplore' },
+  // HIDDEN for now (not deleted) — restore by uncommenting:
+  // { name: 'habits',   label: 'Habits',    icon: 'flame-outline',       iconActive: 'flame' },
+  // { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant', sectionKey: 'tabMeals' },
+  // { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass',    sectionKey: 'tabExplore' },
   { name: 'calendar', label: 'Calendar',  icon: 'calendar-outline',    iconActive: 'calendar',   sectionKey: 'tabCalendar' },
-  { name: 'settings', label: 'Profile',   icon: 'person-outline',      iconActive: 'person' },
+  { name: 'settings', label: 'Settings',  icon: 'settings-outline',    iconActive: 'settings' },
 ]
 
 function CustomTabBar({ state, navigation, theme, sections }) {
@@ -119,7 +120,7 @@ export default function TabsLayout() {
       <Tabs.Screen name="habits"   options={{ title: 'Habits' }} />
       <Tabs.Screen name="meals"    options={{ title: 'Nutrition' }} />
       <Tabs.Screen name="calendar" options={{ title: 'Calendar' }} />
-      <Tabs.Screen name="settings" options={{ title: 'Profile' }} />
+      <Tabs.Screen name="settings" options={{ title: 'Settings' }} />
       <Tabs.Screen name="explore"  options={{ title: 'Explore Routines' }} />
     </Tabs>
     </>

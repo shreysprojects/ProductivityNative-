@@ -9,8 +9,8 @@ import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
-import { getRoutineNames, getRoutineTemplate, getTodayRun, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries } from '../../lib/storage'
-import { getSections, saveSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import { getRoutineNames, getRoutineTemplate, getTodayRun, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineLabels, saveRoutineLabels, getRoutineLabelMap, saveRoutineLabelMap } from '../../lib/storage'
+import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
 import { useProductivity } from '../../lib/ProductivityContext'
@@ -473,7 +473,7 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
   )
 }
 
-function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete }) {
+function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete, routineLabels = [], onOpenLabels }) {
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isRunning = !isHidden && run && !run.finished
@@ -537,6 +537,11 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
             ]}>
               {statusText}
             </Text>
+            {!isHidden && !!settings?.description && (
+              <Text style={[s.cardDesc, { color: theme.muted }]} numberOfLines={2}>
+                {settings.description}
+              </Text>
+            )}
             {!isHidden && timeRange && (
               <Text style={[s.cardTime, { color: theme.muted }]}>🕐 {timeRange}</Text>
             )}
@@ -580,6 +585,31 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
             )}
           </View>
         </View>
+
+        {!isHidden && (
+          <View style={s.labelChipsRow}>
+            {routineLabels.map(l => (
+              <Pressable
+                key={l.id}
+                style={[s.labelChip, { backgroundColor: l.color + '1c', borderColor: l.color + '55' }]}
+                onPress={onOpenLabels}
+                hitSlop={4}
+              >
+                <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
+                <Text style={[s.labelChipText, { color: l.color }]}>{l.name}</Text>
+              </Pressable>
+            ))}
+            <Pressable
+              style={[s.labelAddChip, { borderColor: theme.cardBorder }]}
+              onPress={onOpenLabels}
+              hitSlop={6}
+            >
+              <Text style={[s.labelChipText, { color: theme.muted }]}>
+                {routineLabels.length ? '＋' : '＋ Label'}
+              </Text>
+            </Pressable>
+          </View>
+        )}
 
         {showSplit && (
           <View style={s.splitPillsRow}>
@@ -1024,20 +1054,24 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
 // ── Main screen ───────────────────────────────────────────────────────────
 
 export default function RoutinesScreen() {
-  const { user, profile, signOut } = useAuth()
-  const { theme, toggleDark, unit, toggleUnit } = useTheme()
+  const { user, profile } = useAuth()
+  const { theme } = useTheme()
   const navigation = useNavigation()
   const [routines, setRoutines] = useState([])
   const [streak, setStreak] = useState({ current: 0, longest: 0 })
   const [routineStreaks, setRoutineStreaks] = useState({})
   const [loading, setLoading] = useState(true)
   const [todayMuscle, setTodayMuscle] = useState(null)
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [hiddenSet, setHiddenSet] = useState(new Set())
   const [activeTab, setActiveTab] = useState('daily')
   const [weeklyRoutines, setWeeklyRoutines] = useState([])
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
+  const [labels, setLabels] = useState([])
+  const [labelMap, setLabelMap] = useState({})
+  const [labelModalFor, setLabelModalFor] = useState(null) // routine name being labeled
+  const [editingLabelId, setEditingLabelId] = useState(null)
+  const [editingLabelName, setEditingLabelName] = useState('')
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -1046,26 +1080,22 @@ export default function RoutinesScreen() {
       headerTitle: () => (
         <Text style={{ fontSize: 17, fontWeight: '800', color: theme.text, letterSpacing: -0.3 }}>My Routines</Text>
       ),
-      headerRight: () => (
-        <Pressable
-          onPress={() => setSettingsOpen(true)}
-          style={{ marginRight: 16, padding: 6, borderRadius: 10, backgroundColor: theme.isDark ? '#1e1e38' : '#f0f0f8' }}
-        >
-          <Text style={{ fontSize: 18 }}>⚙️</Text>
-        </Pressable>
-      ),
     })
   }, [navigation, theme])
 
   const load = useCallback(async () => {
     if (!user) return
-    const [names, hiddenArr, str, split, rStreaks] = await Promise.all([
+    const [names, hiddenArr, str, split, rStreaks, lbls, lblMap] = await Promise.all([
       getRoutineNames(user.id),
       getHiddenDefaults(user.id),
       getStreak(user.id),
       getGymSplit(user.id),
       getRoutineStreaks(user.id),
+      getRoutineLabels(user.id),
+      getRoutineLabelMap(user.id),
     ])
+    setLabels(lbls)
+    setLabelMap(lblMap)
     const [templates, runs, settingsArr] = await Promise.all([
       Promise.all(names.map(n => getRoutineTemplate(user.id, n))),
       Promise.all(names.map(n => getTodayRun(user.id, n))),
@@ -1096,11 +1126,33 @@ export default function RoutinesScreen() {
     setLoading(false)
   }, [user])
 
-  async function toggleSection(name) {
-    const next = { ...sections, [name]: !sections[name] }
-    setSections(next)
-    if (!next.weekly && activeTab === 'weekly') setActiveTab('daily')
-    await saveSections(user.id, next)
+  async function toggleRoutineLabel(routineName, labelId) {
+    const current = labelMap[routineName] ?? []
+    const next = {
+      ...labelMap,
+      [routineName]: current.includes(labelId)
+        ? current.filter(id => id !== labelId)
+        : [...current, labelId],
+    }
+    setLabelMap(next)
+    await saveRoutineLabelMap(user.id, next)
+  }
+
+  async function saveLabelRename() {
+    const clean = editingLabelName.trim()
+    if (clean) {
+      const next = labels.map(l => l.id === editingLabelId ? { ...l, name: clean } : l)
+      setLabels(next)
+      await saveRoutineLabels(user.id, next)
+    }
+    setEditingLabelId(null)
+    setEditingLabelName('')
+  }
+
+  function closeLabelModal() {
+    setLabelModalFor(null)
+    setEditingLabelId(null)
+    setEditingLabelName('')
   }
 
   async function handleHide(name) {
@@ -1239,7 +1291,8 @@ export default function RoutinesScreen() {
                 </Text>
               </View>
             )}
-            {sections.productivity && <ProductivityCard theme={theme} userId={user?.id} />}
+            {/* HIDDEN for now (not deleted) — restore by removing `false &&` */}
+            {false && sections.productivity && <ProductivityCard theme={theme} userId={user?.id} />}
             {routines.length > 1 && (
               <Pressable
                 onPress={() => router.push('/reorder-routines')}
@@ -1263,6 +1316,8 @@ export default function RoutinesScreen() {
                 onHide={() => handleHide(name)}
                 onUnhide={() => handleUnhide(name)}
                 onDelete={() => handleDeleteCustom(name)}
+                routineLabels={(labelMap[name] ?? []).map(id => labels.find(l => l.id === id)).filter(Boolean)}
+                onOpenLabels={() => setLabelModalFor(name)}
               />
             ))}
             <Pressable
@@ -1274,7 +1329,8 @@ export default function RoutinesScreen() {
           </>
         ) : (
           <>
-            <WeeklyGoalsList userId={user.id} theme={theme} />
+            {/* HIDDEN for now (not deleted) — restore by removing `false &&` */}
+            {false && <WeeklyGoalsList userId={user.id} theme={theme} />}
             {weeklyRoutines.map((routine, i) => (
               <WeeklyRoutineCard
                 key={routine.id}
@@ -1298,112 +1354,82 @@ export default function RoutinesScreen() {
 
       </ScrollView>
 
-      <Modal
-        visible={settingsOpen}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setSettingsOpen(false)}
-      >
-        <View style={s.settingsOverlay}>
-          <Pressable style={s.settingsBg} onPress={() => setSettingsOpen(false)} />
-          <View style={[s.settingsSheet, { backgroundColor: theme.card }]}>
-            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
-            <Text style={[s.settingsTitle, { color: theme.text }]}>Settings</Text>
-
-            <View style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
-              <View style={s.settingsRowLeft}>
-                <Text style={s.settingsRowIcon}>🌙</Text>
-                <Text style={[s.settingsRowLabel, { color: theme.text }]}>Dark Mode</Text>
-              </View>
-              <Switch
-                value={theme.isDark}
-                onValueChange={toggleDark}
-                trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
-                thumbColor="#ffffff"
-                ios_backgroundColor="#e0e0f0"
-              />
-            </View>
-
-            <View style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
-              <View style={s.settingsRowLeft}>
-                <Text style={s.settingsRowIcon}>⚖️</Text>
-                <Text style={[s.settingsRowLabel, { color: theme.text }]}>Weight Unit</Text>
-              </View>
-              <Pressable
-                onPress={toggleUnit}
-                style={[s.unitPill, { backgroundColor: theme.isDark ? '#28284a' : '#ebebf5' }]}
-              >
-                <Text style={[s.unitPillText, { color: theme.accent }]}>{unit.toUpperCase()}</Text>
-              </Pressable>
-            </View>
-
-            <Text style={[s.settingsGroupLabel, { color: theme.muted }]}>SECTIONS</Text>
-
-            {[
-              ['weekly', '🗓️', 'Weekly tab'],
-              ['productivity', '📚', 'Deep Work card'],
-            ].map(([key, icon, label]) => (
-              <View key={key} style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
-                <View style={s.settingsRowLeft}>
-                  <Text style={s.settingsRowIcon}>{icon}</Text>
-                  <Text style={[s.settingsRowLabel, { color: theme.text }]}>{label}</Text>
-                </View>
-                <Switch
-                  value={sections[key]}
-                  onValueChange={() => toggleSection(key)}
-                  trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
-                  thumbColor="#ffffff"
-                  ios_backgroundColor="#e0e0f0"
-                />
-              </View>
-            ))}
-
-            <Text style={[s.settingsGroupLabel, { color: theme.muted }]}>BOTTOM TABS</Text>
-
-            {[
-              ['tabMeals', '🍽️', 'Nutrition'],
-              ['tabCalendar', '📅', 'Calendar'],
-              ['tabExplore', '🧭', 'Explore'],
-            ].map(([key, icon, label]) => (
-              <View key={key} style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
-                <View style={s.settingsRowLeft}>
-                  <Text style={s.settingsRowIcon}>{icon}</Text>
-                  <Text style={[s.settingsRowLabel, { color: theme.text }]}>{label}</Text>
-                </View>
-                <Switch
-                  value={sections[key] !== false}
-                  onValueChange={() => toggleSection(key)}
-                  trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
-                  thumbColor="#ffffff"
-                  ios_backgroundColor="#e0e0f0"
-                />
-              </View>
-            ))}
-
-            <Pressable
-              style={s.signOutRow}
-              onPress={() => { setSettingsOpen(false); signOut() }}
-            >
-              <Text style={s.settingsRowIcon}>🚪</Text>
-              <Text style={s.signOutText}>Sign Out</Text>
-            </Pressable>
-
-            <Pressable
-              style={[s.closeBtn, { borderColor: theme.cardBorder }]}
-              onPress={() => setSettingsOpen(false)}
-            >
-              <Text style={[s.closeBtnText, { color: theme.subtext }]}>Close</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
-
       <WeeklyRoutineModal
         visible={weeklyModalOpen}
         theme={theme}
         onClose={() => setWeeklyModalOpen(false)}
         onSave={handleWeeklyAddRoutine}
       />
+
+      {/* Label picker — assign labels to a routine, rename labels inline */}
+      <Modal
+        visible={!!labelModalFor}
+        transparent
+        animationType="slide"
+        onRequestClose={closeLabelModal}
+      >
+        <KeyboardAvoidingView style={s.settingsOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <Pressable style={s.settingsBg} onPress={closeLabelModal} />
+          <View style={[s.labelSheet, { backgroundColor: theme.card }]}>
+            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+            <Text style={[s.labelSheetTitle, { color: theme.text }]}>🏷  {labelModalFor}</Text>
+            <Text style={[s.labelSheetSub, { color: theme.muted }]}>
+              Tap a label to add or remove it. Use ✏️ to rename a label everywhere.
+            </Text>
+
+            {labels.map(l => {
+              const active = (labelMap[labelModalFor] ?? []).includes(l.id)
+              const editing = editingLabelId === l.id
+              return (
+                <View key={l.id} style={[s.labelRow, { borderBottomColor: theme.divider }]}>
+                  {editing ? (
+                    <>
+                      <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
+                      <TextInput
+                        style={[s.labelEditInput, { color: theme.text, borderColor: l.color + '88', backgroundColor: theme.bg }]}
+                        value={editingLabelName}
+                        onChangeText={setEditingLabelName}
+                        autoFocus
+                        returnKeyType="done"
+                        onSubmitEditing={saveLabelRename}
+                        maxLength={20}
+                      />
+                      <Pressable onPress={saveLabelRename} hitSlop={8}>
+                        <Text style={{ color: l.color, fontWeight: '800', fontSize: 14 }}>Save</Text>
+                      </Pressable>
+                    </>
+                  ) : (
+                    <>
+                      <Pressable style={s.labelRowMain} onPress={() => toggleRoutineLabel(labelModalFor, l.id)} hitSlop={4}>
+                        <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
+                        <Text style={[s.labelRowName, { color: theme.text }]}>{l.name}</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() => { setEditingLabelId(l.id); setEditingLabelName(l.name) }}
+                        hitSlop={8}
+                        style={{ padding: 4 }}
+                      >
+                        <Text style={{ fontSize: 13 }}>✏️</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() => toggleRoutineLabel(labelModalFor, l.id)}
+                        hitSlop={8}
+                        style={[s.labelCheck, { borderColor: active ? l.color : theme.muted }, active && { backgroundColor: l.color }]}
+                      >
+                        {active && <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>✓</Text>}
+                      </Pressable>
+                    </>
+                  )}
+                </View>
+              )
+            })}
+
+            <Pressable style={[s.labelDoneBtn, { backgroundColor: theme.accent }]} onPress={closeLabelModal}>
+              <Text style={s.labelDoneBtnText}>Done</Text>
+            </Pressable>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
 
 
     </KeyboardAvoidingView>
@@ -1442,6 +1468,7 @@ const s = StyleSheet.create({
   rStreak: { borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
   rStreakText: { fontSize: 12, fontWeight: '700', color: '#ea580c' },
   cardStatus: { fontSize: 13, marginTop: 2, fontWeight: '500' },
+  cardDesc: { fontSize: 12, marginTop: 3, lineHeight: 16, fontStyle: 'italic' },
 
   cardTopRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   cardTime: { fontSize: 11, fontWeight: '500', marginTop: 3 },
@@ -1492,52 +1519,54 @@ const s = StyleSheet.create({
   },
   addBtnText: { fontWeight: '700', fontSize: 15 },
 
-  // Settings modal
+  // Bottom-sheet scaffolding (used by the Weekly Routine + label modals)
   settingsOverlay: { flex: 1, justifyContent: 'flex-end' },
   settingsBg: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0,0,0,0.45)',
   },
-  settingsSheet: {
+  settingsHandle: {
+    width: 40, height: 4, borderRadius: 2,
+    alignSelf: 'center', marginBottom: 20,
+  },
+
+  // Routine labels
+  labelChipsRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: -4, marginBottom: 12 },
+  labelChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    borderRadius: 8, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4,
+  },
+  labelChipDot: { width: 7, height: 7, borderRadius: 4 },
+  labelChipText: { fontSize: 11, fontWeight: '700' },
+  labelAddChip: {
+    borderRadius: 8, borderWidth: 1, borderStyle: 'dashed',
+    paddingHorizontal: 8, paddingVertical: 4,
+  },
+
+  labelSheet: {
     borderTopLeftRadius: 28, borderTopRightRadius: 28,
     paddingTop: 10, paddingHorizontal: 24, paddingBottom: 40,
     shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
     shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
   },
-  settingsHandle: {
-    width: 40, height: 4, borderRadius: 2,
-    alignSelf: 'center', marginBottom: 20,
+  labelSheetTitle: { fontSize: 20, fontWeight: '800', letterSpacing: -0.3 },
+  labelSheetSub: { fontSize: 13, marginTop: 4, marginBottom: 8 },
+  labelRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 14, borderBottomWidth: 1,
   },
-  settingsTitle: {
-    fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 20,
+  labelRowMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  labelRowName: { fontSize: 16, fontWeight: '600' },
+  labelCheck: {
+    width: 24, height: 24, borderRadius: 12, borderWidth: 2,
+    alignItems: 'center', justifyContent: 'center',
   },
-  settingsRow: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingVertical: 16, borderBottomWidth: 1,
+  labelEditInput: {
+    flex: 1, borderRadius: 10, borderWidth: 1.5,
+    paddingHorizontal: 12, paddingVertical: 8, fontSize: 15, fontWeight: '600',
   },
-  settingsRowLeft: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  settingsRowIcon: { fontSize: 20 },
-  settingsRowLabel: { fontSize: 16, fontWeight: '500' },
-  settingsGroupLabel: {
-    fontSize: 11, fontWeight: '800', letterSpacing: 1.2,
-    marginTop: 18, marginBottom: 2,
-  },
-  signOutRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    paddingVertical: 16,
-  },
-  signOutText: { fontSize: 16, fontWeight: '600', color: '#ef4444' },
-  closeBtn: {
-    borderRadius: 14, paddingVertical: 14, alignItems: 'center',
-    borderWidth: 1.5, marginTop: 8,
-  },
-  closeBtnText: { fontWeight: '600', fontSize: 15 },
-
-  unitPill: {
-    paddingHorizontal: 16, paddingVertical: 8,
-    borderRadius: 20,
-  },
-  unitPillText: { fontSize: 14, fontWeight: '800', letterSpacing: 1 },
+  labelDoneBtn: { borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 16 },
+  labelDoneBtnText: { color: '#fff', fontWeight: '800', fontSize: 15 },
 })
 
 const db = StyleSheet.create({

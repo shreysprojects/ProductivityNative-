@@ -16,10 +16,11 @@ import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, DAY_LABELS, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
 import {
   getRoutineTemplate, saveRoutineTemplate, getTodayRun, startRun, advanceRun, completeRun,
-  saveRun, resetTodayRun, getGymSplit, getWorkoutRoutineList, deleteWorkoutPlan, getWorkoutPlan,
-  getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today,
+  saveRun, resetTodayRun, getGymSplit, getWorkoutRoutineList, deleteWorkoutPlan, renameWorkoutPlan, getWorkoutPlan,
+  getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
+  setLooksInRoutine, syncIntegratedTasks,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import MuscleMap from '../../components/MuscleMap'
@@ -518,7 +519,7 @@ const dt = StyleSheet.create({
   modalClose: { textAlign: 'center', marginTop: 14, fontSize: 14, fontWeight: '600' },
 })
 
-function LooksSection({ userId, theme, onHide }) {
+function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) {
   const [looksData, setLooksData] = useState({ hidden: false, categories: [] })
   const [addingCat, setAddingCat] = useState(false)
   const [newCatName, setNewCatName] = useState('')
@@ -834,6 +835,25 @@ function LooksSection({ userId, theme, onHide }) {
           onPress={() => setAddingCat(true)}
         >
           <Text style={[lks.addCatBtnText, { color: LOOKS_COLOR }]}>＋  Add category</Text>
+        </Pressable>
+      )}
+
+      {(looksData.categories.length > 0 || integrated) && (
+        <Pressable
+          style={[lks.integrateBtn, {
+            borderColor: LOOKS_COLOR + (integrated ? '66' : '55'),
+            backgroundColor: integrated ? LOOKS_COLOR + '14' : 'transparent',
+          }]}
+          onPress={() => onToggleIntegrate(looksData)}
+        >
+          <Text style={[lks.integrateBtnText, { color: LOOKS_COLOR }]}>
+            {integrated ? '✓  In your Morning tasks' : '＋  Add to Morning tasks'}
+          </Text>
+          <Text style={[lks.integrateBtnSub, { color: theme.muted }]}>
+            {integrated
+              ? 'Synced with this card. Tap to remove from your Morning tasks.'
+              : 'Do your Looks routine as part of your Morning routine — as one task or one per category.'}
+          </Text>
         </Pressable>
       )}
 
@@ -1537,6 +1557,7 @@ export default function RoutineScreen() {
   const [template, setTemplate] = useState([])
   const [run, setRun] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [routineDesc, setRoutineDesc] = useState('')
   const [gymSplit, setGymSplit] = useState(null)
   const [morningSettings, setMorningSettings] = useState({ hideTodo: false, hideWeight: false, hideLooks: false, weightGoal: null, targetWeight: null })
   const [aiModalOpen, setAiModalOpen] = useState(false)
@@ -1571,8 +1592,13 @@ export default function RoutineScreen() {
       getRoutineTemplate(user.id, name),
       getTodayRun(user.id, name),
       isFitness ? getGymSplit(user.id) : Promise.resolve(null),
+      getRoutineSettings(user.id, name),
     ]
-    const [tmpl, todayRun, split] = await Promise.all(promises)
+    let [tmpl, todayRun, split, rSettings] = await Promise.all(promises)
+    setRoutineDesc(rSettings?.description ?? '')
+    if (isMorning) {
+      tmpl = await syncIntegratedTasks(user.id, name, tmpl)
+    }
     setTemplate(tmpl)
     setRun(todayRun)
     if (isFitness) {
@@ -1695,6 +1721,33 @@ export default function RoutineScreen() {
     setTemplate(tasks)
   }
 
+  // Mirror the Looks card into the Morning template (or pull it back out).
+  const looksIntegrated = template.some(t => t.fromLooks)
+  async function toggleLooksIntegration(looksData) {
+    if (looksIntegrated) {
+      const next = await setLooksInRoutine(user.id, false)
+      setTemplate(next)
+      return
+    }
+    if (!looksData.categories.some(c => c.steps.length > 0)) {
+      Alert.alert('Nothing to add yet', 'Add some steps to your Looks routine first.')
+      return
+    }
+    const apply = async mode => {
+      const next = await setLooksInRoutine(user.id, true, mode)
+      setTemplate(next)
+    }
+    Alert.alert(
+      'Add Looks to Morning tasks',
+      'How should your Looks routine show up?',
+      [
+        { text: 'One task with all steps', onPress: () => apply('single') },
+        { text: 'A task per category', onPress: () => apply('multi') },
+        { text: 'Cancel', style: 'cancel' },
+      ]
+    )
+  }
+
   function createNewRoutine() {
     Alert.prompt(
       'New Workout',
@@ -1733,6 +1786,33 @@ export default function RoutineScreen() {
         },
       ]
     )
+  }
+
+  function promptRenameRoutine(oldName) {
+    Alert.prompt(
+      'Rename Workout',
+      `New name for "${oldName}"`,
+      async newName => {
+        const clean = newName?.trim()
+        if (!clean || clean === oldName) return
+        try {
+          await renameWorkoutPlan(user.id, oldName, clean)
+          setAllRoutines(prev => prev.map(r => r.name === oldName ? { ...r, name: clean } : r))
+        } catch (e) {
+          Alert.alert('Rename failed', e.message)
+        }
+      },
+      'plain-text',
+      oldName,
+    )
+  }
+
+  function openWorkoutMenu(routineName) {
+    Alert.alert(routineName, undefined, [
+      { text: 'Rename', onPress: () => promptRenameRoutine(routineName) },
+      { text: 'Delete', style: 'destructive', onPress: () => confirmDeleteRoutine(routineName) },
+      { text: 'Cancel', style: 'cancel' },
+    ])
   }
 
   function renderModeToggle() {
@@ -1945,7 +2025,7 @@ export default function RoutineScreen() {
               {/* Motivational quote pill */}
               <View style={s.previewBannerQuotePill}>
                 <Text style={{ fontSize: 13 }}>✨</Text>
-                <Text style={s.previewBannerQuoteText}>{routineQuote(name)}</Text>
+                <Text style={s.previewBannerQuoteText}>{routineDesc || routineQuote(name)}</Text>
               </View>
             </View>
 
@@ -2005,7 +2085,7 @@ export default function RoutineScreen() {
                   key={routine.name}
                   style={[s.routineCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}
                   onPress={() => openRoutinePreview(routine)}
-                  onLongPress={() => confirmDeleteRoutine(routine.name)}
+                  onLongPress={() => openWorkoutMenu(routine.name)}
                   delayLongPress={600}
                 >
                   <View style={{ flex: 1 }}>
@@ -2024,12 +2104,21 @@ export default function RoutineScreen() {
                     </Text>
                   </View>
                   <View style={s.routineCardActions}>
-                    <Pressable
-                      style={[s.routineEditBtn, { borderColor: theme.cardBorder }]}
-                      onPress={() => router.push('/workout-library?muscleGroup=' + encodeURIComponent(routine.name))}
-                    >
-                      <Text style={[s.routineEditText, { color: card.color }]}>Edit</Text>
-                    </Pressable>
+                    <View style={{ flexDirection: 'row', gap: 6 }}>
+                      <Pressable
+                        style={[s.routineMenuBtn, { borderColor: theme.cardBorder }]}
+                        onPress={() => openWorkoutMenu(routine.name)}
+                        hitSlop={6}
+                      >
+                        <Text style={[s.routineMenuText, { color: theme.subtext }]}>⋯</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[s.routineEditBtn, { borderColor: theme.cardBorder }]}
+                        onPress={() => router.push('/workout-library?muscleGroup=' + encodeURIComponent(routine.name))}
+                      >
+                        <Text style={[s.routineEditText, { color: card.color }]}>Edit</Text>
+                      </Pressable>
+                    </View>
                     {routine.count > 0 && (
                       <Pressable
                         style={[s.routineStartBtn, { backgroundColor: card.color }]}
@@ -2282,6 +2371,8 @@ export default function RoutineScreen() {
               <LooksSection
                 userId={user.id}
                 theme={theme}
+                integrated={looksIntegrated}
+                onToggleIntegrate={toggleLooksIntegration}
                 onHide={async () => {
                   const ns = { ...morningSettings, hideLooks: true }
                   await saveMorningSettings(user.id, ns)
@@ -2633,6 +2724,11 @@ const s = StyleSheet.create({
   routineCardName: { fontSize: 15, fontWeight: '700', marginBottom: 2 },
   routineCardCount: { fontSize: 12, fontWeight: '500' },
   routineCardActions: { gap: 6, alignItems: 'flex-end' },
+  routineMenuBtn: {
+    paddingHorizontal: 9, paddingVertical: 6, borderRadius: 8,
+    borderWidth: 1, justifyContent: 'center',
+  },
+  routineMenuText: { fontSize: 12, fontWeight: '900', lineHeight: 14 },
   routineEditBtn: {
     paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8,
     borderWidth: 1,
@@ -2836,6 +2932,14 @@ const lks = StyleSheet.create({
   addCatBlock: { borderTopWidth: StyleSheet.hairlineWidth, paddingTop: 12, marginTop: 10 },
   addCatBtn: { borderRadius: 14, paddingVertical: 11, alignItems: 'center', borderWidth: 1.5 },
   addCatBtnText: { fontSize: 14, fontWeight: '700' },
+
+  integrateBtn: {
+    borderRadius: 14, borderWidth: 1.5,
+    paddingVertical: 12, paddingHorizontal: 14,
+    alignItems: 'center', marginTop: 10,
+  },
+  integrateBtnText: { fontSize: 14, fontWeight: '700' },
+  integrateBtnSub: { fontSize: 11.5, fontWeight: '500', marginTop: 3, textAlign: 'center', lineHeight: 15 },
 
   aiBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 10,

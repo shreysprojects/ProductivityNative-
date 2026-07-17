@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
@@ -13,13 +13,137 @@ import { routineTheme } from '../lib/themes'
 const DAY_INITIALS = ['M', 'T', 'W', 'T', 'F', 'S', 'S']
 const DAY_NAMES    = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
-const TASK_EMOJIS = [
-  '🏠', '🛏️', '🚿', '🦷', '👕', '🧹', '🍳', '☕',
-  '🏃', '🚶', '💪', '🧘', '🚴', '🏊', '⚽', '🎾',
-  '💼', '📚', '📝', '💻', '📞', '✉️', '📅', '🎯',
-  '💊', '🥗', '💧', '😴', '🧴', '❤️', '🌿', '🩺',
-  '☀️', '🌙', '🙏', '🎵', '🎨', '📖', '🐕', '🌅',
-  '🔥', '⭐', '✅', '🎆', '🌸', '🍎', '🚗', '🎹',
+// Emoji library for task icons: [emoji, search keywords] grouped by category.
+const EMOJI_LIBRARY = [
+  {
+    category: 'Home & Chores',
+    emojis: [
+      ['🏠', 'home house'], ['🛏️', 'bed make bed bedroom tidy'], ['🚿', 'shower bathe'],
+      ['🛁', 'bath tub soak'], ['🦷', 'teeth brush dental floss'], ['🪥', 'toothbrush teeth brush'],
+      ['👕', 'clothes shirt outfit get dressed'], ['🧺', 'laundry basket clothes wash'],
+      ['🧹', 'clean sweep broom tidy'], ['🧽', 'scrub sponge dishes clean'], ['🧼', 'soap wash hands'],
+      ['🗑️', 'trash garbage bin take out'], ['🍽️', 'dishes plate table wash'], ['🛒', 'groceries shopping cart store'],
+      ['🪴', 'plant water houseplant'], ['🔑', 'keys lock leave'], ['🚪', 'door leave out'],
+      ['🧻', 'paper towel restock'], ['🪟', 'window open air'], ['🧷', 'organize fix'],
+    ],
+  },
+  {
+    category: 'Food & Drink',
+    emojis: [
+      ['🍳', 'breakfast eggs cook cooking'], ['🥞', 'pancakes breakfast'], ['🥣', 'cereal oatmeal bowl breakfast'],
+      ['☕', 'coffee espresso caffeine morning'], ['🍵', 'tea matcha green'], ['💧', 'water hydrate drink'],
+      ['🥤', 'smoothie shake drink cup'], ['🧃', 'juice drink box'], ['🥛', 'milk glass'],
+      ['🍎', 'apple fruit healthy'], ['🍌', 'banana fruit'], ['🍓', 'strawberry fruit berries'],
+      ['🥗', 'salad healthy greens lunch'], ['🥪', 'sandwich lunch'], ['🍱', 'meal prep lunch box bento'],
+      ['🍝', 'pasta dinner spaghetti'], ['🍚', 'rice bowl'], ['🍗', 'chicken protein dinner'],
+      ['🥩', 'steak meat protein'], ['🥦', 'broccoli vegetables veggies'], ['🥕', 'carrot vegetables veggies'],
+      ['🥑', 'avocado healthy fats'], ['🍞', 'bread toast bake'], ['🧊', 'ice cold plunge'],
+      ['🍫', 'chocolate snack treat'], ['🍿', 'popcorn snack movie'], ['🎂', 'cake birthday dessert'],
+    ],
+  },
+  {
+    category: 'Fitness & Sports',
+    emojis: [
+      ['🏃', 'run running jog cardio'], ['🚶', 'walk walking steps stroll'], ['💪', 'gym workout muscle strength lift'],
+      ['🏋️', 'weights lifting barbell gym'], ['🤸', 'stretch stretching mobility gymnastics'], ['🧘', 'yoga meditate meditation mindfulness breathe'],
+      ['🚴', 'bike cycling spin'], ['🏊', 'swim swimming pool laps'], ['🧗', 'climb climbing bouldering'],
+      ['⚽', 'soccer football'], ['🏀', 'basketball hoops'], ['🎾', 'tennis racket'],
+      ['🏐', 'volleyball'], ['🏈', 'football american'], ['⚾', 'baseball catch'],
+      ['🥊', 'boxing punch fight'], ['🥋', 'martial arts karate judo bjj'], ['⛳', 'golf putt'],
+      ['🏄', 'surf surfing'], ['🛹', 'skate skateboard'], ['⛷️', 'ski skiing snow'],
+      ['🏂', 'snowboard snow'], ['🚣', 'row rowing erg'], ['🩰', 'ballet dance'],
+      ['💃', 'dance dancing zumba'], ['🎽', 'marathon race running shirt'], ['⏱️', 'timer stopwatch interval hiit'],
+      ['🏆', 'trophy win championship goal'], ['🥇', 'medal first place winner'],
+    ],
+  },
+  {
+    category: 'Work & Study',
+    emojis: [
+      ['💼', 'work job briefcase office'], ['💻', 'laptop computer code coding work'], ['🖥️', 'desktop computer monitor'],
+      ['⌨️', 'keyboard typing'], ['📚', 'books study read reading homework'], ['📖', 'book read reading chapter'],
+      ['📝', 'write notes journal essay homework'], ['✏️', 'pencil write sketch'], ['📓', 'notebook notes'],
+      ['📔', 'journal diary reflect'], ['🗂️', 'files organize admin'], ['📁', 'folder documents'],
+      ['📊', 'chart data report analytics'], ['📈', 'growth stocks progress invest'], ['🧮', 'math budget calculate'],
+      ['🎓', 'school graduate learn course'], ['🏫', 'school class lecture'], ['🔬', 'science lab research'],
+      ['🧪', 'chemistry experiment test'], ['🌐', 'internet web language online'], ['🗣️', 'speak speaking language practice talk'],
+      ['📞', 'call phone meeting'], ['✉️', 'email mail inbox letters'], ['📅', 'calendar schedule plan planning'],
+      ['⏰', 'alarm wake up early morning clock'], ['🕐', 'clock time hour'], ['🎯', 'goal target focus aim'],
+      ['✅', 'done check complete task'], ['📋', 'clipboard checklist todo list'], ['💡', 'idea brainstorm lightbulb'],
+      ['🧠', 'brain think memory learn mental'], ['🤖', 'ai robot automation'], ['💰', 'money savings finance budget'],
+      ['💳', 'card pay bills payment'], ['🏦', 'bank banking finance'],
+    ],
+  },
+  {
+    category: 'Health & Self-care',
+    emojis: [
+      ['💊', 'medicine vitamins pills supplements meds'], ['🩺', 'doctor checkup appointment health'], ['🩹', 'bandage first aid'],
+      ['🧴', 'skincare lotion moisturizer sunscreen spf'], ['🧖', 'spa sauna facial self care'], ['💆', 'massage relax head'],
+      ['💅', 'nails manicure grooming'], ['💇', 'haircut hair salon'], ['🪒', 'shave razor grooming'],
+      ['🪞', 'mirror looks grooming get ready'], ['✨', 'sparkle glow looks shine'], ['❤️', 'heart love health'],
+      ['🫁', 'lungs breathe breathing breathwork'], ['😴', 'sleep nap rest tired'], ['🛌', 'sleep bed rest lie down'],
+      ['🙏', 'gratitude pray prayer thanks worship'], ['😊', 'smile happy mood positive'], ['🍃', 'calm zen peace leaf'],
+      ['📵', 'no phone digital detox screen free'], ['🔕', 'mute silence quiet do not disturb'], ['🚭', 'no smoking quit'],
+      ['🌡️', 'temperature sick fever'],
+    ],
+  },
+  {
+    category: 'Nature & Outdoors',
+    emojis: [
+      ['☀️', 'sun sunlight morning sunshine'], ['🌅', 'sunrise dawn morning'], ['🌄', 'sunrise mountain morning'],
+      ['🌇', 'sunset evening dusk'], ['🌙', 'moon night evening'], ['⭐', 'star night'],
+      ['🌟', 'star shine glow'], ['🌸', 'flower blossom spring'], ['🌹', 'rose flower'],
+      ['🌻', 'sunflower flower'], ['🌿', 'herb plant nature green'], ['🌱', 'sprout grow growth seedling'],
+      ['🌳', 'tree park nature forest'], ['⛰️', 'mountain hike hiking'], ['🏕️', 'camping tent outdoors'],
+      ['🏖️', 'beach sand vacation'], ['🌊', 'wave ocean sea cold plunge'], ['🌧️', 'rain rainy weather'],
+      ['⛅', 'cloud cloudy weather'], ['❄️', 'snow winter cold'], ['🍂', 'autumn fall leaves'],
+      ['🐕', 'dog puppy pet walk'], ['🐈', 'cat kitten pet'], ['🐾', 'pets paws animal'],
+      ['🐦', 'bird birdwatching'], ['🦮', 'dog walk guide'],
+    ],
+  },
+  {
+    category: 'Travel & Places',
+    emojis: [
+      ['🚗', 'car drive driving commute'], ['🚌', 'bus commute transit'], ['🚆', 'train commute metro'],
+      ['✈️', 'plane flight travel airport'], ['🚲', 'bicycle bike commute ride'], ['🛴', 'scooter ride'],
+      ['⛽', 'gas fuel station'], ['🗺️', 'map trip plan explore'], ['🧳', 'luggage pack packing travel'],
+      ['⛪', 'church worship mass'], ['🕌', 'mosque prayer'], ['🛕', 'temple worship'],
+      ['🕍', 'synagogue worship'], ['🏥', 'hospital appointment clinic'], ['🏢', 'office building work'],
+      ['🏪', 'store shop errand'], ['📍', 'location place errand'],
+    ],
+  },
+  {
+    category: 'Hobbies & Fun',
+    emojis: [
+      ['🎵', 'music song listen'], ['🎧', 'headphones podcast audiobook music'], ['🎸', 'guitar practice music'],
+      ['🎹', 'piano keys practice music'], ['🥁', 'drums practice music'], ['🎤', 'sing singing karaoke voice'],
+      ['🎨', 'art paint drawing creative'], ['🖌️', 'paint brush art'], ['📷', 'photo camera photography'],
+      ['🎮', 'game gaming video games'], ['♟️', 'chess strategy board'], ['🧩', 'puzzle jigsaw'],
+      ['🎬', 'movie film watch cinema'], ['📺', 'tv show watch series'], ['🎭', 'theater drama acting'],
+      ['🧶', 'knit yarn crochet craft'], ['🪡', 'sew sewing craft'], ['🎣', 'fishing fish'],
+      ['🎲', 'board games dice family'], ['🃏', 'cards poker game'], ['📻', 'radio listen'],
+      ['📱', 'phone social media apps'], ['🛍️', 'shopping mall buy'], ['🚀', 'rocket project launch side hustle'],
+    ],
+  },
+  {
+    category: 'People & Social',
+    emojis: [
+      ['👨‍👩‍👧', 'family time kids'], ['👶', 'baby infant childcare'], ['🧒', 'kids children'],
+      ['👥', 'friends social people meet'], ['🤝', 'meeting handshake network'], ['💬', 'chat talk text conversation'],
+      ['🎉', 'party celebrate celebration'], ['🥳', 'celebrate party birthday'], ['🎁', 'gift present giving'],
+      ['💌', 'letter love note write'], ['💑', 'date partner couple love'], ['📣', 'announce share post'],
+    ],
+  },
+  {
+    category: 'Symbols',
+    emojis: [
+      ['🔥', 'fire streak hot motivation'], ['⚡', 'energy power fast lightning'], ['💯', 'hundred percent perfect'],
+      ['🎆', 'fireworks celebration'], ['🏁', 'finish start race flag'], ['🚫', 'no stop avoid quit'],
+      ['❗', 'important priority urgent'], ['❓', 'question review'], ['🔔', 'bell reminder notification'],
+      ['🔋', 'battery recharge energy rest'], ['♻️', 'recycle repeat habit'], ['🔄', 'repeat routine cycle sync'],
+      ['⚖️', 'balance scale weigh weight'], ['🧲', 'magnet focus attract'], ['➕', 'plus add more'],
+      ['🔒', 'lock secure private'],
+    ],
+  },
 ]
 
 function fmtTime(mins) {
@@ -66,6 +190,7 @@ export default function SetupRoutine() {
 
   const [editName,         setEditName]         = useState(routineName || '')
   const [customName,       setCustomName]       = useState('')
+  const [description,      setDescription]      = useState('')
   const [tasks,            setTasks]            = useState([])
   const [text,             setText]             = useState('')
   const [goalMins,         setGoalMins]         = useState('')
@@ -80,6 +205,7 @@ export default function SetupRoutine() {
   const [taskEmoji,        setTaskEmoji]        = useState(null)
   const [showEmojiPicker,  setShowEmojiPicker]  = useState(false)
   const [emojiTargetId,    setEmojiTargetId]    = useState(null)
+  const [emojiQuery,       setEmojiQuery]       = useState('')
 
   useEffect(() => {
     if (!user) return
@@ -93,6 +219,7 @@ export default function SetupRoutine() {
         setStartTimeMinutes(s.startTimeMinutes)
         setPerDayMode(s.perDayMode)
         setDayTimes(s.dayTimes)
+        setDescription(s.description ?? '')
       })
     }
   }, [user, routineName, isFirstTime])
@@ -144,6 +271,7 @@ export default function SetupRoutine() {
 
   function openEmojiPicker(targetId) {
     setEmojiTargetId(targetId ?? null)
+    setEmojiQuery('')
     setShowEmojiPicker(true)
   }
 
@@ -243,7 +371,7 @@ export default function SetupRoutine() {
       await saveRoutineTemplate(user.id, finalName, tasks)
       await addRoutine(user.id, finalName)
       if (!isFirstTime) {
-        await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes })
+        await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes, description: description.trim() })
       }
       if (isFirstTime) await markSetupDone(user.id)
       // First-time setup hands off to onboarding; a rename re-points to the new
@@ -441,6 +569,21 @@ export default function SetupRoutine() {
       )}
 
       {!isFirstTime && (
+        <View style={s.descWrap}>
+          <Text style={[s.renameLabel, { color: theme.color }]}>DESCRIPTION</Text>
+          <TextInput
+            style={[s.descInput, { borderColor: theme.color + '44' }]}
+            placeholder="What's this routine for? (optional)"
+            placeholderTextColor="#bbb"
+            value={description}
+            onChangeText={setDescription}
+            multiline
+            maxLength={140}
+          />
+        </View>
+      )}
+
+      {!isFirstTime && (
         <View style={[s.scheduleCard, { borderColor: theme.color + '33' }]}>
           <View style={s.scheduleHeaderRow}>
             <Text style={[s.scheduleLabel, { color: theme.color }]}>SCHEDULE</Text>
@@ -598,8 +741,9 @@ export default function SetupRoutine() {
         animationType="slide"
         onRequestClose={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }}
       >
-        <Pressable style={s.emojiOverlay} onPress={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }}>
-          <View style={s.emojiSheet} onStartShouldSetResponder={() => true}>
+        <KeyboardAvoidingView style={s.emojiOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }} />
+          <View style={s.emojiSheet}>
             <View style={[s.emojiHandle, { backgroundColor: '#ddd' }]} />
             <View style={s.emojiHeaderRow}>
               <Text style={s.emojiHeaderTitle}>Choose an icon</Text>
@@ -611,15 +755,58 @@ export default function SetupRoutine() {
                 </Pressable>
               )}
             </View>
-            <View style={s.emojiGrid}>
-              {TASK_EMOJIS.map(e => (
-                <Pressable key={e} style={s.emojiItem} onPress={() => pickEmoji(e)}>
-                  <Text style={s.emojiItemText}>{e}</Text>
-                </Pressable>
-              ))}
-            </View>
+
+            <TextInput
+              style={s.emojiSearch}
+              placeholder="Search  (e.g. run, coffee, book…)"
+              placeholderTextColor="#aaa"
+              value={emojiQuery}
+              onChangeText={setEmojiQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+              clearButtonMode="while-editing"
+            />
+
+            <ScrollView
+              style={s.emojiScroll}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {(() => {
+                const q = emojiQuery.trim().toLowerCase()
+                if (q) {
+                  const results = EMOJI_LIBRARY
+                    .flatMap(c => c.emojis)
+                    .filter(([e, keywords]) => keywords.includes(q) || e === emojiQuery.trim())
+                  return results.length ? (
+                    <View style={s.emojiGrid}>
+                      {results.map(([e]) => (
+                        <Pressable key={e} style={s.emojiItem} onPress={() => pickEmoji(e)}>
+                          <Text style={s.emojiItemText}>{e}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  ) : (
+                    <Text style={s.emojiNoResults}>No matches for “{emojiQuery.trim()}”</Text>
+                  )
+                }
+                return EMOJI_LIBRARY.map(cat => (
+                  <View key={cat.category}>
+                    <Text style={s.emojiCatLabel}>{cat.category.toUpperCase()}</Text>
+                    <View style={s.emojiGrid}>
+                      {cat.emojis.map(([e]) => (
+                        <Pressable key={e} style={s.emojiItem} onPress={() => pickEmoji(e)}>
+                          <Text style={s.emojiItemText}>{e}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  </View>
+                ))
+              })()}
+              <View style={{ height: 12 }} />
+            </ScrollView>
           </View>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     </KeyboardAvoidingView>
   )
@@ -665,6 +852,13 @@ const s = StyleSheet.create({
   },
   renameWrap: { marginTop: 4 },
   renameLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 8 },
+
+  descWrap: { marginTop: 4 },
+  descInput: {
+    backgroundColor: '#fff', borderRadius: 14, padding: 14, paddingTop: 12,
+    fontSize: 14, fontWeight: '500', borderWidth: 2, color: '#111', marginBottom: 20,
+    minHeight: 64, textAlignVertical: 'top',
+  },
 
   scheduleCard: {
     backgroundColor: '#fff', borderRadius: 18, padding: 16,
@@ -798,9 +992,22 @@ const s = StyleSheet.create({
     shadowOpacity: 0.12, shadowRadius: 16, elevation: 16,
   },
   emojiHandle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 18 },
-  emojiHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  emojiHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   emojiHeaderTitle: { fontSize: 17, fontWeight: '700', color: '#111' },
   emojiClearBtn: { fontSize: 14, fontWeight: '600' },
+  emojiSearch: {
+    backgroundColor: '#f6f7fb', borderRadius: 12,
+    paddingHorizontal: 14, paddingVertical: 10,
+    fontSize: 15, color: '#111', marginBottom: 12,
+  },
+  emojiScroll: { maxHeight: 420 },
+  emojiCatLabel: {
+    fontSize: 10, fontWeight: '800', letterSpacing: 1.2, color: '#9ca3af',
+    marginTop: 14, marginBottom: 8,
+  },
+  emojiNoResults: {
+    fontSize: 14, color: '#9ca3af', textAlign: 'center', paddingVertical: 28,
+  },
   emojiGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, justifyContent: 'flex-start' },
   emojiItem: {
     width: 52, height: 52, borderRadius: 14,
