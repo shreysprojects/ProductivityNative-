@@ -30,8 +30,9 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# env files — never commit secrets
-.env
+# The root .env is committed on purpose: it holds only EXPO_PUBLIC_* values
+# (Supabase URL + publishable key) that ship in the app bundle anyway.
+# Any env file with real secrets (service-role key, API keys) stays ignored.
 .env.*
 .env*.local
 
