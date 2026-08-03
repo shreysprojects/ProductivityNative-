@@ -538,9 +538,16 @@ export default function FriendProfileScreen() {
     plans.forEach(p => { groupMap[p.muscle_group] = musclesFromPlan(p.exercises ?? []) })
     setMuscleByGroup(groupMap)
 
-    // Index logged activity by date
+    // Index logged activity by date. Runs may be stored under the routine's
+    // alternative variant ("<name>::alt") — key by base name and keep whichever
+    // variant completed more steps, since history is recorded per base name.
     const runsByKey = {}
-    ;(runsRes.data ?? []).forEach(r => { runsByKey[`${r.routine_name}__${r.date}`] = r.data?.steps ?? [] })
+    ;(runsRes.data ?? []).forEach(r => {
+      const key = `${r.routine_name.replace(/::alt$/, '')}__${r.date}`
+      const steps = r.data?.steps ?? []
+      const done = list => list.filter(st => st.completedAt).length
+      if (!runsByKey[key] || done(steps) > done(runsByKey[key])) runsByKey[key] = steps
+    })
 
     const map = {}
     const ensure = d => (map[d] ??= { routines: [], workout: null, deepWork: [], meals: [] })

@@ -6,8 +6,13 @@ import { useAuth } from '../lib/AuthContext'
 import {
   getRoutineTemplate, saveRoutineTemplate, markSetupDone,
   addRoutine, getRoutineNames, getRoutineSettings, saveRoutineSettings,
-  renameRoutine, shiftRoutinesAfter, RESERVED_ROUTINES,
+  renameRoutine, shiftRoutinesAfter, RESERVED_ROUTINES, altRoutineName,
+  getRoutineGroupMap, saveRoutineGroupMap,
 } from '../lib/storage'
+
+// Section identities — match the dashboard's Every day / Whenever headers
+const EVERYDAY_COLOR = '#f59e0b'
+const WHENEVER_COLOR = '#06b6d4'
 import { routineTheme } from '../lib/themes'
 
 const DAY_INITIALS = ['M', 'T', 'W', 'T', 'F', 'S', 'S']
@@ -175,18 +180,21 @@ function fmtGoalSecs(s) {
 
 export default function SetupRoutine() {
   const { user } = useAuth()
-  const { name: nameParam } = useLocalSearchParams()
+  const { name: nameParam, variant: variantParam } = useLocalSearchParams()
 
   const isNew = nameParam === 'new'
   const isFirstTime = !nameParam
   const routineName = isNew || isFirstTime ? null : nameParam
+  // variant=alt edits the routine's alternative version: tasks only — the
+  // name, description, and schedule belong to the routine and stay shared.
+  const isAltVariant = !!routineName && variantParam === 'alt'
 
   const theme = routineTheme(routineName || 'Morning')
 
   // Only routines the user created can be renamed (Morning/Fitness/Night are
   // hardcoded throughout the app and keep their names).
   const isDefaultRoutine = !!routineName && RESERVED_ROUTINES.includes(routineName)
-  const canRename = !isFirstTime && !isNew && !isDefaultRoutine
+  const canRename = !isFirstTime && !isNew && !isDefaultRoutine && !isAltVariant
 
   const [editName,         setEditName]         = useState(routineName || '')
   const [customName,       setCustomName]       = useState('')
@@ -203,14 +211,19 @@ export default function SetupRoutine() {
   const [perDayMode,       setPerDayMode]       = useState(false)
   const [dayTimes,         setDayTimes]         = useState(Array(7).fill(540))
   const [taskEmoji,        setTaskEmoji]        = useState(null)
+  const [newGroup,         setNewGroup]         = useState('everyday') // new routines: which dashboard section
+  const [routineGroup,     setRoutineGroup]     = useState('everyday') // existing routines: their saved section
   const [showEmojiPicker,  setShowEmojiPicker]  = useState(false)
   const [emojiTargetId,    setEmojiTargetId]    = useState(null)
   const [emojiQuery,       setEmojiQuery]       = useState('')
 
+  // Whenever routines have no day/time schedule.
+  const isWhenever = isNew ? newGroup === 'whenever' : routineGroup === 'whenever'
+
   useEffect(() => {
     if (!user) return
     const target = routineName || 'Morning'
-    getRoutineTemplate(user.id, target).then(template =>
+    getRoutineTemplate(user.id, isAltVariant ? altRoutineName(target) : target).then(template =>
       setTasks(template.map(t => ({ ...t, subTasks: t.subTasks || [], timeGoalSecs: t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60 })))
     )
     if (!isFirstTime) {
@@ -222,7 +235,10 @@ export default function SetupRoutine() {
         setDescription(s.description ?? '')
       })
     }
-  }, [user, routineName, isFirstTime])
+    if (routineName && !isNew) {
+      getRoutineGroupMap(user.id).then(m => setRoutineGroup(m[routineName] ?? 'everyday'))
+    }
+  }, [user, routineName, isFirstTime, isNew])
 
   const totalGoalSecs = tasks.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
 
@@ -241,9 +257,11 @@ export default function SetupRoutine() {
     setGoalSecs('')
     setTaskEmoji(null)
 
-    // Offer to push later routines back by this task's duration (existing routines only).
+    // Offer to push later routines back by this task's duration (existing routines
+    // only — alternatives replace the main and Whenever routines have no slot in
+    // the day, so neither shifts the schedule).
     const shiftMin = Math.round(totalSecs / 60)
-    if (shiftMin >= 1 && !isNew && !isFirstTime && routineName) {
+    if (shiftMin >= 1 && !isNew && !isFirstTime && routineName && !isAltVariant && !isWhenever) {
       maybeShiftLater(shiftMin)
     }
   }
@@ -368,10 +386,16 @@ export default function SetupRoutine() {
           return Alert.alert('Could not rename', e.message)
         }
       }
-      await saveRoutineTemplate(user.id, finalName, tasks)
-      await addRoutine(user.id, finalName)
-      if (!isFirstTime) {
-        await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes, description: description.trim() })
+      await saveRoutineTemplate(user.id, isAltVariant ? altRoutineName(finalName) : finalName, tasks)
+      if (!isAltVariant) {
+        await addRoutine(user.id, finalName)
+        if (isNew) {
+          const gMap = await getRoutineGroupMap(user.id)
+          await saveRoutineGroupMap(user.id, { ...gMap, [finalName]: newGroup })
+        }
+        if (!isFirstTime) {
+          await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes, description: description.trim() })
+        }
       }
       if (isFirstTime) await markSetupDone(user.id)
       // First-time setup hands off to onboarding; a rename re-points to the new
@@ -393,6 +417,9 @@ export default function SetupRoutine() {
   } else if (isNew) {
     title = 'New Routine'
     subtitle = 'Give your routine a name, set a schedule, and add your tasks.'
+  } else if (isAltVariant) {
+    title = `Alt ${routineName} Routine`
+    subtitle = 'A lighter fallback for days you can\'t do the main routine. Hold ☰ to reorder tasks.'
   }
 
   function renderItem({ item: task, drag, isActive, getIndex }) {
@@ -568,7 +595,36 @@ export default function SetupRoutine() {
         />
       )}
 
-      {!isFirstTime && (
+      {/* New routines pick their dashboard section */}
+      {isNew && (
+        <View style={s.groupPickWrap}>
+          <Text style={[s.renameLabel, { color: theme.color }]}>SHOW UNDER</Text>
+          <View style={s.groupPickRow}>
+            {[
+              { key: 'everyday', emoji: '⭐', label: 'Every day', hint: 'Aim to do it daily', color: EVERYDAY_COLOR },
+              { key: 'whenever', emoji: '🌊', label: 'Whenever', hint: 'For when you feel like it', color: WHENEVER_COLOR },
+            ].map(opt => {
+              const active = newGroup === opt.key
+              return (
+                <Pressable
+                  key={opt.key}
+                  style={[s.groupPickCard, {
+                    borderColor: active ? opt.color : '#e5e5f0',
+                    backgroundColor: active ? opt.color + '14' : '#fff',
+                  }]}
+                  onPress={() => setNewGroup(opt.key)}
+                >
+                  <Text style={{ fontSize: 18 }}>{opt.emoji}</Text>
+                  <Text style={[s.groupPickLabel, { color: active ? opt.color : '#333' }]}>{opt.label}</Text>
+                  <Text style={s.groupPickHint}>{opt.hint}</Text>
+                </Pressable>
+              )
+            })}
+          </View>
+        </View>
+      )}
+
+      {!isFirstTime && !isAltVariant && (
         <View style={s.descWrap}>
           <Text style={[s.renameLabel, { color: theme.color }]}>DESCRIPTION</Text>
           <TextInput
@@ -583,7 +639,8 @@ export default function SetupRoutine() {
         </View>
       )}
 
-      {!isFirstTime && (
+      {/* Whenever routines have no schedule — they're done, well, whenever */}
+      {!isFirstTime && !isAltVariant && !isWhenever && (
         <View style={[s.scheduleCard, { borderColor: theme.color + '33' }]}>
           <View style={s.scheduleHeaderRow}>
             <Text style={[s.scheduleLabel, { color: theme.color }]}>SCHEDULE</Text>
@@ -852,6 +909,15 @@ const s = StyleSheet.create({
   },
   renameWrap: { marginTop: 4 },
   renameLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 8 },
+
+  groupPickWrap: { marginBottom: 20 },
+  groupPickRow: { flexDirection: 'row', gap: 10 },
+  groupPickCard: {
+    flex: 1, borderRadius: 14, borderWidth: 2,
+    paddingVertical: 12, paddingHorizontal: 10, alignItems: 'center', gap: 3,
+  },
+  groupPickLabel: { fontSize: 14, fontWeight: '800', letterSpacing: -0.2 },
+  groupPickHint: { fontSize: 11, fontWeight: '500', color: '#999', textAlign: 'center' },
 
   descWrap: { marginTop: 4 },
   descInput: {

@@ -11,6 +11,7 @@
     "preview": {
       "distribution": "internal",
       "channel": "preview",
+      "environment": "preview",
       "ios": {
         "simulator": false
       },

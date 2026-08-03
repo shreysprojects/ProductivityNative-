@@ -122,6 +122,18 @@ DROP POLICY IF EXISTS "day_todos_own" ON public.day_todos;
 CREATE POLICY "day_todos_own" ON public.day_todos
   FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
+-- ── day_rules ──────────────────────────────────────────────────────────────
+-- Dashboard "Rules for today": [{id, text}] per user, persists until edited.
+CREATE TABLE IF NOT EXISTS public.day_rules (
+  user_id UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  rules   JSONB NOT NULL DEFAULT '[]'
+);
+
+ALTER TABLE public.day_rules ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "day_rules_own" ON public.day_rules;
+CREATE POLICY "day_rules_own" ON public.day_rules
+  FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
 -- ── productivity_sessions ──────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.productivity_sessions (
   id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),

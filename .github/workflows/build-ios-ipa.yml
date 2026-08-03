@@ -1,0 +1,66 @@
+name: Build iOS IPA (unsigned, for AltStore)
+
+# Builds an UNSIGNED .ipa on GitHub's macOS runners. AltStore/Sideloadly then
+# re-signs it with a free Apple ID for a home-screen install (7-day signature,
+# auto-refreshed by AltStore). Trigger manually from the Actions tab.
+#
+# Note: macOS runner minutes count 10x against the free 2,000 min/month on
+# private repos (~25 real minutes per build ≈ 250). Build only for native
+# changes — JS-only changes ship via `eas update` without a rebuild.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # EXPO_PUBLIC_* values are inlined into the JS bundle at build time.
+      # .env is gitignored, so recreate it from repo secrets.
+      - name: Write .env from secrets
+        run: |
+          cat > .env << 'EOF'
+          EXPO_PUBLIC_SUPABASE_URL=${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+          EXPO_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
+          EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID }}
+          EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID=${{ secrets.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID }}
+          EOF
+
+      - name: Generate native iOS project
+        run: npx expo prebuild --platform ios
+        env:
+          CI: "1"
+
+      - name: Build unsigned app
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          APP=$(ls -d ios/build/Build/Products/Release-iphoneos/*.app | head -1)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry LifeLayer-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LifeLayer-ipa
+          path: LifeLayer-unsigned.ipa

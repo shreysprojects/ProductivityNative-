@@ -215,7 +215,12 @@ export default function DayDetailScreen() {
               </View>
 
               {history.map((h, hi) => {
-                const run   = runs.find(r => r.routine_name === h.routine)
+                // A day's progress may live on the main run or the alternative
+                // (routine_name "<name>::alt") — show whichever got further.
+                const doneSteps = r => (r?.data?.steps ?? []).filter(st => st.completedAt).length
+                const run = runs
+                  .filter(r => r.routine_name === h.routine || r.routine_name === h.routine + '::alt')
+                  .sort((a, b) => doneSteps(b) - doneSteps(a))[0]
                 const steps = run?.data?.steps ?? []
                 return (
                   <View

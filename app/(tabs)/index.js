@@ -9,7 +9,7 @@ import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
-import { getRoutineNames, getRoutineTemplate, getTodayRun, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineLabels, saveRoutineLabels, getRoutineLabelMap, saveRoutineLabelMap } from '../../lib/storage'
+import { getRoutineNames, getRoutineTemplate, getTodayRunEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
@@ -18,6 +18,10 @@ import { getProductivitySessions, getTodayProductiveMinutes, clearProductivitySe
 
 const PROD_COLOR    = '#6366f1'
 const DEFAULT_ROUTINES = new Set(['Morning', 'Fitness', 'Night'])
+
+// Section identities for the routine groups (chip + rule tint)
+const EVERYDAY_COLOR = '#f59e0b'
+const WHENEVER_COLOR = '#06b6d4'
 
 function fmtMinsShort(m) {
   if (m <= 0) return '0m'
@@ -320,6 +324,11 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
   const [tasksToday, setTasksToday] = useState([])
   const [todayJournal, setTodayJournal] = useState(null)
   const [collapsed, setCollapsed] = useState(false)
+  // Rules for the day — persist until the user changes them
+  const [rules, setRules] = useState([])
+  const [rulesOpen, setRulesOpen] = useState(false)
+  const [draftRules, setDraftRules] = useState([])
+  const [newRule, setNewRule] = useState('')
 
   useEffect(() => {
     if (!user?.id) return
@@ -334,6 +343,31 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
     if (user?.id) AsyncStorage.setItem(`@dash_collapsed_${user.id}`, String(next)).catch(() => {})
   }
 
+  function openRulesEditor() {
+    setDraftRules(rules.map(r => ({ ...r })))
+    setNewRule('')
+    setRulesOpen(true)
+  }
+
+  function addDraftRule() {
+    const text = newRule.trim()
+    if (!text) return
+    setDraftRules(prev => [...prev, { id: Date.now(), text }])
+    setNewRule('')
+  }
+
+  async function saveRules() {
+    const cleaned = draftRules
+      .map(r => ({ ...r, text: r.text.trim() }))
+      .filter(r => r.text)
+    // Text typed into the add field but not yet ＋'d still counts.
+    const pending = newRule.trim()
+    if (pending) cleaned.push({ id: Date.now(), text: pending })
+    setRules(cleaned)
+    setRulesOpen(false)
+    await saveDayRules(user.id, cleaned)
+  }
+
   useFocusEffect(useCallback(() => {
     if (!user?.id) return
     const key = today()
@@ -343,7 +377,9 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
       getScheduleItems(user.id),
       getTasks(user.id),
       getJournalEntries(user.id),
-    ]).then(([events, todos, schedule, allTasks, jEntries]) => {
+      getDayRules(user.id),
+    ]).then(([events, todos, schedule, allTasks, jEntries, dayRules]) => {
+      setRules(dayRules)
       const dow = new Date().getDay()
       const combined = [
         ...events.filter(e => e.date === key),
@@ -436,6 +472,33 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
             </View>
           )}
 
+          {/* Rules for today — persist until the user changes them */}
+          <View style={[db.divider, { backgroundColor: theme.divider }]} />
+          {rules.length > 0 ? (
+            <>
+              <View style={db.rulesHeaderRow}>
+                <Text style={[db.rulesTitle, { color: theme.text }]}>📜  Rules for today</Text>
+                <Pressable onPress={openRulesEditor} hitSlop={8}>
+                  <Text style={[db.rulesEdit, { color: theme.accent }]}>Edit</Text>
+                </Pressable>
+              </View>
+              {rules.map((r, i) => (
+                <View key={r.id} style={db.ruleRow}>
+                  <View style={[db.ruleNum, { backgroundColor: theme.accent + '18' }]}>
+                    <Text style={[db.ruleNumText, { color: theme.accent }]}>{i + 1}</Text>
+                  </View>
+                  <Text style={[db.ruleText, { color: theme.text }]}>{r.text}</Text>
+                </View>
+              ))}
+            </>
+          ) : (
+            <Pressable style={db.eventRow} onPress={openRulesEditor}>
+              <Text style={{ fontSize: 12 }}>📜</Text>
+              <Text style={[db.eventTitle, { color: theme.text }]}>Rules for today</Text>
+              <Text style={[db.eventTime, { color: theme.muted }]}>Set them →</Text>
+            </Pressable>
+          )}
+
           {/* Today's events & todos */}
           {allItems.length > 0 && (
             <>
@@ -469,11 +532,68 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
           </Pressable>
         </>
       )}
+
+      {/* Rules editor sheet */}
+      <Modal
+        visible={rulesOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={saveRules}
+      >
+        <KeyboardAvoidingView style={s.settingsOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <Pressable style={s.settingsBg} onPress={saveRules} />
+          <View style={[db.rulesSheet, { backgroundColor: theme.card }]}>
+            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+            <Text style={[db.rulesSheetTitle, { color: theme.text }]}>📜  Rules for today</Text>
+            <Text style={[db.rulesSheetSub, { color: theme.muted }]}>
+              Your ground rules for each day. They stay until you change them.
+            </Text>
+
+            {draftRules.map((r, i) => (
+              <View key={r.id} style={[db.rulesEditRow, { borderBottomColor: theme.divider }]}>
+                <View style={[db.ruleNum, { backgroundColor: theme.accent + '18' }]}>
+                  <Text style={[db.ruleNumText, { color: theme.accent }]}>{i + 1}</Text>
+                </View>
+                <TextInput
+                  style={[db.rulesEditInput, { color: theme.text }]}
+                  value={r.text}
+                  onChangeText={v => setDraftRules(prev => prev.map(x => x.id === r.id ? { ...x, text: v } : x))}
+                  placeholder="Rule…"
+                  placeholderTextColor={theme.muted}
+                  returnKeyType="done"
+                />
+                <Pressable onPress={() => setDraftRules(prev => prev.filter(x => x.id !== r.id))} hitSlop={8}>
+                  <Text style={[db.rulesDelete, { color: theme.muted }]}>✕</Text>
+                </Pressable>
+              </View>
+            ))}
+
+            <View style={db.rulesAddRow}>
+              <TextInput
+                style={[db.rulesAddInput, { color: theme.text, backgroundColor: theme.input, borderColor: theme.inputBorder }]}
+                placeholder={draftRules.length ? 'Add another rule…' : 'e.g. No phone before 9 AM'}
+                placeholderTextColor={theme.muted}
+                value={newRule}
+                onChangeText={setNewRule}
+                onSubmitEditing={addDraftRule}
+                returnKeyType="done"
+              />
+              <Pressable onPress={addDraftRule} style={[db.rulesAddBtn, { backgroundColor: theme.accent }]}>
+                <Text style={db.rulesAddBtnText}>+</Text>
+              </Pressable>
+            </View>
+
+            <Pressable style={[db.rulesDoneBtn, { backgroundColor: theme.accent }]} onPress={saveRules}>
+              <Text style={db.rulesDoneBtnText}>Done</Text>
+            </Pressable>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   )
 }
 
-function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete, routineLabels = [], onOpenLabels }) {
+function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete, group = 'everyday' }) {
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isRunning = !isHidden && run && !run.finished
@@ -497,7 +617,8 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
   const showSplit    = name === 'Fitness' && !isHidden && todayMuscles[0] !== 'Rest'
 
   const totalGoalMins = Math.round(template.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60) / 60, 0))
-  const timeRange = settings
+  // Whenever routines aren't scheduled — no time range on their cards.
+  const timeRange = settings && group !== 'whenever'
     ? totalGoalMins > 0
       ? `${fmtTime(settings.startTimeMinutes)} – ${fmtTime(settings.startTimeMinutes + totalGoalMins)}`
       : fmtTime(settings.startTimeMinutes)
@@ -585,31 +706,6 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
             )}
           </View>
         </View>
-
-        {!isHidden && (
-          <View style={s.labelChipsRow}>
-            {routineLabels.map(l => (
-              <Pressable
-                key={l.id}
-                style={[s.labelChip, { backgroundColor: l.color + '1c', borderColor: l.color + '55' }]}
-                onPress={onOpenLabels}
-                hitSlop={4}
-              >
-                <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
-                <Text style={[s.labelChipText, { color: l.color }]}>{l.name}</Text>
-              </Pressable>
-            ))}
-            <Pressable
-              style={[s.labelAddChip, { borderColor: theme.cardBorder }]}
-              onPress={onOpenLabels}
-              hitSlop={6}
-            >
-              <Text style={[s.labelChipText, { color: theme.muted }]}>
-                {routineLabels.length ? '＋' : '＋ Label'}
-              </Text>
-            </Pressable>
-          </View>
-        )}
 
         {showSplit && (
           <View style={s.splitPillsRow}>
@@ -1067,11 +1163,8 @@ export default function RoutinesScreen() {
   const [weeklyRoutines, setWeeklyRoutines] = useState([])
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
-  const [labels, setLabels] = useState([])
-  const [labelMap, setLabelMap] = useState({})
-  const [labelModalFor, setLabelModalFor] = useState(null) // routine name being labeled
-  const [editingLabelId, setEditingLabelId] = useState(null)
-  const [editingLabelName, setEditingLabelName] = useState('')
+  // Which dashboard group each routine is in: 'everyday' (default) | 'whenever'
+  const [groupMap, setGroupMap] = useState({})
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -1085,20 +1178,18 @@ export default function RoutinesScreen() {
 
   const load = useCallback(async () => {
     if (!user) return
-    const [names, hiddenArr, str, split, rStreaks, lbls, lblMap] = await Promise.all([
+    const [names, hiddenArr, str, split, rStreaks, gMap] = await Promise.all([
       getRoutineNames(user.id),
       getHiddenDefaults(user.id),
       getStreak(user.id),
       getGymSplit(user.id),
       getRoutineStreaks(user.id),
-      getRoutineLabels(user.id),
-      getRoutineLabelMap(user.id),
+      getRoutineGroupMap(user.id),
     ])
-    setLabels(lbls)
-    setLabelMap(lblMap)
+    setGroupMap(gMap)
     const [templates, runs, settingsArr] = await Promise.all([
       Promise.all(names.map(n => getRoutineTemplate(user.id, n))),
-      Promise.all(names.map(n => getTodayRun(user.id, n))),
+      Promise.all(names.map(n => getTodayRunEither(user.id, n))),
       Promise.all(names.map(n => getRoutineSettings(user.id, n))),
     ])
     setRoutines(names.map((name, i) => ({ name, template: templates[i], run: runs[i], settings: settingsArr[i] })))
@@ -1125,35 +1216,6 @@ export default function RoutinesScreen() {
     setActiveTab(prev => (prev === 'weekly' && !sec.weekly) ? 'daily' : prev)
     setLoading(false)
   }, [user])
-
-  async function toggleRoutineLabel(routineName, labelId) {
-    const current = labelMap[routineName] ?? []
-    const next = {
-      ...labelMap,
-      [routineName]: current.includes(labelId)
-        ? current.filter(id => id !== labelId)
-        : [...current, labelId],
-    }
-    setLabelMap(next)
-    await saveRoutineLabelMap(user.id, next)
-  }
-
-  async function saveLabelRename() {
-    const clean = editingLabelName.trim()
-    if (clean) {
-      const next = labels.map(l => l.id === editingLabelId ? { ...l, name: clean } : l)
-      setLabels(next)
-      await saveRoutineLabels(user.id, next)
-    }
-    setEditingLabelId(null)
-    setEditingLabelName('')
-  }
-
-  function closeLabelModal() {
-    setLabelModalFor(null)
-    setEditingLabelId(null)
-    setEditingLabelName('')
-  }
 
   async function handleHide(name) {
     Alert.alert(
@@ -1242,9 +1304,15 @@ export default function RoutinesScreen() {
 
   if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
 
-  const visibleRoutines = routines.filter(r => !hiddenSet.has(r.name))
-  const doneCount = visibleRoutines.filter(r => r.run?.finished).length
-  const allDone = doneCount > 0 && doneCount === visibleRoutines.length
+  const groupOf = n => groupMap[n] ?? 'everyday'
+  const everydayRoutines = routines.filter(r => groupOf(r.name) === 'everyday')
+  const wheneverRoutines = routines.filter(r => groupOf(r.name) === 'whenever')
+
+  // Only Every day routines count toward the daily "all done" celebration —
+  // Whenever routines are optional by definition.
+  const visibleEveryday = everydayRoutines.filter(r => !hiddenSet.has(r.name))
+  const doneCount = visibleEveryday.filter(r => r.run?.finished).length
+  const allDone = doneCount > 0 && doneCount === visibleEveryday.length
 
   return (
     <KeyboardAvoidingView
@@ -1256,7 +1324,7 @@ export default function RoutinesScreen() {
         <DailyDashboard
           user={user}
           profile={profile}
-          routines={routines}
+          routines={everydayRoutines}
           hiddenSet={hiddenSet}
           routineStreaks={routineStreaks}
           theme={theme}
@@ -1293,16 +1361,26 @@ export default function RoutinesScreen() {
             )}
             {/* HIDDEN for now (not deleted) — restore by removing `false &&` */}
             {false && sections.productivity && <ProductivityCard theme={theme} userId={user?.id} />}
-            {routines.length > 1 && (
-              <Pressable
-                onPress={() => router.push('/reorder-routines')}
-                hitSlop={8}
-                style={{ alignSelf: 'flex-end', flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 6, paddingHorizontal: 4, marginBottom: 2 }}
-              >
-                <Text style={{ color: theme.accent, fontWeight: '700', fontSize: 13 }}>⇅ Reorder</Text>
-              </Pressable>
+            {/* ── Every day — priority routines (+ Organize, right-aligned) ── */}
+            <View style={s.groupHeaderRow}>
+              <View style={[s.groupChip, { backgroundColor: EVERYDAY_COLOR + '1c' }]}>
+                <Text style={s.groupHeaderEmoji}>⭐</Text>
+                <Text style={[s.groupHeaderText, { color: EVERYDAY_COLOR }]}>EVERY DAY</Text>
+              </View>
+              <Text style={[s.groupHeaderHint, { color: theme.muted }]}>aim to do these daily</Text>
+              <View style={[s.groupRule, { backgroundColor: EVERYDAY_COLOR + '2a' }]} />
+              {routines.length > 1 && (
+                <Pressable onPress={() => router.push('/reorder-routines')} hitSlop={8}>
+                  <Text style={{ color: theme.accent, fontWeight: '700', fontSize: 13 }}>⇅ Organize</Text>
+                </Pressable>
+              )}
+            </View>
+            {everydayRoutines.length === 0 && (
+              <Text style={[s.groupEmptyHint, { color: theme.muted }]}>
+                No priority routines yet — tap ⇅ Organize to move one here.
+              </Text>
             )}
-            {routines.map(({ name, template, run, settings }) => (
+            {everydayRoutines.map(({ name, template, run, settings }) => (
               <RoutineCard
                 key={name}
                 name={name}
@@ -1316,8 +1394,39 @@ export default function RoutinesScreen() {
                 onHide={() => handleHide(name)}
                 onUnhide={() => handleUnhide(name)}
                 onDelete={() => handleDeleteCustom(name)}
-                routineLabels={(labelMap[name] ?? []).map(id => labels.find(l => l.id === id)).filter(Boolean)}
-                onOpenLabels={() => setLabelModalFor(name)}
+                group="everyday"
+              />
+            ))}
+
+            {/* ── Whenever — no-pressure routines ── */}
+            <View style={[s.groupHeaderRow, { marginTop: 14 }]}>
+              <View style={[s.groupChip, { backgroundColor: WHENEVER_COLOR + '1c' }]}>
+                <Text style={s.groupHeaderEmoji}>🌊</Text>
+                <Text style={[s.groupHeaderText, { color: WHENEVER_COLOR }]}>WHENEVER</Text>
+              </View>
+              <Text style={[s.groupHeaderHint, { color: theme.muted }]}>for when you feel like it</Text>
+              <View style={[s.groupRule, { backgroundColor: WHENEVER_COLOR + '2a' }]} />
+            </View>
+            {wheneverRoutines.length === 0 && (
+              <Text style={[s.groupEmptyHint, { color: theme.muted }]}>
+                Nothing here yet — tap ⇅ Organize to move routines you don't need to do daily.
+              </Text>
+            )}
+            {wheneverRoutines.map(({ name, template, run, settings }) => (
+              <RoutineCard
+                key={name}
+                name={name}
+                template={template}
+                run={run}
+                todayMuscle={name === 'Fitness' ? todayMuscle : null}
+                routineStreak={routineStreaks[name] ?? 0}
+                settings={settings}
+                isDefault={DEFAULT_ROUTINES.has(name)}
+                isHidden={hiddenSet.has(name)}
+                onHide={() => handleHide(name)}
+                onUnhide={() => handleUnhide(name)}
+                onDelete={() => handleDeleteCustom(name)}
+                group="whenever"
               />
             ))}
             <Pressable
@@ -1360,77 +1469,6 @@ export default function RoutinesScreen() {
         onClose={() => setWeeklyModalOpen(false)}
         onSave={handleWeeklyAddRoutine}
       />
-
-      {/* Label picker — assign labels to a routine, rename labels inline */}
-      <Modal
-        visible={!!labelModalFor}
-        transparent
-        animationType="slide"
-        onRequestClose={closeLabelModal}
-      >
-        <KeyboardAvoidingView style={s.settingsOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <Pressable style={s.settingsBg} onPress={closeLabelModal} />
-          <View style={[s.labelSheet, { backgroundColor: theme.card }]}>
-            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
-            <Text style={[s.labelSheetTitle, { color: theme.text }]}>🏷  {labelModalFor}</Text>
-            <Text style={[s.labelSheetSub, { color: theme.muted }]}>
-              Tap a label to add or remove it. Use ✏️ to rename a label everywhere.
-            </Text>
-
-            {labels.map(l => {
-              const active = (labelMap[labelModalFor] ?? []).includes(l.id)
-              const editing = editingLabelId === l.id
-              return (
-                <View key={l.id} style={[s.labelRow, { borderBottomColor: theme.divider }]}>
-                  {editing ? (
-                    <>
-                      <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
-                      <TextInput
-                        style={[s.labelEditInput, { color: theme.text, borderColor: l.color + '88', backgroundColor: theme.bg }]}
-                        value={editingLabelName}
-                        onChangeText={setEditingLabelName}
-                        autoFocus
-                        returnKeyType="done"
-                        onSubmitEditing={saveLabelRename}
-                        maxLength={20}
-                      />
-                      <Pressable onPress={saveLabelRename} hitSlop={8}>
-                        <Text style={{ color: l.color, fontWeight: '800', fontSize: 14 }}>Save</Text>
-                      </Pressable>
-                    </>
-                  ) : (
-                    <>
-                      <Pressable style={s.labelRowMain} onPress={() => toggleRoutineLabel(labelModalFor, l.id)} hitSlop={4}>
-                        <View style={[s.labelChipDot, { backgroundColor: l.color }]} />
-                        <Text style={[s.labelRowName, { color: theme.text }]}>{l.name}</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => { setEditingLabelId(l.id); setEditingLabelName(l.name) }}
-                        hitSlop={8}
-                        style={{ padding: 4 }}
-                      >
-                        <Text style={{ fontSize: 13 }}>✏️</Text>
-                      </Pressable>
-                      <Pressable
-                        onPress={() => toggleRoutineLabel(labelModalFor, l.id)}
-                        hitSlop={8}
-                        style={[s.labelCheck, { borderColor: active ? l.color : theme.muted }, active && { backgroundColor: l.color }]}
-                      >
-                        {active && <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>✓</Text>}
-                      </Pressable>
-                    </>
-                  )}
-                </View>
-              )
-            })}
-
-            <Pressable style={[s.labelDoneBtn, { backgroundColor: theme.accent }]} onPress={closeLabelModal}>
-              <Text style={s.labelDoneBtnText}>Done</Text>
-            </Pressable>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
-
 
     </KeyboardAvoidingView>
   )
@@ -1530,43 +1568,22 @@ const s = StyleSheet.create({
     alignSelf: 'center', marginBottom: 20,
   },
 
-  // Routine labels
-  labelChipsRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: -4, marginBottom: 12 },
-  labelChip: {
+  // Routine group sections (Every day / Whenever)
+  groupHeaderRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: 2, marginBottom: 10, marginTop: 2,
+  },
+  groupChip: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
-    borderRadius: 8, borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4,
+    borderRadius: 9, paddingHorizontal: 9, paddingVertical: 4,
   },
-  labelChipDot: { width: 7, height: 7, borderRadius: 4 },
-  labelChipText: { fontSize: 11, fontWeight: '700' },
-  labelAddChip: {
-    borderRadius: 8, borderWidth: 1, borderStyle: 'dashed',
-    paddingHorizontal: 8, paddingVertical: 4,
+  groupHeaderEmoji: { fontSize: 12 },
+  groupHeaderText: { fontSize: 11, fontWeight: '800', letterSpacing: 0.7 },
+  groupHeaderHint: { fontSize: 11, fontWeight: '500' },
+  groupRule: { flex: 1, height: 2, borderRadius: 1, minWidth: 8 },
+  groupEmptyHint: {
+    fontSize: 12, lineHeight: 17, paddingHorizontal: 4, marginBottom: 14,
   },
-
-  labelSheet: {
-    borderTopLeftRadius: 28, borderTopRightRadius: 28,
-    paddingTop: 10, paddingHorizontal: 24, paddingBottom: 40,
-    shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
-  },
-  labelSheetTitle: { fontSize: 20, fontWeight: '800', letterSpacing: -0.3 },
-  labelSheetSub: { fontSize: 13, marginTop: 4, marginBottom: 8 },
-  labelRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10,
-    paddingVertical: 14, borderBottomWidth: 1,
-  },
-  labelRowMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  labelRowName: { fontSize: 16, fontWeight: '600' },
-  labelCheck: {
-    width: 24, height: 24, borderRadius: 12, borderWidth: 2,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  labelEditInput: {
-    flex: 1, borderRadius: 10, borderWidth: 1.5,
-    paddingHorizontal: 12, paddingVertical: 8, fontSize: 15, fontWeight: '600',
-  },
-  labelDoneBtn: { borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 16 },
-  labelDoneBtnText: { color: '#fff', fontWeight: '800', fontSize: 15 },
 })
 
 const db = StyleSheet.create({
@@ -1598,6 +1615,45 @@ const db = StyleSheet.create({
   eventRow:    { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 3 },
   eventTitle:  { flex: 1, fontSize: 13, fontWeight: '500' },
   eventTime:   { fontSize: 11, fontWeight: '600' },
+
+  // Rules for today
+  rulesHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
+  rulesTitle: { fontSize: 13, fontWeight: '700' },
+  rulesEdit: { fontSize: 12, fontWeight: '700' },
+  ruleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },
+  ruleNum: {
+    width: 20, height: 20, borderRadius: 7,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  ruleNumText: { fontSize: 11, fontWeight: '800' },
+  ruleText: { flex: 1, fontSize: 13, fontWeight: '500', lineHeight: 18 },
+
+  rulesSheet: {
+    borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    paddingTop: 10, paddingHorizontal: 24, paddingBottom: 40,
+    shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
+  },
+  rulesSheetTitle: { fontSize: 20, fontWeight: '800', letterSpacing: -0.3 },
+  rulesSheetSub: { fontSize: 13, marginTop: 4, marginBottom: 10 },
+  rulesEditRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 10, borderBottomWidth: 1,
+  },
+  rulesEditInput: { flex: 1, fontSize: 15, fontWeight: '500', paddingVertical: 2 },
+  rulesDelete: { fontSize: 13, fontWeight: '600', padding: 4 },
+  rulesAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 14 },
+  rulesAddInput: {
+    flex: 1, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,
+    fontSize: 15, borderWidth: 1.5,
+  },
+  rulesAddBtn: {
+    width: 38, height: 38, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  rulesAddBtnText: { color: '#fff', fontWeight: '800', fontSize: 20, lineHeight: 22 },
+  rulesDoneBtn: { borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 16 },
+  rulesDoneBtnText: { color: '#fff', fontWeight: '800', fontSize: 15 },
 })
 
 const pc = StyleSheet.create({
