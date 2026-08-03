@@ -7,7 +7,7 @@
     "icon": "./assets/icon.png",
     "scheme": "productivityapp",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": false,
+    "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.shreyj.productivityapp",
