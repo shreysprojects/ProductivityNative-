@@ -15,7 +15,13 @@
     },
     "android": {
       "package": "com.shreyj.productivityapp",
-      "softwareKeyboardLayoutMode": "resize"
+      "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -25,13 +31,19 @@
       "expo-router",
       "expo-secure-store",
       "expo-web-browser",
-      ["expo-camera", {
-        "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes"
-      }],
-      ["expo-image-picker", {
-        "photosPermission": "Allow LifeLayer to access your photos for AI skin analysis.",
-        "cameraPermission": "Allow LifeLayer to take a photo for AI skin analysis."
-      }],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow LifeLayer to access your photos for AI skin analysis.",
+          "cameraPermission": "Allow LifeLayer to take a photo for AI skin analysis."
+        }
+      ],
       [
         "expo-notifications",
         {
@@ -43,6 +55,19 @@
     ],
     "experiments": {
       "typedRoutes": false
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "a3a61b51-3b0b-4f6f-8ddb-e07fba21ec41"
+      }
+    },
+    "owner": "shreyj7",
+    "runtimeVersion": {
+      "policy": "sdkVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/a3a61b51-3b0b-4f6f-8ddb-e07fba21ec41"
     }
   }
 }
