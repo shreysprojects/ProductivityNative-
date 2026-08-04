@@ -20,7 +20,7 @@ import {
   getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
-  setLooksInRoutine, syncIntegratedTasks, altRoutineName,
+  setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import MuscleMap from '../../components/MuscleMap'
@@ -1748,6 +1748,25 @@ export default function RoutineScreen() {
     setTemplate(tasks)
   }
 
+  // Clear the alternative back to its empty state. Past completed days stay.
+  function confirmWipeAlt() {
+    Alert.alert(
+      'Delete alternative?',
+      `This removes your alternative ${name} routine and its progress today. Days you completed in the past are kept. You can rebuild it anytime.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete', style: 'destructive',
+          onPress: async () => {
+            await wipeAltRoutine(user.id, name)
+            setTemplate([])
+            setRun(null)
+          },
+        },
+      ]
+    )
+  }
+
   // Seed the alternative from the current main routine.
   async function copyMainToAlt() {
     const mainTmpl = await getRoutineTemplate(user.id, name)
@@ -2437,6 +2456,13 @@ export default function RoutineScreen() {
                   <Text style={s.startBtnSparkle}>✦</Text>
                 </Pressable>
               </Animated.View>
+            )}
+
+            {/* Alternative: wipe it back to empty */}
+            {isAlt && template.length > 0 && (
+              <Pressable style={s.resetBtn} onPress={confirmWipeAlt}>
+                <Text style={s.resetText}>Delete alternative routine</Text>
+              </Pressable>
             )}
           </>
         )}
