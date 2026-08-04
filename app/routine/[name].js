@@ -1606,21 +1606,29 @@ export default function RoutineScreen() {
   const contentFade   = useRef(new Animated.Value(1)).current
 
   // Morning greeting chooser: shown once when opening Morning before anything
-  // has been started today. { mainTime, altTime } or null.
+  // has been started today. { mainTime, altTime } or null. While `chooserPending`
+  // the page renders nothing but background, so the greeting is the first thing
+  // seen — never the routine page behind it.
   const [chooser, setChooser] = useState(null)
-  const chooserAnim = useRef(new Animated.Value(0)).current
+  const [chooserPending, setChooserPending] = useState(name === 'Morning')
+  const chooserAnim = useRef(new Animated.Value(0)).current  // staggers the text/buttons in
+  const chooserBg   = useRef(new Animated.Value(1)).current  // full overlay fade on dismiss
 
   useEffect(() => {
-    if (chooser) {
+    // Start the entrance only once the overlay is actually on screen
+    // (post-load), so the full stagger is visible.
+    if (chooser && !loading) {
+      chooserBg.setValue(1)
       chooserAnim.setValue(0)
       Animated.timing(chooserAnim, { toValue: 1, duration: 650, useNativeDriver: true }).start()
     }
-  }, [chooser])
+  }, [chooser, loading])
 
   function chooseVariant(v) {
-    Animated.timing(chooserAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => {
+    if (v === 'alt') switchVariant('alt') // start loading behind the overlay
+    Animated.timing(chooserBg, { toValue: 0, duration: 260, useNativeDriver: true }).start(() => {
       setChooser(null)
-      if (v === 'alt') switchVariant('alt')
+      setChooserPending(false)
     })
   }
 
@@ -1635,6 +1643,7 @@ export default function RoutineScreen() {
         getTodayRun(user.id, altRoutineName(name)),
       ])
       if (!mainRun && altRun) {
+        setChooserPending(false)
         setVariant('alt')
         return // variant change re-triggers load with the alt storage name
       }
@@ -1649,6 +1658,8 @@ export default function RoutineScreen() {
           mainTime: fmtRoutineDuration(mainTmpl),
           altTime: altTmpl.length > 0 ? fmtRoutineDuration(altTmpl) : 'Not set up yet',
         })
+      } else {
+        setChooserPending(false)
       }
     }
     const promises = [
@@ -1940,7 +1951,11 @@ export default function RoutineScreen() {
     )
   }
 
-  if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
+  // Blank themed background while loading, and while deciding whether the
+  // morning chooser should show — the routine page must never flash first.
+  if (loading || (chooserPending && !chooser)) {
+    return <View style={[s.page, { backgroundColor: theme.bg }]} />
+  }
 
   const todayIdx = todaySplitIndex()
   const todayMuscle = gymSplit?.days?.[todayIdx] ?? 'Rest'
@@ -2611,7 +2626,7 @@ export default function RoutineScreen() {
         <Animated.View
           style={[s.chooserOverlay, {
             backgroundColor: theme.bg,
-            opacity: chooserAnim.interpolate({ inputRange: [0, 0.15], outputRange: [0, 1], extrapolate: 'clamp' }),
+            opacity: chooserBg,
           }]}
         >
           <Animated.Text style={[s.chooserGreeting, {
