@@ -1602,6 +1602,8 @@ export default function RoutineScreen() {
 
   const startBtnScale = useRef(new Animated.Value(1)).current
   const doneAnim      = useRef(new Animated.Value(0)).current
+  // Content cross-fade for Main/Alternative tab switches (no blank flash).
+  const contentFade   = useRef(new Animated.Value(1)).current
 
   // Morning greeting chooser: shown once when opening Morning before anything
   // has been started today. { mainTime, altTime } or null.
@@ -1672,13 +1674,16 @@ export default function RoutineScreen() {
       setMorningSettings(ms)
     }
     setLoading(false)
+    Animated.timing(contentFade, { toValue: 1, duration: 160, useNativeDriver: true }).start()
   }, [user, name, storageName, isAlt, isFitness, isMorning])
 
   useFocusEffect(useCallback(() => { load() }, [load]))
 
   function switchVariant(v) {
     if (v === variant) return
-    setLoading(true) // blank instead of flashing the other variant's tasks
+    // Dim the current content while the other variant loads; load() fades it
+    // back in once the new data is set. Header and tabs stay in place.
+    Animated.timing(contentFade, { toValue: 0.25, duration: 120, useNativeDriver: true }).start()
     setVariant(v)
   }
 
@@ -2019,6 +2024,7 @@ export default function RoutineScreen() {
         })}
       </View>
 
+      <Animated.View style={{ flex: 1, opacity: contentFade }}>
       <ScrollView
         contentContainerStyle={s.content}
         keyboardShouldPersistTaps="handled"
@@ -2588,6 +2594,7 @@ export default function RoutineScreen() {
         )}
 
       </ScrollView>
+      </Animated.View>
 
       <AIRoutineModal
         visible={aiModalOpen}
