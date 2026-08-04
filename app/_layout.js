@@ -2,7 +2,7 @@ import 'react-native-url-polyfill/auto'
 import { useEffect, useRef, useState } from 'react'
 import { Animated, StyleSheet, View, Image } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
-import { Slot } from 'expo-router'
+import { Stack } from 'expo-router'
 import { AuthProvider } from '../lib/AuthContext'
 import { ThemeProvider, useTheme } from '../lib/ThemeContext'
 import { ProductivityProvider } from '../lib/ProductivityContext'
@@ -60,7 +60,14 @@ function Inner() {
     // Themed background here so route transitions never flash white.
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
       <StatusBar style={theme.statusBar} />
-      <Slot />
+      {/* Real stack navigator: native slide transitions between screens, so
+          pages animate in instead of cutting to a blank frame while loading. */}
+      <Stack
+        screenOptions={{
+          headerShown: false,
+          contentStyle: { backgroundColor: theme.bg },
+        }}
+      />
       {!splashDone && <SplashOverlay onDone={() => setSplashDone(true)} />}
     </View>
   )

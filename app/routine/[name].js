@@ -1602,8 +1602,9 @@ export default function RoutineScreen() {
 
   const startBtnScale = useRef(new Animated.Value(1)).current
   const doneAnim      = useRef(new Animated.Value(0)).current
-  // Content cross-fade for Main/Alternative tab switches (no blank flash).
-  const contentFade   = useRef(new Animated.Value(1)).current
+  // Content cross-fade: starts hidden so the first load fades in smoothly,
+  // and Main/Alternative tab switches dim + restore instead of blanking.
+  const contentFade   = useRef(new Animated.Value(0)).current
 
   // Morning greeting chooser: shown once when opening Morning before anything
   // has been started today. { mainTime, altTime } or null. While `chooserPending`
