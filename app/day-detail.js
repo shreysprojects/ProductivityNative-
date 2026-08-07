@@ -10,6 +10,7 @@ import {
   getTasks, getJournalEntries,
 } from '../lib/storage'
 import MuscleMap from '../components/MuscleMap'
+import { readingStats } from '../lib/textStats'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -115,10 +116,12 @@ function pctColor(p) {
 export default function DayDetailScreen() {
   const { date } = useLocalSearchParams()
   const { user } = useAuth()
-  const { theme } = useTheme()
+  const { theme, unit } = useTheme()
   const insets = useSafeAreaInsets()
 
   const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
   const [history, setHistory] = useState([])
   const [runs,    setRuns]    = useState([])
   const [workout, setWorkout] = useState(null)
@@ -130,30 +133,37 @@ export default function DayDetailScreen() {
   useEffect(() => {
     if (!user || !date) { setLoading(false); return }
     async function load() {
-      const [hist, runData, wlog, mealList, allEvents, allTasks, journalMap] = await Promise.all([
-        getHistoryForDate(user.id, date),
-        getRoutineRunsForDate(user.id, date),
-        getWorkoutLog(user.id, date),
-        getMeals(user.id, date),
-        getCalendarEvents(user.id),
-        getTasks(user.id),
-        getJournalEntries(user.id),
-      ])
-      setHistory(hist)
-      setRuns(runData)
-      setWorkout(wlog)
-      setMeals(mealList)
-      setEvents(
-        allEvents
-          .filter(e => e.date === date)
-          .sort((a, b) => (a.time ?? '').localeCompare(b.time ?? ''))
-      )
-      setTasks(allTasks.filter(t => t.dueDate === date))
-      setJournal(journalMap[date] ?? null)
-      setLoading(false)
+      setLoading(true)
+      setError(false)
+      try {
+        const [hist, runData, wlog, mealList, allEvents, allTasks, journalMap] = await Promise.all([
+          getHistoryForDate(user.id, date),
+          getRoutineRunsForDate(user.id, date),
+          getWorkoutLog(user.id, date),
+          getMeals(user.id, date),
+          getCalendarEvents(user.id),
+          getTasks(user.id),
+          getJournalEntries(user.id),
+        ])
+        setHistory(hist)
+        setRuns(runData)
+        setWorkout(wlog)
+        setMeals(mealList)
+        setEvents(
+          allEvents
+            .filter(e => e.date === date)
+            .sort((a, b) => (a.time ?? '').localeCompare(b.time ?? ''))
+        )
+        setTasks(allTasks.filter(t => t.dueDate === date))
+        setJournal(journalMap[date] ?? null)
+      } catch {
+        setError(true)
+      } finally {
+        setLoading(false)
+      }
     }
     load()
-  }, [user, date])
+  }, [user, date, reloadKey])
 
   const isActive  = history.length > 0 || !!workout
   const doneTasks = tasks.filter(t => t.done)
@@ -175,7 +185,7 @@ export default function DayDetailScreen() {
         <Text style={[s.headerTitle, { color: theme.text }]} numberOfLines={2}>
           {date ? formatDateFull(date) : '—'}
         </Text>
-        {!loading && (
+        {!loading && !error && (
           <View style={[s.statusBadge, { backgroundColor: isActive ? '#10b98118' : (theme.isDark ? '#ffffff0d' : '#0000000a') }]}>
             <Text style={{ fontSize: 13 }}>{isActive ? '🔥' : '😴'}</Text>
             <Text style={[s.statusText, { color: isActive ? '#10b981' : theme.muted }]}>
@@ -187,6 +197,20 @@ export default function DayDetailScreen() {
 
       {loading ? (
         <ActivityIndicator color={theme.accent} style={{ marginTop: 48 }} />
+      ) : error ? (
+        <View style={s.errorWrap}>
+          <Text style={{ fontSize: 44, marginBottom: 14 }}>⚠️</Text>
+          <Text style={[s.emptyTitle, { color: theme.text }]}>Couldn't load this day</Text>
+          <Text style={[s.emptySubtitle, { color: theme.muted, textAlign: 'center' }]}>
+            Check your connection and try again.
+          </Text>
+          <Pressable
+            onPress={() => setReloadKey(k => k + 1)}
+            style={[s.retryBtn, { backgroundColor: theme.accent }]}
+          >
+            <Text style={s.retryText}>Retry</Text>
+          </Pressable>
+        </View>
       ) : (
         <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
 
@@ -302,9 +326,9 @@ export default function DayDetailScreen() {
                             {exSets.map((set, si) => (
                               <View key={si} style={[s.setChip, { backgroundColor: theme.isDark ? '#ffffff12' : '#0000000a' }]}>
                                 <Text style={[s.setChipText, { color: theme.subtext }]}>
-                                  {ex.inputType === 'time'
-                                    ? fmtMs((Number(set.time) || 0) * 1000) ?? '—'
-                                    : `${set.reps ?? '—'} × ${set.weight ?? '—'}${set.unit ?? 'lb'}`}
+                                  {(set.isTime ?? (ex.inputType === 'time'))
+                                    ? fmtMs((Number(set.time ?? set.weight) || 0) * 1000) ?? '—'
+                                    : `${set.reps ?? '—'} × ${set.weight ?? '—'}${set.unit ?? unit}`}
                                 </Text>
                               </View>
                             ))}
@@ -422,7 +446,10 @@ export default function DayDetailScreen() {
               ) : null}
 
               {journal.text ? (
-                <Text style={[s.journalText, { color: theme.text }]}>{journal.text}</Text>
+                <>
+                  <Text style={[s.journalText, { color: theme.text }]}>{journal.text}</Text>
+                  <Text style={[s.journalStats, { color: theme.muted }]}>{readingStats(journal.text)}</Text>
+                </>
               ) : (
                 <Text style={[s.journalText, { color: theme.muted, fontStyle: 'italic' }]}>(mood only)</Text>
               )}
@@ -528,6 +555,7 @@ const s = StyleSheet.create({
   moodChip: { flexDirection: 'row', alignItems: 'center', gap: 8, alignSelf: 'flex-start', borderRadius: 20, paddingHorizontal: 12, paddingVertical: 6, marginBottom: 12 },
   moodLabel: { fontSize: 14, fontWeight: '700' },
   journalText: { fontSize: 14, lineHeight: 22 },
+  journalStats: { fontSize: 11, fontWeight: '600', marginTop: 8 },
 
   evRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, gap: 12 },
   evIcon: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
@@ -535,4 +563,8 @@ const s = StyleSheet.create({
 
   emptyTitle: { fontSize: 17, fontWeight: '700', marginBottom: 6 },
   emptySubtitle: { fontSize: 13 },
+
+  errorWrap: { alignItems: 'center', paddingHorizontal: 32, paddingTop: 56 },
+  retryBtn: { borderRadius: 14, paddingHorizontal: 24, paddingVertical: 12, marginTop: 18 },
+  retryText: { color: '#fff', fontSize: 14, fontWeight: '700' },
 })

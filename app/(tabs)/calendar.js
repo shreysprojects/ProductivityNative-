@@ -17,6 +17,7 @@ import {
   getWorkoutLog, getMeals,
 } from '../../lib/storage'
 import { loadHabits } from '../../lib/habitsStorage'
+import { readingStats } from '../../lib/textStats'
 
 const HABIT_DOT_COLOR = '#f43f5e'
 
@@ -973,9 +974,14 @@ export default function CalendarScreen() {
                           </Text>
                         )}
                         {entry.text ? (
-                          <Text style={[s.journalPreviewText, { color: theme.subtext }]} numberOfLines={3}>
-                            {entry.text}
-                          </Text>
+                          <>
+                            <Text style={[s.journalPreviewText, { color: theme.subtext }]} numberOfLines={3}>
+                              {entry.text}
+                            </Text>
+                            <Text style={[s.journalPreviewStats, { color: theme.muted }]}>
+                              {readingStats(entry.text)}
+                            </Text>
+                          </>
                         ) : (
                           <Text style={[s.journalPreviewText, { color: theme.muted, fontStyle: 'italic' }]}>
                             (mood only)
@@ -1594,7 +1600,10 @@ export default function CalendarScreen() {
               ))}
             </View>
 
-            <Text style={[s.fieldLabel, { color: theme.muted }]}>ENTRY</Text>
+            <View style={s.entryLabelRow}>
+              <Text style={[s.fieldLabel, { color: theme.muted }]}>ENTRY</Text>
+              <Text style={[s.entryStats, { color: theme.muted }]}>{readingStats(jText)}</Text>
+            </View>
             <TextInput
               style={[s.journalTextArea, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
               placeholder="What's on your mind today?"
@@ -1798,6 +1807,7 @@ const s = StyleSheet.create({
   journalSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
   journalPreview: { borderRadius: 14, padding: 12, borderWidth: 1 },
   journalPreviewText: { fontSize: 13, lineHeight: 18 },
+  journalPreviewStats: { fontSize: 11, fontWeight: '600', marginTop: 6 },
   journalEmptyBtn: { borderRadius: 14, padding: 12, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center' },
   journalEmptyText: { fontSize: 13, fontStyle: 'italic' },
   moodRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap', marginBottom: 16 },
@@ -1816,6 +1826,8 @@ const s = StyleSheet.create({
   },
   journalSave: { fontSize: 16, fontWeight: '700', color: '#0ea5e9', padding: 4 },
   journalBody: { flex: 1, paddingHorizontal: 24 },
+  entryLabelRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  entryStats: { fontSize: 11, fontWeight: '600', marginBottom: 8, marginTop: 4 },
   journalTextArea: {
     flex: 1, borderRadius: 14, borderWidth: 1,
     paddingHorizontal: 14, paddingVertical: 12, paddingTop: 12,
