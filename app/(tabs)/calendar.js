@@ -4,6 +4,7 @@ import {
   Modal, TextInput, Alert, KeyboardAvoidingView, Platform,
 } from 'react-native'
 import * as Notifications from 'expo-notifications'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useFocusEffect, router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
@@ -232,6 +233,7 @@ const ti = StyleSheet.create({
 export default function CalendarScreen() {
   const { user } = useAuth()
   const { theme } = useTheme()
+  const insets = useSafeAreaInsets()
   const today = todayStr()
   const now = new Date()
   const { openJournal: openJournalParam } = useLocalSearchParams()
@@ -298,6 +300,10 @@ export default function CalendarScreen() {
   // Habits
   const [habitEventsByDate, setHabitEventsByDate] = useState({})
 
+  // Load state
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(false)
+
   // Per-date detail extras
   const [selectedWorkout, setSelectedWorkout] = useState(null)
   const [selectedMeals, setSelectedMeals]     = useState([])
@@ -333,46 +339,53 @@ export default function CalendarScreen() {
 
   const load = useCallback(async () => {
     if (!user) return
-    const [hist, str, evts, sched, taskList, jEntries, habitsData] = await Promise.all([
-      getHistory(user.id), getStreak(user.id),
-      getCalendarEvents(user.id), getScheduleItems(user.id),
-      getTasks(user.id), getJournalEntries(user.id),
-      loadHabits(user.id),
-    ])
-    const map = {}, byDate = {}
-    hist.forEach(h => {
-      if (!map[h.date] || map[h.date] < h.completion) map[h.date] = h.completion
-      if (!byDate[h.date]) byDate[h.date] = []
-      byDate[h.date].push(h)
-    })
-    setCompletionMap(map)
-    setHistoryByDate(byDate)
-    setStreak(str)
-    setEvents(evts)
-    setScheduleItems(sched)
-    setTasks(taskList)
-    setJournalEntries(jEntries)
-    const hmap = {}
-    for (const habit of habitsData.breaking) {
-      for (const entry of habit.history) {
-        const d = entry.date.slice(0, 10)
-        if (!hmap[d]) hmap[d] = []
-        hmap[d].push({ type: entry.type, habitName: habit.name })
+    try {
+      const [hist, str, evts, sched, taskList, jEntries, habitsData] = await Promise.all([
+        getHistory(user.id), getStreak(user.id),
+        getCalendarEvents(user.id), getScheduleItems(user.id),
+        getTasks(user.id), getJournalEntries(user.id),
+        loadHabits(user.id),
+      ])
+      const map = {}, byDate = {}
+      hist.forEach(h => {
+        if (!map[h.date] || map[h.date] < h.completion) map[h.date] = h.completion
+        if (!byDate[h.date]) byDate[h.date] = []
+        byDate[h.date].push(h)
+      })
+      setCompletionMap(map)
+      setHistoryByDate(byDate)
+      setStreak(str)
+      setEvents(evts)
+      setScheduleItems(sched)
+      setTasks(taskList)
+      setJournalEntries(jEntries)
+      const hmap = {}
+      for (const habit of habitsData.breaking) {
+        for (const entry of habit.history) {
+          const d = entry.date.slice(0, 10)
+          if (!hmap[d]) hmap[d] = []
+          hmap[d].push({ type: entry.type, habitName: habit.name })
+        }
       }
-    }
-    setHabitEventsByDate(hmap)
+      setHabitEventsByDate(hmap)
+      setError(false)
 
-    if (openJournalParam) {
-      const td = todayStr()
-      const existing = jEntries[td]
-      setSelected(td)
-      const d = new Date(td + 'T12:00:00')
-      setViewDate({ year: d.getFullYear(), month: d.getMonth() })
-      setJDate(td)
-      setJMood(existing?.mood ?? null)
-      setJText(existing?.text ?? '')
-      setJournalOpen(true)
-      router.setParams({ openJournal: undefined })
+      if (openJournalParam) {
+        const td = todayStr()
+        const existing = jEntries[td]
+        setSelected(td)
+        const d = new Date(td + 'T12:00:00')
+        setViewDate({ year: d.getFullYear(), month: d.getMonth() })
+        setJDate(td)
+        setJMood(existing?.mood ?? null)
+        setJText(existing?.text ?? '')
+        setJournalOpen(true)
+        router.setParams({ openJournal: undefined })
+      }
+    } catch {
+      setError(true)
+    } finally {
+      setLoading(false)
     }
   }, [user, openJournalParam])
 
@@ -692,14 +705,28 @@ export default function CalendarScreen() {
 
   // ── JSX ───────────────────────────────────────────────────────────────────
 
+  if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
+
+  if (error) return (
+    <View style={[s.page, s.errorPage, { backgroundColor: theme.bg }]}>
+      <Text style={[s.errorTitle, { color: theme.text }]}>We couldn't load your calendar</Text>
+      <Text style={[s.errorSub, { color: theme.subtext }]}>Check your connection and try again.</Text>
+      <Pressable
+        style={[s.errorBtn, { backgroundColor: theme.accent }]}
+        onPress={() => { setLoading(true); load() }}
+      >
+        <Text style={s.errorBtnText}>Retry</Text>
+      </Pressable>
+    </View>
+  )
+
   return (
     <View style={[s.page, { backgroundColor: theme.bg }]}>
 
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {/* 'tasks' HIDDEN for now (not deleted) — restore: ['month', 'week', 'tasks'] */}
-          {['month', 'week'].map(mode => (
+          {['month', 'week', 'tasks'].map(mode => (
             <Pressable
               key={mode}
               style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}
@@ -1528,55 +1555,56 @@ export default function CalendarScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ── Journal modal ──────────────────────────────────────────────────── */}
-      <Modal visible={journalOpen} transparent animationType="slide" onRequestClose={() => setJournalOpen(false)}>
-        <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <Pressable style={[StyleSheet.absoluteFillObject, s.modalBg]} onPress={() => setJournalOpen(false)} />
-          <View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card }]}>
-            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-              <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
-              <Text style={[s.modalTitle, { color: theme.text }]}>
-                {jDate ? formatDate(jDate) : 'Journal'}
+      {/* ── Journal modal — full-screen editor so long entries stay visible ── */}
+      <Modal visible={journalOpen} animationType="slide" onRequestClose={() => setJournalOpen(false)}>
+        <KeyboardAvoidingView
+          style={[s.journalPage, { backgroundColor: theme.card }]}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <View style={[s.journalHeader, { paddingTop: insets.top + 10 }]}>
+            <Pressable onPress={() => setJournalOpen(false)} hitSlop={12}>
+              <Text style={[s.journalClose, { color: theme.muted }]}>✕</Text>
+            </Pressable>
+            <Text style={[s.journalHeaderTitle, { color: theme.text }]} numberOfLines={1}>
+              {jDate ? formatDate(jDate) : 'Journal'}
+            </Text>
+            <Pressable onPress={handleSaveJournal} disabled={jSaving} hitSlop={12}>
+              <Text style={[s.journalSave, { opacity: jSaving ? 0.5 : 1 }]}>
+                {jSaving ? 'Saving…' : 'Save'}
               </Text>
+            </Pressable>
+          </View>
 
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>MOOD</Text>
-              <View style={s.moodRow}>
-                {MOODS.map(m => (
-                  <Pressable
-                    key={m.key}
-                    style={[
-                      s.moodBtn,
-                      { borderColor: jMood === m.key ? '#0ea5e9' : theme.cardBorder,
-                        backgroundColor: jMood === m.key ? '#0ea5e918' : (theme.isDark ? '#1c1c32' : '#f4f8ff') },
-                    ]}
-                    onPress={() => setJMood(jMood === m.key ? null : m.key)}
-                  >
-                    <Text style={s.moodBtnEmoji}>{m.emoji}</Text>
-                    <Text style={[s.moodBtnLabel, { color: jMood === m.key ? '#0ea5e9' : theme.muted }]}>{m.label}</Text>
-                  </Pressable>
-                ))}
-              </View>
+          <View style={s.journalBody}>
+            <Text style={[s.fieldLabel, { color: theme.muted }]}>MOOD</Text>
+            <View style={s.moodRow}>
+              {MOODS.map(m => (
+                <Pressable
+                  key={m.key}
+                  style={[
+                    s.moodBtn,
+                    { borderColor: jMood === m.key ? '#0ea5e9' : theme.cardBorder,
+                      backgroundColor: jMood === m.key ? '#0ea5e918' : (theme.isDark ? '#1c1c32' : '#f4f8ff') },
+                  ]}
+                  onPress={() => setJMood(jMood === m.key ? null : m.key)}
+                >
+                  <Text style={s.moodBtnEmoji}>{m.emoji}</Text>
+                  <Text style={[s.moodBtnLabel, { color: jMood === m.key ? '#0ea5e9' : theme.muted }]}>{m.label}</Text>
+                </Pressable>
+              ))}
+            </View>
 
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>ENTRY</Text>
-              <TextInput
-                style={[s.journalTextArea, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                placeholder="What's on your mind today?"
-                placeholderTextColor={theme.muted}
-                value={jText}
-                onChangeText={setJText}
-                multiline
-              />
-
-              <Pressable
-                style={[s.saveBtn, { backgroundColor: '#0ea5e9', opacity: jSaving ? 0.6 : 1, marginTop: 16 }]}
-                onPress={handleSaveJournal}
-                disabled={jSaving}
-              >
-                <Text style={s.saveBtnText}>
-                  {jSaving ? 'Saving…' : journalEntries[jDate] ? 'Update Entry' : 'Save Entry'}
-                </Text>
-              </Pressable>
-            </ScrollView>
+            <Text style={[s.fieldLabel, { color: theme.muted }]}>ENTRY</Text>
+            <TextInput
+              style={[s.journalTextArea, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+              placeholder="What's on your mind today?"
+              placeholderTextColor={theme.muted}
+              value={jText}
+              onChangeText={setJText}
+              multiline
+              scrollEnabled
+            />
+            <View style={{ height: Math.max(insets.bottom, 12) }} />
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -1590,9 +1618,17 @@ export default function CalendarScreen() {
 const s = StyleSheet.create({
   page: { flex: 1 },
 
+  // Load failure
+  errorPage: { alignItems: 'center', justifyContent: 'center', padding: 32 },
+  errorTitle: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2, textAlign: 'center' },
+  errorSub: { fontSize: 13, fontWeight: '500', textAlign: 'center', marginTop: 6, lineHeight: 18 },
+  errorBtn: { borderRadius: 16, paddingVertical: 13, paddingHorizontal: 30, marginTop: 20 },
+  errorBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+
   // Toggle bar
   toggleBar: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    flexWrap: 'wrap', rowGap: 8,
     paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1,
   },
   togglePill: { flexDirection: 'row', borderRadius: 20, padding: 3 },
@@ -1768,10 +1804,22 @@ const s = StyleSheet.create({
   moodBtn: { borderRadius: 14, padding: 10, alignItems: 'center', borderWidth: 1.5, minWidth: 56 },
   moodBtnEmoji: { fontSize: 22 },
   moodBtnLabel: { fontSize: 10, fontWeight: '600', marginTop: 3 },
+  journalPage: { flex: 1 },
+  journalHeader: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 20, paddingBottom: 10,
+  },
+  journalClose: { fontSize: 20, fontWeight: '600', padding: 4 },
+  journalHeaderTitle: {
+    flex: 1, textAlign: 'center', marginHorizontal: 10,
+    fontSize: 17, fontWeight: '700', letterSpacing: -0.3,
+  },
+  journalSave: { fontSize: 16, fontWeight: '700', color: '#0ea5e9', padding: 4 },
+  journalBody: { flex: 1, paddingHorizontal: 24 },
   journalTextArea: {
-    borderRadius: 14, borderWidth: 1,
-    paddingHorizontal: 14, paddingVertical: 12,
-    fontSize: 15, minHeight: 140, textAlignVertical: 'top',
+    flex: 1, borderRadius: 14, borderWidth: 1,
+    paddingHorizontal: 14, paddingVertical: 12, paddingTop: 12,
+    fontSize: 15, lineHeight: 22, textAlignVertical: 'top',
   },
 
   dueDatePresets: { flexDirection: 'row', gap: 8, marginBottom: 8 },
