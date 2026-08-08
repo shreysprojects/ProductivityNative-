@@ -10,6 +10,7 @@ import * as Notifications from 'expo-notifications'
 import { supabase } from '../lib/supabase'
 import { flushQueue } from '../lib/syncQueue'
 import { syncFromCloud } from '../lib/cloudSync'
+import ErrorBoundary from '../components/ErrorBoundary'
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -114,11 +115,13 @@ const sp = StyleSheet.create({
 export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <ThemeProvider>
-        <AuthProvider>
-          <Inner />
-        </AuthProvider>
-      </ThemeProvider>
+      <ErrorBoundary>
+        <ThemeProvider>
+          <AuthProvider>
+            <Inner />
+          </AuthProvider>
+        </ThemeProvider>
+      </ErrorBoundary>
     </GestureHandlerRootView>
   )
 }

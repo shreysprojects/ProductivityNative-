@@ -486,6 +486,8 @@ export default function CalendarScreen() {
       }
 
       for (const item of scheduleItems) {
+        // Defensive: one malformed row must not take the whole tab down.
+        if (!Array.isArray(item?.days) || !item.startTime || !item.endTime) continue
         if (!item.days.includes(dow)) continue
         if (item.semesterStart && day < item.semesterStart) continue
         if (item.semesterEnd   && day > item.semesterEnd)   continue
@@ -498,7 +500,7 @@ export default function CalendarScreen() {
         })
       }
 
-      result[day] = dayEvs.sort((a, b) => a.startTime.localeCompare(b.startTime))
+      result[day] = dayEvs.sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''))
     }
     return result
   }, [weekDays, events, scheduleItems])
