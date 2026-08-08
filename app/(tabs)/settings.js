@@ -2,14 +2,20 @@ import { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, ScrollView, TextInput,
   StyleSheet, Alert, ActivityIndicator, Switch,
-  KeyboardAvoidingView, Platform,
+  KeyboardAvoidingView, Platform, Share,
 } from 'react-native'
 import { Image } from 'expo-image'
 import { useFocusEffect } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import { getUserGoals, saveUserGoals } from '../../lib/goalsStorage'
-import { saveGymSplit } from '../../lib/storage'
+import {
+  saveGymSplit, getRoutineNames, getRoutineTemplate, getHistory,
+  getWorkoutRoutineList, getWorkoutPlan, getAllWorkoutLogs,
+  getRecentMealHistory, getJournalEntries,
+} from '../../lib/storage'
+import { getBlockedIds, unblockUser } from '../../lib/blockedStorage'
+import { supabase } from '../../lib/supabase'
 import {
   calculateGoals, generateGymSplit,
   ACTIVITY_LABELS, GOAL_LABELS,
@@ -78,6 +84,19 @@ function validateUsernameFormat(u) {
   return 'valid'
 }
 
+// Postgres RAISE EXCEPTION puts the code in `message` and the readable text in `hint`.
+const FRIENDLY_DB_ERRORS = {
+  inappropriate_content: "That contains a word we don't allow. Please edit it and try again.",
+  name_too_long: 'Your name is too long — please keep it under 40 characters.',
+  username_too_long: 'That username is too long — please keep it under 30 characters.',
+  bio_too_long: 'Your bio is too long — please keep it under 200 characters.',
+  invalid_avatar_url: 'Please upload your photo through the app.',
+}
+
+function friendlyError(e, fallback = 'Something went wrong. Please try again.') {
+  return FRIENDLY_DB_ERRORS[e?.message] ?? e?.hint ?? e?.message ?? fallback
+}
+
 export default function SettingsScreen() {
   const { user, profile, refreshProfile, signOut, deleteAccount } = useAuth()
   const { theme, toggleDark, unit: appUnit, toggleUnit } = useTheme()
@@ -128,6 +147,12 @@ export default function SettingsScreen() {
 
   // App sections (drives the hidden SECTIONS / BOTTOM TABS toggle groups)
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
+
+  // Privacy & data
+  const [blockedOpen, setBlockedOpen]       = useState(false)
+  const [blockedList, setBlockedList]       = useState([])
+  const [blockedLoading, setBlockedLoading] = useState(false)
+  const [exporting, setExporting]           = useState(false)
 
   useFocusEffect(useCallback(() => {
     if (user) getSections(user.id).then(setSections)
@@ -281,7 +306,7 @@ export default function SettingsScreen() {
       })
       await refreshProfile()
     } catch (e) {
-      Alert.alert('Error', e.message)
+      Alert.alert('Error', friendlyError(e, 'We could not update your photo. Please try again.'))
     } finally {
       setUploadingAvatar(false)
     }
@@ -305,9 +330,109 @@ export default function SettingsScreen() {
       await refreshProfile()
       Alert.alert('Saved', 'Profile updated.')
     } catch (e) {
-      Alert.alert('Error', e.message)
+      Alert.alert('Error', friendlyError(e, 'We could not save your profile. Please try again.'))
     } finally {
       setSavingProfile(false)
+    }
+  }
+
+  async function loadBlocked() {
+    if (!user) return
+    setBlockedLoading(true)
+    try {
+      const ids = await getBlockedIds(user.id, { force: true })
+      if (!ids.length) {
+        setBlockedList([])
+        return
+      }
+      const { data } = await supabase
+        .from('public_profiles')
+        .select('id, username, name')
+        .in('id', ids)
+      const byId = {}
+      ;(data ?? []).forEach(p => { byId[p.id] = p })
+      setBlockedList(ids.map(id => byId[id] ?? { id }))
+    } finally {
+      setBlockedLoading(false)
+    }
+  }
+
+  function toggleBlockedList() {
+    const next = !blockedOpen
+    setBlockedOpen(next)
+    if (next) loadBlocked()
+  }
+
+  function confirmUnblock(entry) {
+    const label = entry.username ? `@${entry.username}` : 'This person'
+    Alert.alert(
+      'Unblock',
+      `${label} will be able to see your profile and reach you in the community again.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Unblock',
+          onPress: async () => {
+            try {
+              await unblockUser(user.id, entry.id)
+              setBlockedList(list => list.filter(b => b.id !== entry.id))
+            } catch (e) {
+              Alert.alert('Error', friendlyError(e, 'Could not unblock right now.'))
+            }
+          },
+        },
+      ]
+    )
+  }
+
+  async function exportData() {
+    if (!user || exporting) return
+    setExporting(true)
+    try {
+      const [goals, routineNames, history, workoutList, workoutLogs, meals, journal] =
+        await Promise.all([
+          getUserGoals(user.id),
+          getRoutineNames(user.id),
+          getHistory(user.id),
+          getWorkoutRoutineList(user.id),
+          getAllWorkoutLogs(user.id),
+          getRecentMealHistory(user.id, 3650),
+          getJournalEntries(user.id),
+        ])
+
+      const routineTemplates = {}
+      for (const name of routineNames) {
+        routineTemplates[name] = await getRoutineTemplate(user.id, name)
+      }
+      const workouts = {}
+      for (const w of workoutList) {
+        workouts[w.name] = await getWorkoutPlan(user.id, w.name)
+      }
+
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        account: {
+          email: user.email ?? null,
+          username: profile?.username ?? null,
+          name: profile?.name ?? null,
+        },
+        goals,
+        routines: routineTemplates,
+        history,
+        workouts,
+        workoutLogs,
+        meals,
+        journal,
+      }
+
+      await Share.share({
+        title: 'My LifeLayer data',
+        message: JSON.stringify(payload, null, 2),
+      })
+    } catch (e) {
+      Alert.alert('Export failed', friendlyError(e, 'We could not gather your data. Please try again.'))
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -414,6 +539,7 @@ export default function SettingsScreen() {
             autoCorrect={false}
             value={localUsername}
             onChangeText={setLocalUsername}
+            maxLength={20}
           />
           {localUsername ? (
             <Text style={[st.usernameHint, {
@@ -447,11 +573,10 @@ export default function SettingsScreen() {
             multiline
             value={localBio}
             onChangeText={setLocalBio}
+            maxLength={200}
           />
 
-          {/* "Show full data to" visibility picker — HIDDEN for now via `false &&` (not deleted) */}
-          {false && (<>
-          <FieldLabel theme={theme}>Show full data to</FieldLabel>
+          <FieldLabel theme={theme}>Who can see your activity</FieldLabel>
           <View style={[st.visRow, { backgroundColor: theme.isDark ? theme.input : '#f0f0f8', borderColor: theme.inputBorder }]}>
             {[
               ['everyone', 'Everyone'],
@@ -474,7 +599,6 @@ export default function SettingsScreen() {
               ? 'Only accepted friends can see your calendar, routines, and workouts.'
               : 'No one can see your activity — your profile shows only your name and bio.'}
           </Text>
-          </>)}
 
           <Pressable
             style={[st.profileSaveBtn, { backgroundColor: ACCENT }, savingProfile && { opacity: 0.6 }]}
@@ -797,7 +921,6 @@ export default function SettingsScreen() {
           <Text style={[st.prefGroupLabel, { color: theme.muted }]}>SECTIONS</Text>
           {[
             ['weekly', '🗓️', 'Weekly tab'],
-            ['productivity', '📚', 'Deep Work card'],
           ].map(([key, icon, label]) => (
             <View key={key} style={st.prefRow}>
               <Text style={[st.prefLabel, { color: theme.text }]}>{icon}  {label}</Text>
@@ -829,6 +952,50 @@ export default function SettingsScreen() {
             </View>
           ))}
           </>)}
+        </View>
+
+        {/* ── Privacy & Data ────────────────────────────────────────── */}
+        <SectionHeader title="PRIVACY & DATA" theme={theme} />
+        <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+          <Pressable style={st.prefRow} onPress={toggleBlockedList}>
+            <Text style={[st.prefLabel, { color: theme.text }]}>Blocked users</Text>
+            <Text style={[st.prefChevron, { color: theme.muted }]}>{blockedOpen ? '⌄' : '›'}</Text>
+          </Pressable>
+
+          {blockedOpen && (
+            <View style={st.blockedList}>
+              {blockedLoading ? (
+                <ActivityIndicator size="small" color={ACCENT} style={{ marginVertical: 14 }} />
+              ) : blockedList.length === 0 ? (
+                <Text style={[st.blockedEmpty, { color: theme.muted }]}>
+                  You haven't blocked anyone. Blocked people can't see your profile or reach you in the community.
+                </Text>
+              ) : blockedList.map(entry => (
+                <View key={entry.id} style={[st.blockedRow, { borderTopColor: theme.divider }]}>
+                  <Text style={[st.blockedName, { color: theme.text }]} numberOfLines={1}>
+                    {entry.username ? `@${entry.username}` : 'Deleted account'}
+                  </Text>
+                  <Pressable
+                    style={[st.unblockBtn, { borderColor: ACCENT }]}
+                    onPress={() => confirmUnblock(entry)}
+                    hitSlop={6}
+                  >
+                    <Text style={[st.unblockBtnText, { color: ACCENT }]}>Unblock</Text>
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+          )}
+
+          <Pressable style={[st.prefRow, { marginTop: 16 }]} onPress={exportData} disabled={exporting}>
+            <Text style={[st.prefLabel, { color: theme.text }]}>Export my data</Text>
+            {exporting
+              ? <ActivityIndicator size="small" color={ACCENT} />
+              : <Text style={[st.prefChevron, { color: theme.muted }]}>›</Text>}
+          </Pressable>
+          <Text style={[st.prefHint, { color: theme.muted }]}>
+            Sends a copy of your goals, routines, history, workouts, meals, journal, and focus sessions so you can keep it.
+          </Text>
         </View>
 
         {/* ── Save ──────────────────────────────────────────────────── */}
@@ -872,7 +1039,7 @@ export default function SettingsScreen() {
                         try {
                           await deleteAccount()
                         } catch (e) {
-                          Alert.alert('Error', e.message)
+                          Alert.alert('Error', friendlyError(e, 'We could not delete your account. Please try again.'))
                         }
                       },
                     },
@@ -985,6 +1152,8 @@ const st = StyleSheet.create({
     justifyContent: 'space-between', paddingVertical: 4,
   },
   prefLabel: { fontSize: 15, fontWeight: '600' },
+  prefChevron: { fontSize: 18, fontWeight: '600' },
+  prefHint: { fontSize: 12, fontWeight: '500', marginTop: 6, lineHeight: 16 },
   prefGroupLabel: {
     fontSize: 11, fontWeight: '800', letterSpacing: 1.2,
     marginTop: 18, marginBottom: 6,
@@ -1037,6 +1206,17 @@ const st = StyleSheet.create({
   visBtn: { flex: 1, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },
   visBtnText: { fontSize: 13, fontWeight: '700' },
   visHint: { fontSize: 12, fontWeight: '500', marginTop: 8, lineHeight: 16 },
+
+  blockedList: { marginTop: 6 },
+  blockedEmpty: { fontSize: 12, fontWeight: '500', lineHeight: 17, paddingVertical: 10 },
+  blockedRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    gap: 12, paddingVertical: 11, borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  blockedName: { flex: 1, fontSize: 14, fontWeight: '600' },
+  unblockBtn: { borderRadius: 10, borderWidth: 1.5, paddingHorizontal: 12, paddingVertical: 6 },
+  unblockBtnText: { fontSize: 12, fontWeight: '700' },
+
   ageHint: { fontSize: 12, fontWeight: '600', marginTop: 6, marginBottom: 2, marginLeft: 2 },
 
   signOutBtn: {

@@ -8,11 +8,9 @@ import Svg, { Circle } from 'react-native-svg'
 import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
-import { useProductivity } from '../../lib/ProductivityContext'
 import StreakBadge from '../../components/StreakBadge'
 import { getRoutineNames, getRoutineTemplate, getTodayRunEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
-import { getTodayProductiveMinutes } from '../../lib/productivityStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
@@ -868,36 +866,6 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
 // ── Habits ────────────────────────────────────────────────────────────────
 
 
-// ── Deep Work ─────────────────────────────────────────────────────────────
-
-function DeepWorkLauncher({ theme, focusMins }) {
-  const { activeSession, openSession } = useProductivity()
-
-  return (
-    <Pressable
-      style={[dw.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}
-      onPress={openSession}
-    >
-      <View style={[dw.iconCircle, { backgroundColor: theme.isDark ? '#2a2f6b' : '#eef1ff' }]}>
-        <Text style={dw.icon}>🎯</Text>
-      </View>
-      <View style={dw.body}>
-        <Text style={[dw.title, { color: theme.text }]}>Deep Work</Text>
-        <Text style={[dw.sub, { color: theme.subtext }]}>
-          {activeSession
-            ? 'Session in progress'
-            : focusMins > 0
-              ? `${focusMins}m focused today`
-              : 'No focus time logged today'}
-        </Text>
-      </View>
-      <Text style={[dw.cta, { color: theme.accent }]}>
-        {activeSession ? 'Open ›' : 'Start ›'}
-      </Text>
-    </Pressable>
-  )
-}
-
 // ── Main screen ───────────────────────────────────────────────────────────
 
 export default function RoutinesScreen() {
@@ -915,7 +883,6 @@ export default function RoutinesScreen() {
   const [weeklyRoutines, setWeeklyRoutines] = useState([])
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
-  const [focusMins, setFocusMins] = useState(0)
   // Which dashboard group each routine is in: 'everyday' (default) | 'whenever'
   const [groupMap, setGroupMap] = useState({})
 
@@ -932,18 +899,15 @@ export default function RoutinesScreen() {
   const load = useCallback(async () => {
     if (!user) return
     try {
-      const [names, hiddenArr, str, split, rStreaks, gMap, focus] = await Promise.all([
+      const [names, hiddenArr, str, split, rStreaks, gMap] = await Promise.all([
         getRoutineNames(user.id),
         getHiddenDefaults(user.id),
         getStreak(user.id),
         getGymSplit(user.id),
         getRoutineStreaks(user.id),
         getRoutineGroupMap(user.id),
-        // Never let the focus total take the whole dashboard down with it.
-        getTodayProductiveMinutes(user.id).catch(() => 0),
       ])
       setGroupMap(gMap)
-      setFocusMins(focus)
       const [templates, runs, settingsArr] = await Promise.all([
         Promise.all(names.map(n => getRoutineTemplate(user.id, n))),
         Promise.all(names.map(n => getTodayRunEither(user.id, n))),
@@ -1132,9 +1096,6 @@ export default function RoutinesScreen() {
 
         {activeTab === 'daily' ? (
           <>
-            {sections.productivity && (
-              <DeepWorkLauncher theme={theme} focusMins={focusMins} />
-            )}
             {allDone && <StreakBadge streak={streak} />}
             {allDone && (
               <View style={[s.allDoneBanner, { backgroundColor: theme.isDark ? '#0d2e21' : '#ecfdf5', borderColor: theme.isDark ? '#1a5c3a' : '#a7f3d0' }]}>
@@ -1372,24 +1333,6 @@ const s = StyleSheet.create({
   errorSub: { fontSize: 13, fontWeight: '500', textAlign: 'center', marginTop: 6, lineHeight: 18 },
   errorBtn: { borderRadius: 14, paddingVertical: 13, paddingHorizontal: 30, marginTop: 20 },
   errorBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
-})
-
-const dw = StyleSheet.create({
-  card: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    borderRadius: 22, borderWidth: 2, padding: 14, marginBottom: 14,
-    shadowOffset: { width: 4, height: 5 },
-    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
-  },
-  iconCircle: {
-    width: 42, height: 42, borderRadius: 13,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  icon: { fontSize: 21 },
-  body: { flex: 1 },
-  title: { fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
-  sub: { fontSize: 12, fontWeight: '500', marginTop: 2 },
-  cta: { fontSize: 13, fontWeight: '700' },
 })
 
 const db = StyleSheet.create({

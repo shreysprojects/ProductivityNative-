@@ -13,8 +13,9 @@ import { getRoutineNames, getRoutineTemplate } from '../../lib/storage'
 import { routineTheme } from '../../lib/themes'
 import { updateBio } from '../../lib/profileStorage'
 import { getUserGoals } from '../../lib/goalsStorage'
-import { getProductivitySessions } from '../../lib/productivityStorage'
 import { consumeRateLimit } from '../../lib/rateLimit'
+import { findBlockedWord } from '../../lib/contentFilter'
+import { getBlockedIds, blockUser } from '../../lib/blockedStorage'
 import {
   getMyFriendCode, getFriends, getPendingRequests,
   addFriendByCode, acceptFriendRequest, declineFriendRequest, removeFriend,
@@ -145,29 +146,6 @@ function buildMealContent(date, meals) {
 
 // ── Content safety ────────────────────────────────────────────────────────────
 
-const BLOCKED_SUBSTRINGS = [
-  'fuck', 'shit', 'bitch', 'cunt', 'pussy', 'asshole', 'whore', 'faggot', 'nigger', 'nigga',
-  'slut', 'skank', 'twat', 'wanker', 'piss', 'spaz', 'jerk off', 'jerkoff',
-  'penis', 'vagina', 'masturbat', 'handjob', 'blowjob', 'cumshot', 'orgasm', 'erection',
-  'ejaculat', 'dildo', 'vibrator', 'porn', 'intercourse', 'foreplay', 'threesome',
-  'genitals', 'testicle', 'nude', 'naked', 'incest', 'pedophil', 'prostitut', 'bestiality',
-  'boob', 'jackoff', 'sexual',
-  // Adult content / solicitation
-  'onlyfans', 'only fans', 'fansly', 'subscrib', 'subscription', 'camgirl', 'cam girl',
-  'escort', 'hookup', 'sugar daddy', 'sugar baby', 'nsfw', 'xxx', 'fetish', 'bdsm',
-  'milf', 'hentai', 'stripper', 'strip club', 'lewd', 'thot', 'sexting', 'horny',
-  'creampie', 'deepthroat', 'gangbang', 'bukkake', 'gloryhole', 'rimjob', 'footjob',
-  'titties', 'cumming', 'fap',
-  'gook', 'kike', 'wetback', 'beaner', 'towelhead', 'redskin', 'golliwog', 'zipperhead', 'darkie',
-  'tranny', 'shemale',
-  'suicide', 'murder', 'terrorist', 'torture',
-  'hitler', 'stalin', 'mussolini', 'genocide', 'holocaust', 'fascism', 'fascist', 'communism',
-]
-const BLOCKED_WORDS = [
-  'ass', 'cock', 'sex', 'anal', 'rape', 'kill', 'bastard',
-  'spic', 'chink', 'coon', 'cracker', 'paki', 'jap', 'dyke', 'honky',
-  'retard', 'hooker', 'nazi',
-]
 const EMAIL_RE = /\S+@\S+\.\S+/
 const PHONE_RE = /(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/
 const SPAM_RE = /(.)\1{9,}/
@@ -185,9 +163,8 @@ function checkText(text, maxLen = TITLE_MAX) {
   if (PHONE_RE.test(t)) return { issue: 'phone' }
   if (URL_RE.test(t)) return { issue: 'url' }
   if (SOCIAL_RE.test(t)) return { issue: 'social' }
-  const lower = t.toLowerCase()
-  for (const w of BLOCKED_SUBSTRINGS) if (lower.includes(w)) return { issue: 'word', word: w }
-  for (const w of BLOCKED_WORDS) if (new RegExp(`\\b${w}\\b`).test(lower)) return { issue: 'word', word: w }
+  const word = findBlockedWord(t)
+  if (word) return { issue: 'word', word }
   return null
 }
 
@@ -219,20 +196,6 @@ function validateRoutineContent(routineName, tasks, bio = '') {
     if (!t.name) continue
     const r = checkText(t.name)
     if (r) return buildMessage(r, 'task name')
-  }
-  return null
-}
-
-function validateDeepWorkContent(taskDesc, notes = '', bio = '') {
-  const br = checkBio(bio)
-  if (br) return buildMessage(br, 'bio')
-  if (taskDesc?.trim()) {
-    const r = checkText(taskDesc, 120)
-    if (r) return buildMessage(r, 'session description')
-  }
-  if (notes?.trim()) {
-    const r = checkText(notes, 200)
-    if (r) return buildMessage(r, 'session notes')
   }
   return null
 }
@@ -308,10 +271,31 @@ function VisibilityRow({ label, value, onChange, theme }) {
   )
 }
 
+// ── Under review badge (shared by all card types) ─────────────────────────────
+
+function ReviewBadge({ item, theme }) {
+  if ((item.report_count ?? 0) < 5) return null
+  return (
+    <View style={[ec.reviewRow, { borderTopColor: theme.divider }]}>
+      <View style={ec.reviewBadge}><Text style={ec.reviewBadgeText}>Under Review</Text></View>
+    </View>
+  )
+}
+
 // ── Author header (shared by all card types) ──────────────────────────────────
 
-function CardAuthorHeader({ item, theme, isOwn, onDelete, onReport }) {
+function CardAuthorHeader({ item, theme, isOwn, onDelete, onReport, onBlock }) {
   const initials = (item.author_name?.[0] ?? '?').toUpperCase()
+  const handle = item.author_username ?? item.author_name ?? 'user'
+
+  function openActions() {
+    Alert.alert('Post options', `Posted by @${handle}`, [
+      { text: 'Report post', onPress: () => onReport(item) },
+      { text: `Block @${handle}`, style: 'destructive', onPress: () => onBlock(item) },
+      { text: 'Cancel', style: 'cancel' },
+    ])
+  }
+
   return (
     <View style={ec.cardHeader}>
       {item.author_avatar_url ? (
@@ -338,8 +322,8 @@ function CardAuthorHeader({ item, theme, isOwn, onDelete, onReport }) {
           <Text style={{ fontSize: 16 }}>🗑</Text>
         </Pressable>
       ) : (
-        <Pressable onPress={() => onReport(item)} hitSlop={12} style={ec.actionBtn}>
-          <Text style={{ fontSize: 16 }}>🚩</Text>
+        <Pressable onPress={openActions} hitSlop={12} style={ec.actionBtn} accessibilityLabel="Post options">
+          <Text style={[ec.actionGlyph, { color: theme.subtext }]}>⋯</Text>
         </Pressable>
       )}
     </View>
@@ -348,7 +332,7 @@ function CardAuthorHeader({ item, theme, isOwn, onDelete, onReport }) {
 
 // ── Routine card ──────────────────────────────────────────────────────────────
 
-function RoutineCard({ item, currentUserId, theme, onDelete, onReport }) {
+function RoutineCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   const tasks = item.tasks ?? []
   const isOwn = item.user_id === currentUserId
   const totalMins = tasks.reduce((sum, t) => sum + (Number(t.time) || 0), 0)
@@ -356,7 +340,7 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport }) {
 
   return (
     <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} />
+      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
@@ -390,68 +374,14 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport }) {
         </View>
       )}
 
-      {(item.report_count ?? 0) >= 5 && (
-        <View style={[ec.reviewRow, { borderTopColor: theme.divider }]}>
-          <View style={ec.reviewBadge}><Text style={ec.reviewBadgeText}>Under Review</Text></View>
-        </View>
-      )}
-    </View>
-  )
-}
-
-// ── Deep work card ────────────────────────────────────────────────────────────
-
-function DeepWorkCard({ item, currentUserId, theme, onDelete, onReport }) {
-  const isOwn = item.user_id === currentUserId
-  const c = item.content ?? {}
-  const durStr = fmtDur(c.actualMins)
-  const goalStr = fmtDur(c.goalMins)
-  const rating = c.rating ?? null
-  const ratingBar = rating != null ? '█'.repeat(rating) + '░'.repeat(10 - rating) : null
-
-  return (
-    <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} />
-
-      <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
-        <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
-          <Text style={ec.routinePillText}>⚡ Deep Focus</Text>
-        </View>
-        <View style={ec.routineMeta}>
-          {durStr && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>⏱  {durStr}</Text>}
-          {goalStr && durStr && <Text style={[ec.routineMetaDot, { color: theme.muted }]}>·</Text>}
-          {goalStr && <Text style={[ec.routineMetaText, { color: theme.muted }]}>goal {goalStr}</Text>}
-        </View>
-      </View>
-
-      <View style={[ec.taskList, { borderTopColor: theme.divider }]}>
-        {c.taskDesc ? (
-          <View style={[ec.taskRow, { borderBottomWidth: (rating != null || c.notes) ? StyleSheet.hairlineWidth : 0, borderBottomColor: theme.divider }]}>
-            <Text style={ec.taskEmoji}>🎯</Text>
-            <Text style={[ec.taskName, { color: theme.text, flex: 1 }]}>{c.taskDesc}</Text>
-          </View>
-        ) : null}
-        {rating != null && (
-          <View style={[ec.taskRow, { borderBottomWidth: c.notes ? StyleSheet.hairlineWidth : 0, borderBottomColor: theme.divider }]}>
-            <Text style={[ec.taskEmoji, { fontSize: 13 }]}>📊</Text>
-            <Text style={[ec.taskName, { color: theme.muted, fontSize: 13, fontFamily: 'Courier' }]}>{ratingBar}</Text>
-            <Text style={[ec.taskTime, { color: theme.subtext }]}>{rating}/10</Text>
-          </View>
-        )}
-        {!!c.notes && (
-          <View style={ec.taskRow}>
-            <Text style={ec.taskEmoji}>💬</Text>
-            <Text style={[ec.taskName, { color: theme.subtext, flex: 1, fontStyle: 'italic' }]}>{c.notes}</Text>
-          </View>
-        )}
-      </View>
+      <ReviewBadge item={item} theme={theme} />
     </View>
   )
 }
 
 // ── Workout card ──────────────────────────────────────────────────────────────
 
-function WorkoutCard({ item, currentUserId, theme, onDelete, onReport }) {
+function WorkoutCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   const isOwn = item.user_id === currentUserId
   const c = item.content ?? {}
   const exercises = c.exercises ?? []
@@ -460,7 +390,7 @@ function WorkoutCard({ item, currentUserId, theme, onDelete, onReport }) {
 
   return (
     <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} />
+      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
@@ -496,13 +426,15 @@ function WorkoutCard({ item, currentUserId, theme, onDelete, onReport }) {
           })}
         </View>
       )}
+
+      <ReviewBadge item={item} theme={theme} />
     </View>
   )
 }
 
 // ── Meal day card ─────────────────────────────────────────────────────────────
 
-function MealDayCard({ item, currentUserId, theme, onDelete, onReport }) {
+function MealDayCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   const isOwn = item.user_id === currentUserId
   const c = item.content ?? {}
   const totals = c.totals ?? {}
@@ -510,7 +442,7 @@ function MealDayCard({ item, currentUserId, theme, onDelete, onReport }) {
 
   return (
     <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} />
+      <CardAuthorHeader item={item} theme={theme} isOwn={isOwn} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
@@ -552,6 +484,8 @@ function MealDayCard({ item, currentUserId, theme, onDelete, onReport }) {
           ))}
         </View>
       )}
+
+      <ReviewBadge item={item} theme={theme} />
     </View>
   )
 }
@@ -567,24 +501,20 @@ function MacroChip({ label, value, unit, color, theme }) {
 
 // ── Community card router ─────────────────────────────────────────────────────
 
-function CommunityCard({ item, currentUserId, theme, onDelete, onReport }) {
-  if (item.post_type === 'deep_work') {
-    return <DeepWorkCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} />
-  }
+function CommunityCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   if (item.post_type === 'workout') {
-    return <WorkoutCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} />
+    return <WorkoutCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
   }
   if (item.post_type === 'meal_day') {
-    return <MealDayCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} />
+    return <MealDayCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
   }
-  return <RoutineCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} />
+  return <RoutineCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
 }
 
 // ── Post modal ────────────────────────────────────────────────────────────────
 
 const POST_TABS = [
   { key: 'routine',   label: 'Routine',    emoji: '📋' },
-  { key: 'deep_work', label: 'Deep Work',  emoji: '⚡' },
   { key: 'workout',   label: 'Workout',    emoji: '🏋️' },
   { key: 'meal_day',  label: 'Meal Day',   emoji: '🍽' },
 ]
@@ -592,7 +522,6 @@ const POST_TABS = [
 function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, onPost }) {
   const [activeTab, setActiveTab] = useState('routine')
   const [routineNames, setRoutineNames] = useState([])
-  const [sessions, setSessions] = useState([])
   const [workoutLogs, setWorkoutLogs] = useState([])
   const [mealDays, setMealDays] = useState([])
   const [loadingContent, setLoadingContent] = useState(false)
@@ -613,13 +542,11 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
     setLoadingContent(true)
     Promise.all([
       getRoutineNames(userId),
-      getProductivitySessions(userId, 20),
       supabase.from('workout_logs').select('date, data').eq('user_id', userId).order('date', { ascending: false }).limit(10),
       supabase.from('meals').select('date, meals').eq('user_id', userId).order('date', { ascending: false }).limit(14),
       getUserGoals(userId),
-    ]).then(([names, sess, wlRes, mlRes, g]) => {
+    ]).then(([names, wlRes, mlRes, g]) => {
       setRoutineNames(names)
-      setSessions(sess ?? [])
       setWorkoutLogs((wlRes.data ?? []).filter(r => (r.data?.exercises ?? []).length > 0))
       setMealDays((mlRes.data ?? []).filter(r => (r.meals ?? []).length > 0))
       setGoals(g ?? null)
@@ -637,7 +564,12 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
   async function getAuthorPayload() {
     const trimmedBio = localBio.trim()
     if (trimmedBio !== (profile?.bio ?? '').trim()) {
-      try { await updateBio(userId, trimmedBio) } catch {}
+      try {
+        await updateBio(userId, trimmedBio)
+      } catch (e) {
+        Alert.alert('Could not save bio', e?.message ?? 'Your bio could not be saved. Please try again.')
+        return null
+      }
     }
     if (profile?.avatar_url && showAvatar) {
       const avatarResult = await moderateProfilePicture(profile.avatar_url)
@@ -679,27 +611,6 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
       if (error) throw error
       onPost()
     } catch (e) { const { title, msg } = postError(e, 'Could not share routine. Please try again.'); Alert.alert(title, msg) }
-    finally { setPosting(null) }
-  }
-
-  async function handlePostDeepWork(session) {
-    const key = session.id
-    setPosting(key)
-    try {
-      const rl = await consumeRateLimit(userId, 'community_post', { maxPerDay: 5, cooldownMs: 60000 })
-      if (!rl.allowed) { Alert.alert('Slow down', rl.reason); return }
-      const trimmedBio = localBio.trim()
-      const validationError = validateDeepWorkContent(session.taskDesc, session.notes ?? '', trimmedBio)
-      if (validationError) { Alert.alert('Cannot share this session', validationError); return }
-      const aiResult = await aiModerateTexts([session.taskDesc, session.notes].filter(Boolean), trimmedBio)
-      if (!aiResult.allowed) { Alert.alert('Cannot share this session', aiResult.reason ?? 'Please edit your content before sharing.'); return }
-      const author = await getAuthorPayload()
-      if (!author) return
-      const content = { taskDesc: session.taskDesc ?? '', notes: session.notes ?? '', goalMins: session.goalMins ?? null, actualMins: session.actualMins ?? null, rating: session.rating ?? null, date: session.date ?? null }
-      const { error } = await supabase.from('community_posts').insert({ user_id: userId, post_type: 'deep_work', ...author, content })
-      if (error) throw error
-      onPost()
-    } catch (e) { const { title, msg } = postError(e, 'Could not share session. Please try again.'); Alert.alert(title, msg) }
     finally { setPosting(null) }
   }
 
@@ -761,26 +672,6 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
       ))
     }
 
-    if (activeTab === 'deep_work') {
-      if (sessions.length === 0) return <Text style={[ec.emptyMsg, { color: theme.muted }]}>No sessions found. Complete a focus session first!</Text>
-      return sessions.map(s => (
-        <Pressable key={s.id} style={[ec.pickRow, { borderBottomColor: theme.divider }]} onPress={() => !posting && handlePostDeepWork(s)} disabled={!!posting}>
-          <View style={{ flex: 1 }}>
-            <Text style={[ec.pickRowName, { color: posting === s.id ? '#6366f1' : theme.text }]} numberOfLines={1}>{s.taskDesc || 'Untitled session'}</Text>
-            <Text style={[ec.pickRowSub, { color: theme.muted }]}>
-              {fmtDur(s.actualMins) ?? '—'}
-              {s.rating ? `  ·  ${s.rating}/10` : ''}
-              {s.date ? `  ·  ${fmtDate(s.date)}` : ''}
-            </Text>
-            {!!s.notes && (
-              <Text style={[ec.pickRowSub, { color: theme.muted, fontStyle: 'italic', marginTop: 2 }]} numberOfLines={1}>"{s.notes}"</Text>
-            )}
-          </View>
-          {posting === s.id ? <ActivityIndicator size="small" color="#6366f1" /> : <Text style={[ec.pickRowCta, { color: '#6366f1' }]}>Share →</Text>}
-        </Pressable>
-      ))
-    }
-
     if (activeTab === 'workout') {
       if (workoutLogs.length === 0) return <Text style={[ec.emptyMsg, { color: theme.muted }]}>No workouts found. Log a workout first!</Text>
       return workoutLogs.map(row => (
@@ -800,7 +691,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
     if (activeTab === 'meal_day') {
       if (mealDays.length === 0) return <Text style={[ec.emptyMsg, { color: theme.muted }]}>No meal days found. Log meals first!</Text>
       return mealDays.map(row => {
-        const totals = (row.meals ?? []).reduce((acc, m) => ({ cal: acc.cal + (m.calories ?? 0), p: acc.p + (m.protein ?? 0) }), { cal: 0, p: 0 })
+        const totals = (row.meals ?? []).reduce((acc, m) => ({ cal: acc.cal + (m.macros?.calories ?? 0), p: acc.p + (m.macros?.protein ?? 0) }), { cal: 0, p: 0 })
         return (
           <Pressable key={row.date} style={[ec.pickRow, { borderBottomColor: theme.divider }]} onPress={() => !posting && handlePostMealDay(row)} disabled={!!posting}>
             <View style={{ flex: 1 }}>
@@ -818,7 +709,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
     return null
   }
 
-  const SECTION_LABELS = { routine: 'CHOOSE ROUTINE', deep_work: 'CHOOSE SESSION', workout: 'CHOOSE WORKOUT', meal_day: 'CHOOSE MEAL DAY' }
+  const SECTION_LABELS = { routine: 'CHOOSE ROUTINE', workout: 'CHOOSE WORKOUT', meal_day: 'CHOOSE MEAL DAY' }
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -1009,6 +900,7 @@ export default function ExploreScreen() {
   const { theme, unit } = useTheme()
   const navigation = useNavigation()
   const [feed, setFeed] = useState([])
+  const [blockedIds, setBlockedIds] = useState([])
   const [loading, setLoading] = useState(true)
   const [postModalVisible, setPostModalVisible] = useState(false)
   const [activeTopTab, setActiveTopTab] = useState('community')
@@ -1031,13 +923,15 @@ export default function ExploreScreen() {
 
   async function fetchFeed() {
     setLoading(true)
-    const [routinesRes, postsRes] = await Promise.all([
+    const [routinesRes, postsRes, blocked] = await Promise.all([
       supabase.from('shared_routines').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('community_posts').select('*').order('created_at', { ascending: false }).limit(100),
+      getBlockedIds(user?.id),
     ])
     const routines = (routinesRes.data ?? []).map(r => ({ ...r, post_type: 'routine', _table: 'shared_routines' }))
     const posts = (postsRes.data ?? []).map(p => ({ ...p, _table: 'community_posts' }))
     const merged = [...routines, ...posts].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    setBlockedIds(blocked)
     setFeed(merged)
     setLoading(false)
   }
@@ -1105,7 +999,7 @@ export default function ExploreScreen() {
     if (activeTopTab === 'friends' && user?.id) loadFriends()
   }, [activeTopTab])
 
-  useFocusEffect(useCallback(() => { fetchFeed() }, []))
+  useFocusEffect(useCallback(() => { fetchFeed() }, [user?.id]))
 
   function handleDelete(item) {
     Alert.alert('Remove Post?', 'Remove this post from the community feed?', [
@@ -1114,6 +1008,26 @@ export default function ExploreScreen() {
         text: 'Remove', style: 'destructive', onPress: async () => {
           await supabase.from(item._table).delete().eq('id', item.id)
           fetchFeed()
+        },
+      },
+    ])
+  }
+
+  function handleBlock(item) {
+    if (!user?.id || item.user_id === user.id) return
+    const handle = item.author_username ?? item.author_name ?? 'this user'
+    Alert.alert(`Block @${handle}?`, "You won't see their posts anymore, and they won't see yours.", [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Block', style: 'destructive', onPress: async () => {
+          try {
+            await blockUser(user.id, item.user_id)
+            setBlockedIds(prev => prev.includes(item.user_id) ? prev : [...prev, item.user_id])
+            setFeed(prev => prev.filter(p => p.user_id !== item.user_id))
+            Alert.alert('Blocked', `You will no longer see posts from @${handle}.`)
+          } catch {
+            Alert.alert('Error', 'Could not block this user. Please try again.')
+          }
         },
       },
     ])
@@ -1130,7 +1044,7 @@ export default function ExploreScreen() {
             })
             if (error?.code === '23505') Alert.alert('Already reported', 'You have already reported this post.')
             else if (error) Alert.alert('Error', 'Could not submit report. Please try again.')
-            else Alert.alert('Report submitted', 'Thank you. We will review this post.')
+            else Alert.alert('Report submitted', 'Thank you. Our team reviews every report within 24 hours and removes anything that breaks the rules.')
           },
         },
       ])
@@ -1183,7 +1097,7 @@ export default function ExploreScreen() {
           </View>
         ) : (
           <FlatList
-            data={feed}
+            data={feed.filter(item => !blockedIds.includes(item.user_id))}
             keyExtractor={item => item.id}
             contentContainerStyle={ec.listContent}
             showsVerticalScrollIndicator={false}
@@ -1194,10 +1108,16 @@ export default function ExploreScreen() {
                 theme={theme}
                 onDelete={handleDelete}
                 onReport={handleReport}
+                onBlock={handleBlock}
               />
             )}
             ListHeaderComponent={() => (
               <Text style={[ec.feedLabel, { color: theme.subtext }]}>COMMUNITY</Text>
+            )}
+            ListFooterComponent={() => (
+              <Text style={[ec.guidelines, { color: theme.muted }]}>
+                Community posts are moderated. Reported content is reviewed and removed within 24 hours, and accounts that post abusive content are removed.
+              </Text>
             )}
             ListEmptyComponent={() => (
               <View style={ec.emptyContainer}>
@@ -1262,6 +1182,7 @@ const ec = StyleSheet.create({
   loadingContainer: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
   feedLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 12 },
+  guidelines: { fontSize: 11, fontWeight: '500', lineHeight: 17, textAlign: 'center', paddingHorizontal: 12, paddingTop: 8 },
 
   card: {
     borderRadius: 20, marginBottom: 16, borderWidth: 1,
@@ -1278,6 +1199,7 @@ const ec = StyleSheet.create({
   authorMeta: { fontSize: 12, fontWeight: '500', marginTop: 2 },
   authorBio: { fontSize: 12, fontWeight: '400', marginTop: 4, lineHeight: 17 },
   actionBtn: { padding: 4, marginLeft: 8, marginTop: 2 },
+  actionGlyph: { fontSize: 20, fontWeight: '800', lineHeight: 20 },
 
   routineSection: { paddingHorizontal: 16, paddingVertical: 12, borderTopWidth: StyleSheet.hairlineWidth },
   routinePill: { alignSelf: 'flex-start', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 6, marginBottom: 8 },

@@ -5,8 +5,6 @@ import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import { Ionicons } from '@expo/vector-icons'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import SessionBanner from '../../components/SessionBanner'
-import ProductivityModal from '../../components/ProductivityModal'
 import { getSections, onSectionsChange, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 
 const TABS = [
@@ -24,8 +22,6 @@ function CustomTabBar({ state, navigation, theme, sections }) {
   const visibleTabs = TABS.filter(t => !t.sectionKey || sections[t.sectionKey] !== false)
 
   return (
-    <View style={{ backgroundColor: theme.tabBar }}>
-      <SessionBanner />
     <View style={[tb.bar, {
       backgroundColor: theme.tabBar,
       paddingBottom: Math.max(insets.bottom, 10),
@@ -57,7 +53,6 @@ function CustomTabBar({ state, navigation, theme, sections }) {
           </Pressable>
         )
       })}
-    </View>
     </View>
   )
 }
@@ -105,8 +100,6 @@ export default function TabsLayout() {
   if (!profileLoading && !profile) return <Redirect href="/(auth)/complete-profile" />
 
   return (
-    <>
-    <ProductivityModal />
     <Tabs
       tabBar={(props) => <CustomTabBar {...props} theme={theme} sections={sections} />}
       screenOptions={{
@@ -124,6 +117,5 @@ export default function TabsLayout() {
       <Tabs.Screen name="settings" options={{ title: 'Settings' }} />
       <Tabs.Screen name="explore"  options={{ title: 'Explore Routines' }} />
     </Tabs>
-    </>
   )
 }

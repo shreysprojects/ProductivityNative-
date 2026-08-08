@@ -249,7 +249,7 @@ export default function Onboarding() {
     const opts = [
       { key: 'habits',       emoji: '🎯', label: 'Routines & habits',     sub: 'Daily routines, habit tracking, weekly goals' },
       { key: 'fitness',      emoji: '💪', label: 'Fitness & nutrition',   sub: 'Workouts, gym splits, meals and macros' },
-      { key: 'productivity', emoji: '📚', label: 'Productivity',          sub: 'Deep work sessions, planning, weekly goals' },
+      { key: 'productivity', emoji: '📚', label: 'Productivity',          sub: 'Planning, weekly goals, journaling' },
       { key: 'all',          emoji: '✨', label: 'A bit of everything',   sub: 'Show me all the features' },
     ]
     return (
