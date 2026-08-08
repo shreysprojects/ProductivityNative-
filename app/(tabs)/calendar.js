@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
+import { useState, useCallback, useEffect, useMemo } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView,
   Modal, TextInput, Alert, KeyboardAvoidingView, Platform,
@@ -81,13 +81,6 @@ const WEEK_DAY_BTNS = [
   { label: 'Su', value: 0 },
 ]
 
-const HOUR_HEIGHT = 64
-const DAY_START   = 7   // 7 AM
-const DAY_END     = 21  // 9 PM
-const TOTAL_HOURS = DAY_END - DAY_START
-const TOTAL_H     = TOTAL_HOURS * HOUR_HEIGHT
-const TIME_COL    = 44
-
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2) }
@@ -116,35 +109,10 @@ function getWeekStart(ds) {
   return _localDate(d)
 }
 
-function timeToY(timeStr) {
-  const [h, m] = timeStr.split(':').map(Number)
-  return ((h * 60 + m) - DAY_START * 60) * HOUR_HEIGHT / 60
-}
-
-function timeDurH(s, e) {
-  const [sh, sm] = s.split(':').map(Number)
-  const [eh, em] = e.split(':').map(Number)
-  return ((eh * 60 + em) - (sh * 60 + sm)) * HOUR_HEIGHT / 60
-}
-
 function addMinsToTime(t, mins) {
   const [h, m] = t.split(':').map(Number)
   const tot = h * 60 + m + mins
   return `${String(Math.floor(tot / 60) % 24).padStart(2,'0')}:${String(tot % 60).padStart(2,'0')}`
-}
-
-function hourLabel(h) {
-  if (h === 0)  return '12 AM'
-  if (h === 12) return '12 PM'
-  return h < 12 ? `${h} AM` : `${h - 12} PM`
-}
-
-function formatWeekRange(ws) {
-  const s = new Date(ws + 'T12:00:00')
-  const e = new Date(ws + 'T12:00:00')
-  e.setDate(e.getDate() + 6)
-  const o = { month: 'short', day: 'numeric' }
-  return `${s.toLocaleDateString('en-US', o)} – ${e.toLocaleDateString('en-US', { ...o, year: 'numeric' })}`
 }
 
 function parseDateInput(str) {
@@ -187,6 +155,16 @@ function fmtTime(t) {
   const [h, m] = t.split(':').map(Number)
   const ap = h >= 12 ? 'PM' : 'AM'
   return `${h % 12 || 12}:${String(m).padStart(2,'0')} ${ap}`
+}
+
+function formatDuration(startTime, endTime) {
+  const [sh, sm] = startTime.split(':').map(Number)
+  const [eh, em] = endTime.split(':').map(Number)
+  const mins = Math.max(0, (eh * 60 + em) - (sh * 60 + sm))
+  const hours = Math.floor(mins / 60)
+  const rest = mins % 60
+  if (!hours) return `${rest}m`
+  return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
 
 function pctColor(p) {
@@ -310,7 +288,6 @@ export default function CalendarScreen() {
 
   // View
   const [viewMode, setViewMode] = useState('month')
-  const [weekStart, setWeekStart] = useState(() => getWeekStart(today))
 
   // Month view
   const [viewDate, setViewDate] = useState({ year: now.getFullYear(), month: now.getMonth() })
@@ -387,26 +364,11 @@ export default function CalendarScreen() {
   const [selectedWorkout, setSelectedWorkout] = useState(null)
   const [selectedMeals, setSelectedMeals]     = useState([])
 
-  const weekScrollRef = useRef(null)
-
-  const nowY = useMemo(() => {
-    const n = new Date()
-    return ((n.getHours() * 60 + n.getMinutes()) - DAY_START * 60) * HOUR_HEIGHT / 60
-  }, [])
-
   useEffect(() => {
     Notifications.getPermissionsAsync()
       .then(({ status }) => setHasPerm(status === 'granted'))
       .catch(() => {})
   }, [])
-
-  useEffect(() => {
-    if (viewMode === 'week') {
-      setTimeout(() => {
-        weekScrollRef.current?.scrollTo({ y: Math.max(0, nowY - 80), animated: false })
-      }, 100)
-    }
-  }, [viewMode])
 
   useEffect(() => {
     if (!selected || !user) { setSelectedWorkout(null); setSelectedMeals([]); return }
@@ -498,9 +460,13 @@ export default function CalendarScreen() {
     return m
   }, [tasks])
 
-  const weekDays = useMemo(() => (
-    Array.from({ length: 7 }, (_, i) => addDays(weekStart, i))
-  ), [weekStart])
+  // The day strip always shows the week containing the selected day. Derived
+  // rather than stored, so stepping into a neighbouring week can't render one
+  // frame against the old week's days.
+  const weekDays = useMemo(() => {
+    const ws = getWeekStart(logDay)
+    return Array.from({ length: 7 }, (_, i) => addDays(ws, i))
+  }, [logDay])
 
   const weekEventsByDay = useMemo(() => {
     const result = {}
@@ -586,7 +552,7 @@ export default function CalendarScreen() {
 
   function switchView(mode) {
     setViewMode(mode)
-    if (mode === 'week' && selected) setWeekStart(getWeekStart(selected))
+    if (mode === 'week' && selected) setLogDay(selected)
   }
 
   function openAdd() {
@@ -737,9 +703,10 @@ export default function CalendarScreen() {
     for (const item of saved) await saveScheduleItem(user.id, item)
     setViewMode('week')
     setWeekPane('schedule')
+    setLogDay(today)
     Alert.alert(
       'Classes added',
-      `${saved.length} class${saved.length === 1 ? '' : 'es'} added to your weekly schedule.`
+      `${saved.length} recurring class${saved.length === 1 ? '' : 'es'} added to your schedule.`
     )
   }
 
@@ -856,7 +823,7 @@ export default function CalendarScreen() {
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {[['month', 'Month'], ['week', 'Week'], ['tasks', 'To-do']].map(([mode, label]) => (
+          {[['month', 'Month'], ['week', 'Day'], ['tasks', 'To-do']].map(([mode, label]) => (
             <Pressable
               key={mode}
               style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}
@@ -1291,158 +1258,138 @@ export default function CalendarScreen() {
         </View>
       )}
 
-      {/* Time log — one row per slot for the chosen day */}
-      {viewMode === 'week' && logSettings.enabled && weekPane === 'log' && (
-        <View style={{ flex: 1 }}>
-          <View style={[s.logDayBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
-            <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.logDayArrowBtn}>
-              <Text style={[s.logDayArrow, { color: theme.accent }]}>‹</Text>
+      {/* Shared day navigation for Schedule and Time log. */}
+      {viewMode === 'week' && (
+        <View style={[s.dayPicker, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
+          <View style={s.dayNav}>
+            <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.dayNavArrowBtn}>
+              <Text style={[s.dayNavArrow, { color: theme.accent }]}>‹</Text>
             </Pressable>
             <Pressable onPress={() => setLogDay(today)} style={{ flex: 1 }}>
-              <Text style={[s.logDayLabel, { color: theme.text }]} numberOfLines={1}>
+              <Text style={[s.dayNavTitle, { color: theme.text }]} numberOfLines={1}>
                 {logDay === today ? 'Today' : formatDateShort(logDay)}
               </Text>
             </Pressable>
             <Pressable
-              onPress={() => setLogDay(d => (d < today ? addDays(d, 1) : d))}
-              hitSlop={10}
-              style={s.logDayArrowBtn}
+              onPress={() => setLogDay(today)}
+              style={[s.dayTodayBtn, { backgroundColor: theme.accent + '18' }]}
             >
-              <Text style={[s.logDayArrow, { color: logDay < today ? theme.accent : theme.muted, opacity: logDay < today ? 1 : 0.4 }]}>›</Text>
+              <Text style={[s.dayTodayText, { color: theme.accent }]}>Today</Text>
+            </Pressable>
+            <Pressable onPress={() => setLogDay(d => addDays(d, 1))} hitSlop={10} style={s.dayNavArrowBtn}>
+              <Text style={[s.dayNavArrow, { color: theme.accent }]}>›</Text>
             </Pressable>
           </View>
-          <DayLogTimeline
-            key={logDay}
-            userId={user.id}
-            day={logDay}
-            todayStr={today}
-            settings={logSettings}
-            onCountsChange={(filled) => setLogCounts(prev => (
-              prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
-            ))}
-          />
+
+          <View style={s.dayStrip}>
+            {weekDays.map(d => {
+              const active = d === logDay
+              const dObj = new Date(d + 'T12:00:00')
+              const count = (!logSettings.enabled || weekPane === 'schedule')
+                ? (weekEventsByDay[d]?.length ?? 0)
+                : (logCounts[d] ?? 0)
+              return (
+                <Pressable
+                  key={d}
+                  onPress={() => setLogDay(d)}
+                  style={[s.dayChip, active && { backgroundColor: theme.accent }]}
+                >
+                  <Text style={[s.dayChipName, { color: active ? '#fff' : theme.subtext }]}>
+                    {dObj.toLocaleDateString('en-US', { weekday: 'short' })}
+                  </Text>
+                  <Text style={[s.dayChipNum, { color: active ? '#fff' : theme.text }]}>{dObj.getDate()}</Text>
+                  <View style={[s.dayChipCount, { backgroundColor: active ? '#ffffff2e' : theme.accent + '15' }]}>
+                    <Text style={[s.dayChipCountText, { color: active ? '#fff' : theme.accent }]}>{count}</Text>
+                  </View>
+                </Pressable>
+              )
+            })}
+          </View>
         </View>
       )}
 
+      {/* Time log — one row per slot for the chosen day. */}
+      {viewMode === 'week' && logSettings.enabled && weekPane === 'log' && (
+        <DayLogTimeline
+          key={logDay}
+          userId={user.id}
+          day={logDay}
+          todayStr={today}
+          settings={logSettings}
+          onCountsChange={(filled) => setLogCounts(prev => (
+            prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
+          ))}
+        />
+      )}
+
+      {/* Schedule — a readable agenda for the chosen day. */}
       {viewMode === 'week' && (!logSettings.enabled || weekPane === 'schedule') && (
-        <View style={{ flex: 1 }}>
-
-          {/* Week navigation + day headers */}
-          <View style={[s.weekHeader, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
-            <View style={s.weekNav}>
-              <Pressable onPress={() => setWeekStart(ws => addDays(ws, -7))} style={s.weekNavBtn}>
-                <Text style={[s.weekNavArrow, { color: theme.accent }]}>‹</Text>
-              </Pressable>
-              <Text style={[s.weekNavTitle, { color: theme.text }]}>{formatWeekRange(weekStart)}</Text>
-              <Pressable
-                onPress={() => setWeekStart(getWeekStart(today))}
-                style={[s.weekTodayBtn, { backgroundColor: theme.accent + '20' }]}
-              >
-                <Text style={[s.weekTodayText, { color: theme.accent }]}>Today</Text>
-              </Pressable>
-              <Pressable onPress={() => setWeekStart(ws => addDays(ws, 7))} style={s.weekNavBtn}>
-                <Text style={[s.weekNavArrow, { color: theme.accent }]}>›</Text>
-              </Pressable>
-            </View>
-
-            <View style={s.weekDayHeaders}>
-              <View style={{ width: TIME_COL }} />
-              {weekDays.map(d => {
-                const isT = d === today
-                const dObj = new Date(d + 'T12:00:00')
-                return (
-                  <View key={d} style={s.weekDayHeader}>
-                    <Text style={[s.weekDayName, { color: isT ? theme.accent : theme.subtext }]}>
-                      {dObj.toLocaleDateString('en-US', { weekday: 'short' })}
-                    </Text>
-                    <View style={[s.weekDayNumCircle, isT && { backgroundColor: theme.accent }]}>
-                      <Text style={[s.weekDayNum, { color: isT ? '#fff' : theme.text }]}>
-                        {dObj.getDate()}
-                      </Text>
-                    </View>
-                  </View>
-                )
-              })}
+        <ScrollView
+          style={{ flex: 1 }}
+          contentInsetAdjustmentBehavior="automatic"
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={s.dayScheduleContent}
+        >
+          <View style={s.dayScheduleHeading}>
+            <View>
+              <Text style={[s.dayScheduleTitle, { color: theme.text }]}>
+                {new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })}
+                {logDay === today && <Text style={{ color: theme.accent }}> · Today</Text>}
+              </Text>
+              <Text style={[s.dayScheduleCount, { color: theme.subtext }]}>
+                {(weekEventsByDay[logDay]?.length ?? 0)} {(weekEventsByDay[logDay]?.length ?? 0) === 1 ? 'class' : 'classes'}
+              </Text>
             </View>
           </View>
 
-          {/* Time grid */}
-          <ScrollView ref={weekScrollRef} style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
-            <View style={{ flexDirection: 'row', height: TOTAL_H }}>
-
-              {/* Time labels */}
-              <View style={{ width: TIME_COL }}>
-                {Array.from({ length: TOTAL_HOURS }, (_, i) => (
-                  <View key={i} style={{ position: 'absolute', top: i * HOUR_HEIGHT - 8, width: TIME_COL, alignItems: 'flex-end', paddingRight: 6 }}>
-                    <Text style={[s.timeLabel, { color: theme.muted }]}>{hourLabel(DAY_START + i)}</Text>
-                  </View>
-                ))}
-              </View>
-
-              {/* Day columns */}
-              <View style={{ flex: 1, flexDirection: 'row' }}>
-                {weekDays.map((d, di) => {
-                  const isT = d === today
-                  const dayEvs = weekEventsByDay[d] || []
-                  return (
-                    <View
-                      key={d}
-                      style={[
-                        s.dayCol,
-                        { borderLeftColor: theme.divider },
-                        di === 0 && { borderLeftWidth: 1 },
-                        isT && { backgroundColor: theme.accent + '06' },
-                      ]}
-                    >
-                      {/* Hour lines */}
-                      {Array.from({ length: TOTAL_HOURS }, (_, i) => (
-                        <View key={i} style={[s.hourLine, { top: i * HOUR_HEIGHT, borderTopColor: theme.isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.1)' }]} />
-                      ))}
-
-                      {/* Current time line */}
-                      {isT && nowY >= 0 && nowY <= TOTAL_H && (
-                        <View style={[s.nowLine, { top: nowY }]}>
-                          <View style={[s.nowDot, { backgroundColor: theme.accent }]} />
-                          <View style={[s.nowBar, { backgroundColor: theme.accent }]} />
-                        </View>
-                      )}
-
-                      {/* Events */}
-                      {dayEvs.map(ev => {
-                        const top = timeToY(ev.startTime)
-                        const height = Math.max(timeDurH(ev.startTime, ev.endTime), 22)
-                        if (top < 0 || top > TOTAL_H) return null
-                        return (
-                          <Pressable
-                            key={ev.id}
-                            style={[s.eventBlock, {
-                              top, height,
-                              backgroundColor: ev.color + 'DD',
-                              borderLeftColor: ev.color,
-                            }]}
-                            onPress={() => handleWeekEventPress(ev)}
-                          >
-                            <Text style={s.eventBlockTitle} numberOfLines={height > 36 ? 2 : 1}>
-                              {ev.title}
-                            </Text>
-                            {height > 34 && (
-                              <Text style={s.eventBlockTime} numberOfLines={1}>
-                                {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
-                              </Text>
-                            )}
-                            {height > 52 && ev.location && (
-                              <Text style={s.eventBlockLoc} numberOfLines={1}>{ev.location}</Text>
-                            )}
-                          </Pressable>
-                        )
-                      })}
-                    </View>
-                  )
-                })}
-              </View>
+          {(weekEventsByDay[logDay] ?? []).length === 0 ? (
+            <View style={[s.dayScheduleEmpty, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+              <Text style={s.dayScheduleEmptyIcon}>☀️</Text>
+              <Text style={[s.dayScheduleEmptyTitle, { color: theme.text }]}>No classes scheduled</Text>
+              <Text style={[s.dayScheduleEmptyText, { color: theme.subtext }]}>Enjoy the open time, or add a class above.</Text>
             </View>
-          </ScrollView>
-        </View>
+          ) : (weekEventsByDay[logDay] ?? []).map(ev => {
+            const courseCode = ev.meta?.courseCode || (ev.kind === 'event' ? 'EVENT' : ev.title)
+            const classType = ev.meta?.type || (ev.kind === 'event' ? 'Calendar' : 'Class')
+            const courseName = ev.meta?.courseName && ev.meta.courseName !== courseCode
+              ? ev.meta.courseName
+              : ev.title
+            return (
+              <View key={ev.id} style={s.dayClassRow}>
+                <View style={s.dayClassTimeCol}>
+                  <Text style={[s.dayClassStart, { color: theme.subtext }]}>{fmtTime(ev.startTime)}</Text>
+                  <View style={[s.dayClassTimeLine, { backgroundColor: theme.divider }]} />
+                  <Text style={[s.dayClassEnd, { color: theme.muted }]}>{fmtTime(ev.endTime)}</Text>
+                </View>
+                <Pressable
+                  onPress={() => handleWeekEventPress(ev)}
+                  style={[s.dayClassCard, {
+                    backgroundColor: ev.color + (theme.isDark ? '24' : '16'),
+                    borderLeftColor: ev.color,
+                    borderColor: ev.color + '40',
+                  }]}
+                >
+                  <View style={s.dayClassTopRow}>
+                    <View style={[s.dayCoursePill, { backgroundColor: ev.color }]}>
+                      <Text style={s.dayCoursePillText} numberOfLines={1}>{courseCode}</Text>
+                    </View>
+                    <View style={[s.dayTypePill, { backgroundColor: ev.color + '20' }]}>
+                      <Text style={[s.dayTypePillText, { color: ev.color }]}>{classType}</Text>
+                    </View>
+                    <Text style={[s.dayDuration, { color: ev.color }]}>{formatDuration(ev.startTime, ev.endTime)}</Text>
+                  </View>
+                  <Text style={[s.dayClassName, { color: theme.text }]} numberOfLines={2}>{courseName}</Text>
+                  {!!ev.location && (
+                    <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {ev.location}</Text>
+                  )}
+                  <Text style={[s.dayClassRange, { color: theme.muted }]}>
+                    {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
+                  </Text>
+                </Pressable>
+              </View>
+            )
+          })}
+        </ScrollView>
       )}
 
       {/* ── To-do view ────────────────────────────────────────────────────── */}
@@ -1996,6 +1943,46 @@ const s = StyleSheet.create({
   eventBlockTitle: { fontSize: 10, fontWeight: '700', color: '#fff' },
   eventBlockTime:  { fontSize: 9,  fontWeight: '500', color: 'rgba(255,255,255,0.85)', marginTop: 1 },
   eventBlockLoc:   { fontSize: 9,  color: 'rgba(255,255,255,0.75)', marginTop: 1 },
+
+  // Shared day picker
+  dayPicker: { borderBottomWidth: StyleSheet.hairlineWidth, paddingBottom: 10 },
+  dayNav: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  dayNavArrowBtn: { paddingHorizontal: 8, paddingVertical: 2 },
+  dayNavArrow: { fontSize: 26, fontWeight: '700', lineHeight: 28 },
+  dayNavTitle: { fontSize: 14, fontWeight: '700', textAlign: 'center' },
+  dayTodayBtn: { borderRadius: 12, paddingHorizontal: 10, paddingVertical: 5 },
+  dayTodayText: { fontSize: 11.5, fontWeight: '800' },
+  dayStrip: { flexDirection: 'row', gap: 5, paddingHorizontal: 10 },
+  dayChip: { flex: 1, minWidth: 40, alignItems: 'center', gap: 1, paddingVertical: 7, borderRadius: 15 },
+  dayChipName: { fontSize: 10.5, fontWeight: '700' },
+  dayChipNum: { fontSize: 15, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  dayChipCount: { minWidth: 20, height: 18, borderRadius: 9, paddingHorizontal: 5, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
+  dayChipCountText: { fontSize: 10.5, lineHeight: 13, fontWeight: '800', fontVariant: ['tabular-nums'] },
+
+  // Day schedule agenda
+  dayScheduleContent: { paddingHorizontal: 16, paddingTop: 18, paddingBottom: 40, gap: 14 },
+  dayScheduleHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 2, paddingBottom: 2 },
+  dayScheduleTitle: { fontSize: 22, fontWeight: '800', letterSpacing: -0.5 },
+  dayScheduleCount: { fontSize: 13.5, fontWeight: '600', marginTop: 2 },
+  dayScheduleEmpty: { alignItems: 'center', borderRadius: 20, borderWidth: 1, padding: 28, gap: 6 },
+  dayScheduleEmptyIcon: { fontSize: 28 },
+  dayScheduleEmptyTitle: { fontSize: 16, fontWeight: '800' },
+  dayScheduleEmptyText: { fontSize: 12.5, fontWeight: '500', textAlign: 'center' },
+  dayClassRow: { flexDirection: 'row', gap: 10, minHeight: 142 },
+  dayClassTimeCol: { width: 74, alignItems: 'flex-end' },
+  dayClassStart: { fontSize: 12.5, fontWeight: '700', fontVariant: ['tabular-nums'], paddingTop: 12 },
+  dayClassTimeLine: { width: 1, flex: 1, marginRight: 5, marginVertical: 7 },
+  dayClassEnd: { fontSize: 11.5, fontWeight: '600', fontVariant: ['tabular-nums'], paddingBottom: 8 },
+  dayClassCard: { flex: 1, borderRadius: 19, borderWidth: 1, borderLeftWidth: 6, padding: 14, gap: 8 },
+  dayClassTopRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  dayCoursePill: { maxWidth: '52%', borderRadius: 9, paddingHorizontal: 10, paddingVertical: 5 },
+  dayCoursePillText: { color: '#fff', fontSize: 11.5, fontWeight: '900', letterSpacing: 0.5 },
+  dayTypePill: { borderRadius: 9, paddingHorizontal: 9, paddingVertical: 5 },
+  dayTypePillText: { fontSize: 11, fontWeight: '800' },
+  dayDuration: { marginLeft: 'auto', fontSize: 12, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  dayClassName: { fontSize: 17, lineHeight: 21, fontWeight: '800', letterSpacing: -0.25 },
+  dayClassLocation: { fontSize: 13, lineHeight: 18, fontWeight: '600' },
+  dayClassRange: { fontSize: 11.5, fontWeight: '600', fontVariant: ['tabular-nums'] },
 
   // Modals
   modalKAV: { flex: 1, justifyContent: 'flex-end' },

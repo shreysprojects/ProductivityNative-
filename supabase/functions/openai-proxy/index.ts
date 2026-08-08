@@ -392,14 +392,14 @@ Deno.serve(async (req) => {
         messages: [{
           role: 'user',
           content: [
-            { type: 'text', text: 'The attached screenshots show a student\'s class schedule / timetable. Extract EVERY class meeting shown.\n\nReturn ONLY valid JSON:\n{"classes":[{"courseCode":"CS 135","courseName":"Designing Functional Programs","type":"Lecture","day":"Mon","startTime":"14:30","endTime":"15:20","location":"MC 2054"}]}\n\nRules:\n- One object per class meeting per day. A class that meets Mon/Wed/Fri at the same time becomes THREE objects.\n- courseCode: the short code as shown (e.g. "CS 135", "MATH 137"). If none is visible, use a short form of the name.\n- courseName: the full course title. If not visible, repeat the course code.\n- type: one of "Lecture", "Tutorial", "Lab", "Seminar", "Other" — infer from markers like LEC/TUT/LAB/SEM.\n- day: three letters, one of Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n- startTime/endTime: 24-hour "HH:MM".\n- location: the room/building as shown, or null if not visible.\n- If the images do not show a class schedule, return {"classes":[]}.' },
+            { type: 'text', text: 'The attached screenshots show a student\'s class schedule / timetable. Read the ENTIRE timetable, checking every visible day/column in every screenshot. Extract every distinct recurring class meeting pattern.\n\nReturn ONLY valid JSON:\n{"classes":[{"courseCode":"CS 135","courseName":"Designing Functional Programs","type":"Lecture","days":["Mon","Wed","Fri"],"startTime":"14:30","endTime":"15:20","location":"MC 2054"}]}\n\nRules:\n- days: include EVERY weekday on which that exact course, type, time, and location meets. Never keep only the first day. Use three-letter values from Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n- If a course has different times, types, or rooms on different days, return separate objects with the correct days for each pattern.\n- Inspect all seven day columns and all supplied screenshots before answering. Do not omit later days or repeated meetings.\n- courseCode: the short code as shown (e.g. "CS 135", "MATH 137"). If none is visible, use a short form of the name.\n- courseName: the full course title. If not visible, repeat the course code.\n- type: one of "Lecture", "Tutorial", "Lab", "Seminar", "Other" — infer from markers like LEC/TUT/LAB/SEM.\n- startTime/endTime: 24-hour "HH:MM".\n- location: the room/building as shown, or null if not visible.\n- If the images do not show a class schedule, return {"classes":[]}.' },
             ...images.map(b64 => ({
               type: 'image_url',
               image_url: { url: `data:image/jpeg;base64,${b64}`, detail: 'high' },
             })),
           ],
         }],
-        max_tokens: 1600,
+        max_tokens: 3000,
         response_format: { type: 'json_object' },
       })
 
@@ -410,18 +410,30 @@ Deno.serve(async (req) => {
       const parsed = JSON.parse(choice?.message?.content ?? '{}')
       const raw: Array<Record<string, unknown>> = Array.isArray(parsed.classes) ? parsed.classes : []
       const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+      const DAY_ALIASES: Record<string, string> = {
+        sun: 'Sun', sunday: 'Sun', mon: 'Mon', monday: 'Mon',
+        tue: 'Tue', tues: 'Tue', tuesday: 'Tue', wed: 'Wed', wednesday: 'Wed',
+        thu: 'Thu', thur: 'Thu', thurs: 'Thu', thursday: 'Thu',
+        fri: 'Fri', friday: 'Fri', sat: 'Sat', saturday: 'Sat',
+      }
       const TYPES = ['Lecture', 'Tutorial', 'Lab', 'Seminar', 'Other']
       const timeOk = (t: unknown) => typeof t === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(t)
       const classes = raw
-        .map(c => ({
-          courseCode: String(c.courseCode ?? '').trim().slice(0, 20),
-          courseName: String(c.courseName ?? '').trim().slice(0, 80),
-          type: TYPES.includes(String(c.type)) ? String(c.type) : 'Other',
-          day: String(c.day ?? '').slice(0, 3),
-          startTime: c.startTime,
-          endTime: c.endTime,
-          location: c.location ? String(c.location).trim().slice(0, 60) : null,
-        }))
+        .flatMap(c => {
+          const suppliedDays = Array.isArray(c.days) ? c.days : [c.day]
+          const days = [...new Set(suppliedDays
+            .map(day => DAY_ALIASES[String(day ?? '').trim().toLowerCase()])
+            .filter(day => DAYS.includes(day)))]
+          return days.map(day => ({
+            courseCode: String(c.courseCode ?? '').trim().slice(0, 20),
+            courseName: String(c.courseName ?? '').trim().slice(0, 80),
+            type: TYPES.includes(String(c.type)) ? String(c.type) : 'Other',
+            day,
+            startTime: c.startTime,
+            endTime: c.endTime,
+            location: c.location ? String(c.location).trim().slice(0, 60) : null,
+          }))
+        })
         .filter(c =>
           (c.courseCode || c.courseName) && DAYS.includes(c.day) &&
           timeOk(c.startTime) && timeOk(c.endTime) && String(c.startTime) < String(c.endTime)

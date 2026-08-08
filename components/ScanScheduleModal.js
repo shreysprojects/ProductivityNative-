@@ -16,6 +16,17 @@ const CLASS_COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#22c55e', '#e
 // AI returns 'Mon'..'Sun'; schedule_items.days uses JS day-of-week (0 = Sunday).
 const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }
 
+const DAY_ALIASES = {
+  sun: 'Sun', sunday: 'Sun', mon: 'Mon', monday: 'Mon',
+  tue: 'Tue', tues: 'Tue', tuesday: 'Tue', wed: 'Wed', wednesday: 'Wed',
+  thu: 'Thu', thur: 'Thu', thurs: 'Thu', thursday: 'Thu',
+  fri: 'Fri', friday: 'Fri', sat: 'Sat', saturday: 'Sat',
+}
+
+function normalizeDay(day) {
+  return DAY_ALIASES[String(day ?? '').trim().toLowerCase()] ?? null
+}
+
 const TYPE_EMOJI = {
   Lecture: '🎓', Tutorial: '✏️', Lab: '🔬', Seminar: '💬', Other: '📘',
 }
@@ -102,7 +113,17 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
         Alert.alert('Try again', data.reason)
         return
       }
-      const classes = Array.isArray(data?.classes) ? data.classes : []
+      const extracted = Array.isArray(data?.classes) ? data.classes : []
+      const seen = new Set()
+      const classes = extracted.flatMap(c => {
+        const suppliedDays = Array.isArray(c.days) ? c.days : [c.day]
+        return suppliedDays.map(normalizeDay).filter(Boolean).map(day => ({ ...c, day }))
+      }).filter(c => {
+        const key = [c.courseCode, c.courseName, c.type, c.day, c.startTime, c.endTime, c.location].join('|')
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
       if (!classes.length) {
         Alert.alert(
           'No classes found',
@@ -139,7 +160,7 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
       const key = `${code}|${c.type}|${c.startTime}|${c.endTime}|${c.location ?? ''}`
       if (!grouped.has(key)) {
         grouped.set(key, {
-          title: `${code}${c.type && c.type !== 'Other' ? ` ${c.type}` : ''}`,
+          title: code,
           location: c.location ?? null,
           days: [],
           startTime: c.startTime,
@@ -210,7 +231,7 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
                       <Text style={sc.rowEmoji}>{TYPE_EMOJI[c.type] ?? '📘'}</Text>
                       <View style={{ flex: 1 }}>
                         <Text style={[sc.rowTitle, { color: theme.text }]} numberOfLines={1}>
-                          {c.courseCode}{c.type && c.type !== 'Other' ? ` · ${c.type}` : ''}
+                          {c.courseCode || c.courseName}{c.type && c.type !== 'Other' ? ` · ${c.type}` : ''}
                         </Text>
                         {!!c.courseName && c.courseName !== c.courseCode && (
                           <Text style={[sc.rowName, { color: theme.subtext }]} numberOfLines={1}>
