@@ -11,15 +11,21 @@ const SERVICE_KEY  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const MAX_PER_DAY          = 3
 const MAX_MOD_PER_DAY      = 60
 const MAX_EXTRACT_PER_WEEK = 10
+// Length of the base64 string, so ~1.5MB of decoded image.
+const MAX_IMAGE_B64        = 2_000_000
 
 // Actions that consume the daily generative rate limit.
 // extract_workout has its own weekly cap (ai_workout_limits) instead.
 const GENERATIVE = new Set(['create_routine', 'advise_routine', 'analyze_looks'])
 
-// Moderation actions capped separately (moderate_routine & moderate_profile_picture
-// call paid gpt-4o-mini; moderate_texts is the free endpoint but is capped too as
-// abuse protection) so a scripted caller can't hammer them outside the normal UI.
-const PAID_MOD = new Set(['moderate_routine', 'moderate_profile_picture', 'moderate_texts'])
+// Moderation actions capped separately (moderate_routine, moderate_profile_picture
+// and moderate_image call paid models; moderate_texts is the free endpoint but is
+// capped too as abuse protection) so a scripted caller can't hammer them outside
+// the normal UI. upload_avatar shares the same counter but is handled on its own
+// because it cannot fail open.
+const PAID_MOD = new Set(['moderate_routine', 'moderate_profile_picture', 'moderate_texts', 'moderate_image'])
+
+const PICTURE_MOD_PROMPT = 'You are a content moderator for a family-friendly productivity app.\nReview this profile picture.\n\nBLOCK (allowed: false) if the image contains:\n- Nudity or sexual content\n- Hate symbols (swastikas, Nazi imagery, KKK, extremist symbols)\n- Violence or gore\n- Slurs or harassment text\n\nALLOW everything else: selfies, logos, art, memes, animals, landscapes, etc.\n\nReply with ONLY valid JSON:\n{"allowed": true}\n{"allowed": false, "reason": "one sentence, addressed to the user"}'
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
@@ -44,80 +50,136 @@ Deno.serve(async (req) => {
     if (!action) return json({ error: 'missing_action' }, 400)
 
     // ── Server-side rate limit ───────────────────────────────────────────────
-    const today = new Date().toISOString().slice(0, 10)
+    // Increments and checks in one statement; null means the counter itself failed.
+    const consumeLimit = async (kind: string, max: number) => {
+      const { data, error } = await admin.rpc('consume_ai_limit', {
+        p_user: user.id,
+        p_kind: kind,
+        p_max: max,
+      })
+      if (error) {
+        console.error('consume_ai_limit failed:', error)
+        return null
+      }
+      return data as { allowed: boolean; count: number }
+    }
+
+    const checkImageSize = (b64: string) =>
+      b64.length > MAX_IMAGE_B64
+        ? json({ error: 'image_too_large', reason: 'That image is too large. Please try a smaller photo.' }, 413)
+        : null
 
     if (GENERATIVE.has(action)) {
-      const { data: rl } = await admin
-        .from('ai_rate_limits')
-        .select('count')
-        .eq('user_id', user.id)
-        .eq('date', today)
-        .maybeSingle()
-
-      const current = (rl as { count: number } | null)?.count ?? 0
-      if (current >= MAX_PER_DAY) {
+      const rl = await consumeLimit('generative', MAX_PER_DAY)
+      if (!rl || !rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Daily limit of ${MAX_PER_DAY} AI uses reached. Try again tomorrow.` },
           429,
         )
       }
-      await admin
-        .from('ai_rate_limits')
-        .upsert({ user_id: user.id, date: today, count: current + 1 })
-    } else if (PAID_MOD.has(action)) {
-      const { data: rl } = await admin
-        .from('ai_mod_limits')
-        .select('count')
-        .eq('user_id', user.id)
-        .eq('date', today)
-        .maybeSingle()
-
-      const current = (rl as { count: number } | null)?.count ?? 0
-      // Fail open (allowed: true) past the cap: don't burn paid calls, and the
-      // DB blocklist trigger + 5-posts/day insert policy still backstop content.
-      if (current >= MAX_MOD_PER_DAY) return json({ allowed: true })
-      await admin
-        .from('ai_mod_limits')
-        .upsert({ user_id: user.id, date: today, count: current + 1 })
-    } else if (action === 'extract_workout') {
+    } else if (action === 'extract_workout' || action === 'extract_schedule') {
       // Weekly cap (Mon–Sun, UTC), separate from the daily generative limit.
-      const monday = new Date()
-      monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7))
-      const weekStart = monday.toISOString().slice(0, 10)
-
-      const { data: rl } = await admin
-        .from('ai_workout_limits')
-        .select('count')
-        .eq('user_id', user.id)
-        .eq('week_start', weekStart)
-        .maybeSingle()
-
-      const current = (rl as { count: number } | null)?.count ?? 0
-      if (current >= MAX_EXTRACT_PER_WEEK) {
+      // Workout and timetable imports share the same counter.
+      const rl = await consumeLimit('workout', MAX_EXTRACT_PER_WEEK)
+      if (!rl || !rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Weekly limit of ${MAX_EXTRACT_PER_WEEK} screenshot imports reached. It resets on Monday.` },
           429,
         )
       }
-      await admin
-        .from('ai_workout_limits')
-        .upsert({ user_id: user.id, week_start: weekStart, count: current + 1 })
+    } else if (action === 'upload_avatar') {
+      const rl = await consumeLimit('mod', MAX_MOD_PER_DAY)
+      if (rl && !rl.allowed) {
+        return json(
+          { error: 'daily_limit', reason: 'You have changed your photo too many times today. Please try again tomorrow.' },
+          429,
+        )
+      }
+    } else if (PAID_MOD.has(action)) {
+      const rl = await consumeLimit('mod', MAX_MOD_PER_DAY)
+      // Fail open (allowed: true) past the cap: don't burn paid calls, and the
+      // DB blocklist trigger + 5-posts/day insert policy still backstop content.
+      if (rl && !rl.allowed) return json({ allowed: true })
     }
 
     // ── Dispatch ────────────────────────────────────────────────────────────
 
-    if (action === 'moderate_text') {
-      const text = String(body.text ?? '').slice(0, 2000)
-      const res = await callOpenAI('https://api.openai.com/v1/moderations', { input: text })
+    if (action === 'moderate_image') {
+      const base64 = String(body.base64 ?? '')
+      const oversize = checkImageSize(base64)
+      if (oversize) return oversize
+
+      const res = await callOpenAI('https://api.openai.com/v1/moderations', {
+        model: 'omni-moderation-latest',
+        input: [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } }],
+      })
       return json({ flagged: res.results?.[0]?.flagged ?? false })
     }
 
-    if (action === 'moderate_image') {
-      const res = await callOpenAI('https://api.openai.com/v1/moderations', {
-        model: 'omni-moderation-latest',
-        input: [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${body.base64}` } }],
+    if (action === 'upload_avatar') {
+      const base64 = String(body.base64 ?? '')
+      if (!base64) return json({ error: 'no_image' }, 400)
+      const oversize = checkImageSize(base64)
+      if (oversize) return oversize
+
+      const dataUrl = `data:image/jpeg;base64,${base64}`
+      let reason = 'That photo does not fit our community guidelines. Please pick another one.'
+      let flagged = false
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+          model: 'omni-moderation-latest',
+          input: [{ type: 'image_url', image_url: { url: dataUrl } }],
+        })
+        flagged = mod.results?.[0]?.flagged === true
+
+        if (!flagged) {
+          const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+            model: 'gpt-4o-mini',
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: PICTURE_MOD_PROMPT },
+                { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } },
+              ],
+            }],
+            max_tokens: 80,
+            response_format: { type: 'json_object' },
+          })
+          const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}')
+          if (parsed.allowed === false) {
+            flagged = true
+            if (typeof parsed.reason === 'string' && parsed.reason.trim()) reason = parsed.reason.trim()
+          }
+        }
+      } catch (e) {
+        console.error('upload_avatar moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'We could not check that image right now. Please try again.' },
+          503,
+        )
+      }
+      if (flagged) return json({ error: 'flagged', reason }, 422)
+
+      let bytes: Uint8Array | null = null
+      try {
+        bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0))
+      } catch {}
+      if (!bytes) {
+        return json({ error: 'invalid_image', reason: 'That photo could not be read. Please try another one.' }, 400)
+      }
+
+      const path = `${user.id}/avatar.jpg`
+      const { error: upErr } = await admin.storage.from('avatars').upload(path, bytes, {
+        contentType: 'image/jpeg',
+        upsert: true,
       })
-      return json({ flagged: res.results?.[0]?.flagged ?? false })
+      if (upErr) {
+        console.error('upload_avatar storage error:', upErr)
+        return json({ error: 'upload_failed', reason: 'We could not save that photo. Please try again.' }, 500)
+      }
+
+      const { data: pub } = admin.storage.from('avatars').getPublicUrl(path)
+      return json({ url: pub.publicUrl })
     }
 
     if (action === 'create_routine') {
@@ -197,7 +259,7 @@ Deno.serve(async (req) => {
           messages: [{
             role: 'user',
             content: [
-              { type: 'text', text: 'You are a content moderator for a family-friendly productivity app.\nReview this profile picture.\n\nBLOCK (allowed: false) if the image contains:\n- Nudity or sexual content\n- Hate symbols (swastikas, Nazi imagery, KKK, extremist symbols)\n- Violence or gore\n- Slurs or harassment text\n\nALLOW everything else: selfies, logos, art, memes, animals, landscapes, etc.\n\nReply with ONLY valid JSON:\n{"allowed": true}\n{"allowed": false, "reason": "one sentence, addressed to the user"}' },
+              { type: 'text', text: PICTURE_MOD_PROMPT },
               { type: 'image_url', image_url: { url: avatarUrl, detail: 'low' } },
             ],
           }],
@@ -264,6 +326,10 @@ Deno.serve(async (req) => {
         .filter((b: unknown) => typeof b === 'string' && b.length > 0)
         .slice(0, 4)
       if (!images.length) return json({ error: 'no_images' }, 400)
+      for (const b64 of images) {
+        const oversize = checkImageSize(b64)
+        if (oversize) return oversize
+      }
 
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
         model: 'gpt-4o-mini',
@@ -298,8 +364,63 @@ Deno.serve(async (req) => {
       return json({ exercises })
     }
 
+    if (action === 'extract_schedule') {
+      const images: string[] = (Array.isArray(body.images) ? body.images : [])
+        .filter((b: unknown) => typeof b === 'string' && b.length > 0)
+        .slice(0, 3)
+      if (!images.length) return json({ error: 'no_images' }, 400)
+      for (const b64 of images) {
+        const oversize = checkImageSize(b64)
+        if (oversize) return oversize
+      }
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: 'gpt-4o-mini',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'The attached screenshots show a student\'s class schedule / timetable. Extract EVERY class meeting shown.\n\nReturn ONLY valid JSON:\n{"classes":[{"courseCode":"CS 135","courseName":"Designing Functional Programs","type":"Lecture","day":"Mon","startTime":"14:30","endTime":"15:20","location":"MC 2054"}]}\n\nRules:\n- One object per class meeting per day. A class that meets Mon/Wed/Fri at the same time becomes THREE objects.\n- courseCode: the short code as shown (e.g. "CS 135", "MATH 137"). If none is visible, use a short form of the name.\n- courseName: the full course title. If not visible, repeat the course code.\n- type: one of "Lecture", "Tutorial", "Lab", "Seminar", "Other" — infer from markers like LEC/TUT/LAB/SEM.\n- day: three letters, one of Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n- startTime/endTime: 24-hour "HH:MM".\n- location: the room/building as shown, or null if not visible.\n- If the images do not show a class schedule, return {"classes":[]}.' },
+            ...images.map(b64 => ({
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${b64}`, detail: 'high' },
+            })),
+          ],
+        }],
+        max_tokens: 1600,
+        response_format: { type: 'json_object' },
+      })
+
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const parsed = JSON.parse(choice?.message?.content ?? '{}')
+      const raw: Array<Record<string, unknown>> = Array.isArray(parsed.classes) ? parsed.classes : []
+      const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+      const TYPES = ['Lecture', 'Tutorial', 'Lab', 'Seminar', 'Other']
+      const timeOk = (t: unknown) => typeof t === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(t)
+      const classes = raw
+        .map(c => ({
+          courseCode: String(c.courseCode ?? '').trim().slice(0, 20),
+          courseName: String(c.courseName ?? '').trim().slice(0, 80),
+          type: TYPES.includes(String(c.type)) ? String(c.type) : 'Other',
+          day: String(c.day ?? '').slice(0, 3),
+          startTime: c.startTime,
+          endTime: c.endTime,
+          location: c.location ? String(c.location).trim().slice(0, 60) : null,
+        }))
+        .filter(c =>
+          (c.courseCode || c.courseName) && DAYS.includes(c.day) &&
+          timeOk(c.startTime) && timeOk(c.endTime) && String(c.startTime) < String(c.endTime)
+        )
+      return json({ classes })
+    }
+
     if (action === 'analyze_looks') {
       const base64: string = body.base64 ?? ''
+      const oversize = checkImageSize(base64)
+      if (oversize) return oversize
+
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
         model: 'gpt-4o-mini',
         messages: [{
@@ -324,7 +445,7 @@ Deno.serve(async (req) => {
     return json({ error: 'unknown_action' }, 400)
   } catch (e) {
     console.error('openai-proxy error:', e)
-    return json({ error: 'internal_error', message: String((e as Error)?.message ?? e) }, 500)
+    return json({ error: 'internal_error' }, 500)
   }
 })
 

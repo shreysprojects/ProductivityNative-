@@ -18,6 +18,11 @@ import {
 } from '../../lib/storage'
 import { loadHabits } from '../../lib/habitsStorage'
 import { readingStats } from '../../lib/textStats'
+import DayLogTimeline from '../../components/DayLogTimeline'
+import ScanScheduleModal from '../../components/ScanScheduleModal'
+import {
+  getLogSettings, getAllTimeLogs, slotStarts, DEFAULT_LOG_SETTINGS,
+} from '../../lib/timeLogging'
 
 const HABIT_DOT_COLOR = '#f43f5e'
 
@@ -54,6 +59,17 @@ const PRIORITY = {
   low:    { label: 'Low',    color: '#22c55e', emoji: '🟢' },
   none:   { label: 'None',   color: '#94a3b8', emoji: '⚪' },
 }
+
+// To-do buckets — how soon you mean to get to something, rather than a date.
+const BUCKETS = [
+  { key: 'today',     label: 'Today',     emoji: '☀️', hint: 'Things to get to later today' },
+  { key: 'week',      label: 'Week',      emoji: '🗓️', hint: 'Things to do sometime this week' },
+  { key: 'anytime',   label: 'Anytime',   emoji: '📚', hint: 'No deadline — whenever you get to it' },
+  { key: 'ambitious', label: 'Ambitious', emoji: '🚀', hint: 'Big long-term goals worth chipping away at' },
+]
+// Only near-term buckets take a deadline; "anytime" and "ambitious" are the
+// buckets you put things in precisely because they have no clock on them.
+const DEADLINE_BUCKETS = ['today', 'week']
 
 const WEEK_DAY_BTNS = [
   { label: 'M',  value: 1 },
@@ -179,6 +195,59 @@ function pctColor(p) {
   return '#ef4444'
 }
 
+// ── To-do deadlines ────────────────────────────────────────────────────────
+// 'YYYY-MM-DD HH:MM' for a time, or 'YYYY-MM-DD' meaning end of that day.
+
+function nowStamp() {
+  const d = new Date()
+  return `${todayStr()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`
+}
+
+function deadlineStamp(d) {
+  return d.length === 10 ? `${d} 23:59` : d
+}
+
+function isOverdue(t) {
+  return !t.done && !!t.deadline && deadlineStamp(t.deadline) < nowStamp()
+}
+
+function weekdayLabel(ds) {
+  return new Date(ds + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' })
+}
+
+function deadlineLabel(d) {
+  if (d.length === 10) {
+    return d === todayStr() ? 'by end of today' : `by ${weekdayLabel(d)}`
+  }
+  const [day, hm] = d.split(' ')
+  const [h, m] = hm.split(':').map(Number)
+  const time = hm === '23:59' ? 'end of day' : fmtTime(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`)
+  return day === todayStr() ? `by ${time}` : `by ${weekdayLabel(day)} ${time}`
+}
+
+// Remaining half-hours today, or the next 7 days for week-bucket items.
+function deadlineOptions(bucket) {
+  if (bucket === 'today') {
+    const d = new Date()
+    const first = Math.ceil((d.getHours() * 60 + d.getMinutes() + 1) / 30) * 30
+    const opts = []
+    for (let t = first; t <= 1410; t += 30) {
+      const hh = String(Math.floor(t / 60)).padStart(2, '0')
+      const mm = String(t % 60).padStart(2, '0')
+      opts.push({ value: `${todayStr()} ${hh}:${mm}`, label: fmtTime(`${hh}:${mm}`) })
+    }
+    opts.push({ value: `${todayStr()} 23:59`, label: 'End of today' })
+    return opts
+  }
+  return Array.from({ length: 7 }, (_, i) => {
+    const key = addDays(todayStr(), i)
+    const label = i === 0 ? 'Today'
+      : i === 1 ? 'Tomorrow'
+      : new Date(key + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
+    return { value: key, label }
+  })
+}
+
 function parseFormTime(h, m, ap) {
   const hi = parseInt(h, 10), mi = parseInt(m, 10)
   if (isNaN(hi) || isNaN(mi) || hi < 1 || hi > 12 || mi < 0 || mi > 59) return null
@@ -279,9 +348,11 @@ export default function CalendarScreen() {
   const [cTo, setCTo]             = useState('')
   const [cSaving, setCeSaving]    = useState(false)
 
-  // Tasks
+  // To-dos
   const [tasks, setTasks]               = useState([])
-  const [taskFilter, setTaskFilter]     = useState('active')
+  const [bucket, setBucket]             = useState('today')
+  const [draftTodo, setDraftTodo]       = useState('')
+  const [deadlinePick, setDeadlinePick] = useState(null) // task whose deadline is being set
   const [taskModalOpen, setTaskModalOpen] = useState(false)
   const [editingTask, setEditingTask]   = useState(null)
   const [tTitle, setTTitle]             = useState('')
@@ -289,6 +360,13 @@ export default function CalendarScreen() {
   const [tDueDateRaw, setTDueDateRaw]   = useState('')
   const [tPriority, setTPriority]       = useState('none')
   const [tSaving, setTSaving]           = useState(false)
+
+  // Time logging
+  const [logSettings, setLogSettings] = useState(DEFAULT_LOG_SETTINGS)
+  const [logCounts, setLogCounts]     = useState({})  // day -> logged slot count
+  const [weekPane, setWeekPane]       = useState('log') // 'log' | 'schedule'
+  const [logDay, setLogDay]           = useState(todayStr())
+  const [scanOpen, setScanOpen]       = useState(false)
 
   // Journal
   const [journalEntries, setJournalEntries] = useState({})
@@ -341,12 +419,19 @@ export default function CalendarScreen() {
   const load = useCallback(async () => {
     if (!user) return
     try {
-      const [hist, str, evts, sched, taskList, jEntries, habitsData] = await Promise.all([
+      const [hist, str, evts, sched, taskList, jEntries, habitsData, lSettings, allLogs] = await Promise.all([
         getHistory(user.id), getStreak(user.id),
         getCalendarEvents(user.id), getScheduleItems(user.id),
         getTasks(user.id), getJournalEntries(user.id),
         loadHabits(user.id),
+        getLogSettings(user.id),
+        // Never let the time-log sync take the whole calendar down with it.
+        getAllTimeLogs(user.id).catch(() => ({})),
       ])
+      setLogSettings(lSettings)
+      const counts = {}
+      for (const [d, slots] of Object.entries(allLogs)) counts[d] = Object.keys(slots).length
+      setLogCounts(counts)
       const map = {}, byDate = {}
       hist.forEach(h => {
         if (!map[h.date] || map[h.date] < h.completion) map[h.date] = h.completion
@@ -442,6 +527,7 @@ export default function CalendarScreen() {
           id: item.id + '|' + day, title: item.title, kind: 'class',
           startTime: item.startTime, endTime: item.endTime,
           color: item.color, location: item.location ?? null,
+          meta: item.meta ?? null,
           _scheduleId: item.id,
         })
       }
@@ -471,23 +557,30 @@ export default function CalendarScreen() {
       }))
   }, [events, today])
 
-  const filteredTasks = useMemo(() => {
-    const po = { high: 0, medium: 1, low: 2, none: 3 }
-    const sorted = [...tasks].sort((a, b) => {
-      const pd = (po[a.priority] ?? 3) - (po[b.priority] ?? 3)
-      if (pd !== 0) return pd
-      if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate)
-      if (a.dueDate) return -1
-      if (b.dueDate) return 1
-      return b.createdAt - a.createdAt
-    })
-    switch (taskFilter) {
-      case 'today':    return sorted.filter(t => !t.done && t.dueDate === today)
-      case 'upcoming': return sorted.filter(t => !t.done && t.dueDate && t.dueDate > today)
-      case 'done':     return sorted.filter(t => t.done)
-      default:         return sorted.filter(t => !t.done)
+  // Open items first (earliest deadline up top, undated after), done last.
+  const bucketTasks = useMemo(() => (
+    tasks
+      .filter(t => (t.bucket ?? 'today') === bucket)
+      .sort((a, b) => {
+        if (!!a.done !== !!b.done) return a.done ? 1 : -1
+        const ka = a.deadline ? deadlineStamp(a.deadline) : '9999'
+        const kb = b.deadline ? deadlineStamp(b.deadline) : '9999'
+        if (ka !== kb) return ka < kb ? -1 : 1
+        return (a.createdAt ?? 0) - (b.createdAt ?? 0)
+      })
+  ), [tasks, bucket])
+
+  const bucketCounts = useMemo(() => {
+    const c = {}
+    for (const t of tasks) {
+      if (t.done) continue
+      const b = t.bucket ?? 'today'
+      c[b] = (c[b] ?? 0) + 1
     }
-  }, [tasks, taskFilter, today])
+    return c
+  }, [tasks])
+
+  const slotsPerDay = useMemo(() => slotStarts(logSettings).length, [logSettings])
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -592,7 +685,12 @@ export default function CalendarScreen() {
 
   function handleWeekEventPress(ev) {
     const timeRange = `${fmtTime(ev.startTime)} – ${fmtTime(ev.endTime)}`
-    const body = [timeRange, ev.location].filter(Boolean).join('\n')
+    const body = [
+      ev.meta?.courseName && ev.meta.courseName !== ev.meta.courseCode ? ev.meta.courseName : null,
+      ev.meta?.type && ev.meta.type !== 'Other' ? ev.meta.type : null,
+      timeRange,
+      ev.location,
+    ].filter(Boolean).join('\n')
     Alert.alert(ev.title, body, [
       { text: 'Close', style: 'cancel' },
       {
@@ -612,12 +710,41 @@ export default function CalendarScreen() {
     ])
   }
 
-  function openAddTask() {
-    setEditingTask(null)
-    setTTitle(''); setTDesc(''); setTDueDateRaw(''); setTPriority('none')
-    setTaskModalOpen(true)
+  async function addQuickTodo() {
+    const title = draftTodo.trim()
+    if (!title) return
+    setDraftTodo('')
+    const task = {
+      id: genId(), title, description: null, dueDate: null,
+      priority: 'none', done: false, createdAt: Date.now(),
+      bucket, deadline: null,
+    }
+    setTasks(prev => [...prev, task])
+    await saveTask(user.id, task)
   }
 
+  async function setTaskDeadline(value) {
+    const updated = { ...deadlinePick, deadline: value }
+    setDeadlinePick(null)
+    setTasks(prev => prev.map(t => t.id === updated.id ? updated : t))
+    await saveTask(user.id, updated)
+  }
+
+  async function handleImportClasses(items) {
+    setScanOpen(false)
+    const saved = items.map(i => ({ ...i, id: genId(), semesterStart: null, semesterEnd: null }))
+    setScheduleItems(prev => [...prev, ...saved])
+    for (const item of saved) await saveScheduleItem(user.id, item)
+    setViewMode('week')
+    setWeekPane('schedule')
+    Alert.alert(
+      'Classes added',
+      `${saved.length} class${saved.length === 1 ? '' : 'es'} added to your weekly schedule.`
+    )
+  }
+
+  // New to-dos come from the quick-add row; this editor is for the details
+  // (description, priority, due date) once an item exists.
   function openEditTask(task) {
     setEditingTask(task)
     setTTitle(task.title)
@@ -643,6 +770,8 @@ export default function CalendarScreen() {
       priority: tPriority,
       done: editingTask?.done ?? false,
       createdAt: editingTask?.createdAt ?? Date.now(),
+      bucket: editingTask?.bucket ?? bucket,
+      deadline: editingTask?.deadline ?? null,
     }
     await saveTask(user.id, task)
     setTasks(prev => editingTask ? prev.map(t => t.id === task.id ? task : t) : [...prev, task])
@@ -727,26 +856,26 @@ export default function CalendarScreen() {
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {['month', 'week', 'tasks'].map(mode => (
+          {[['month', 'Month'], ['week', 'Week'], ['tasks', 'To-do']].map(([mode, label]) => (
             <Pressable
               key={mode}
               style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}
               onPress={() => switchView(mode)}
             >
               <Text style={[s.toggleOptText, { color: viewMode === mode ? '#fff' : theme.subtext }]}>
-                {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                {label}
               </Text>
             </Pressable>
           ))}
         </View>
         <View style={s.toggleActions}>
-          {viewMode === 'week' && (
+          {viewMode === 'week' && (!logSettings.enabled || weekPane === 'schedule') && (
             <>
               <Pressable
                 style={[s.toggleActionBtn, { backgroundColor: theme.accent + '20' }]}
-                onPress={() => { setSelected(today); openAdd() }}
+                onPress={() => setScanOpen(true)}
               >
-                <Text style={[s.toggleActionText, { color: theme.accent }]}>＋ Event</Text>
+                <Text style={[s.toggleActionText, { color: theme.accent }]}>✦ Scan</Text>
               </Pressable>
               <Pressable
                 style={[s.toggleActionBtn, { backgroundColor: theme.accent }]}
@@ -755,14 +884,6 @@ export default function CalendarScreen() {
                 <Text style={[s.toggleActionText, { color: '#fff' }]}>＋ Class</Text>
               </Pressable>
             </>
-          )}
-          {viewMode === 'tasks' && (
-            <Pressable
-              style={[s.toggleActionBtn, { backgroundColor: theme.accent }]}
-              onPress={openAddTask}
-            >
-              <Text style={[s.toggleActionText, { color: '#fff' }]}>＋ Task</Text>
-            </Pressable>
           )}
         </View>
       </View>
@@ -851,6 +972,9 @@ export default function CalendarScreen() {
                         {habitEventsByDate[ds] && (
                           <View style={[s.eventDot, { backgroundColor: HABIT_DOT_COLOR }]} />
                         )}
+                        {logSettings.enabled && logCounts[ds] > 0 && (
+                          <View style={[s.eventDot, { backgroundColor: '#14b8a6' }]} />
+                        )}
                       </View>
                     </Pressable>
                   )
@@ -860,7 +984,7 @@ export default function CalendarScreen() {
 
             <View style={[s.legendDivider, { backgroundColor: theme.divider }]} />
             <View style={s.legend}>
-              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],[HABIT_DOT_COLOR,'Habit']].map(([c, l]) => (
+              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],[HABIT_DOT_COLOR,'Habit'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
                 <View key={l} style={s.legendItem}>
                   <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
                   <Text style={[s.legendText, { color: theme.muted }]}>{l}</Text>
@@ -878,6 +1002,30 @@ export default function CalendarScreen() {
                   <Text style={s.addBtnText}>＋ Event</Text>
                 </Pressable>
               </View>
+
+              {/* How much of the day you logged */}
+              {logSettings.enabled && slotsPerDay > 0 && selected <= today && (() => {
+                const done = logCounts[selected] ?? 0
+                const pct = Math.round((done / slotsPerDay) * 100)
+                return (
+                  <Pressable
+                    style={[s.logStatRow, { backgroundColor: '#14b8a610', borderColor: '#14b8a640' }]}
+                    onPress={() => { setLogDay(selected); setViewMode('week'); setWeekPane('log') }}
+                  >
+                    <Text style={s.logStatEmoji}>⏱</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.logStatText, { color: theme.text }]}>
+                        <Text style={{ color: '#14b8a6', fontWeight: '800' }}>{done}/{slotsPerDay}</Text>
+                        {' slots logged'}
+                      </Text>
+                      <View style={[s.logStatTrack, { backgroundColor: theme.isDark ? '#ffffff14' : '#00000010' }]}>
+                        <View style={[s.logStatFill, { width: `${pct}%`, backgroundColor: '#14b8a6' }]} />
+                      </View>
+                    </View>
+                    <Text style={[s.logStatPct, { color: '#14b8a6' }]}>{pct}%</Text>
+                  </Pressable>
+                )
+              })()}
               {selectedEvents.map(ev => {
                 const ti = EVENT_TYPES.find(t => t.id === ev.type) ?? EVENT_TYPES[3]
                 return (
@@ -1127,7 +1275,56 @@ export default function CalendarScreen() {
       )}
 
       {/* ── Week view ──────────────────────────────────────────────────────── */}
-      {viewMode === 'week' && (
+      {viewMode === 'week' && logSettings.enabled && (
+        <View style={[s.paneBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
+          {[['log', '⏱  Time log'], ['schedule', '📅  Schedule']].map(([key, label]) => (
+            <Pressable
+              key={key}
+              style={[s.paneBtn, weekPane === key && { borderBottomColor: theme.accent }]}
+              onPress={() => setWeekPane(key)}
+            >
+              <Text style={[s.paneBtnText, { color: weekPane === key ? theme.accent : theme.subtext }]}>
+                {label}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      )}
+
+      {/* Time log — one row per slot for the chosen day */}
+      {viewMode === 'week' && logSettings.enabled && weekPane === 'log' && (
+        <View style={{ flex: 1 }}>
+          <View style={[s.logDayBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
+            <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.logDayArrowBtn}>
+              <Text style={[s.logDayArrow, { color: theme.accent }]}>‹</Text>
+            </Pressable>
+            <Pressable onPress={() => setLogDay(today)} style={{ flex: 1 }}>
+              <Text style={[s.logDayLabel, { color: theme.text }]} numberOfLines={1}>
+                {logDay === today ? 'Today' : formatDateShort(logDay)}
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setLogDay(d => (d < today ? addDays(d, 1) : d))}
+              hitSlop={10}
+              style={s.logDayArrowBtn}
+            >
+              <Text style={[s.logDayArrow, { color: logDay < today ? theme.accent : theme.muted, opacity: logDay < today ? 1 : 0.4 }]}>›</Text>
+            </Pressable>
+          </View>
+          <DayLogTimeline
+            key={logDay}
+            userId={user.id}
+            day={logDay}
+            todayStr={today}
+            settings={logSettings}
+            onCountsChange={(filled) => setLogCounts(prev => (
+              prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
+            ))}
+          />
+        </View>
+      )}
+
+      {viewMode === 'week' && (!logSettings.enabled || weekPane === 'schedule') && (
         <View style={{ flex: 1 }}>
 
           {/* Week navigation + day headers */}
@@ -1248,56 +1445,69 @@ export default function CalendarScreen() {
         </View>
       )}
 
-      {/* ── Tasks view ────────────────────────────────────────────────────── */}
+      {/* ── To-do view ────────────────────────────────────────────────────── */}
       {viewMode === 'tasks' && (
         <View style={{ flex: 1 }}>
-          <View style={[s.taskFilterBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
-            {[
-              { key: 'active',   label: 'Active',    count: tasks.filter(t => !t.done).length },
-              { key: 'today',    label: 'Today',     count: tasks.filter(t => !t.done && t.dueDate === today).length },
-              { key: 'upcoming', label: 'Upcoming',  count: tasks.filter(t => !t.done && t.dueDate && t.dueDate > today).length },
-              { key: 'done',     label: 'Done',      count: tasks.filter(t => t.done).length },
-            ].map(f => (
-              <Pressable
-                key={f.key}
-                style={[s.filterChip, taskFilter === f.key && { backgroundColor: theme.accent }]}
-                onPress={() => setTaskFilter(f.key)}
-              >
-                <Text style={[s.filterChipText, { color: taskFilter === f.key ? '#fff' : theme.subtext }]}>
-                  {f.label}{f.count > 0 ? ` (${f.count})` : ''}
-                </Text>
-              </Pressable>
-            ))}
+          <View style={s.bucketBar}>
+            {BUCKETS.map(b => {
+              const active = b.key === bucket
+              const count = bucketCounts[b.key] ?? 0
+              return (
+                <Pressable
+                  key={b.key}
+                  onPress={() => setBucket(b.key)}
+                  style={[s.bucketBtn, {
+                    backgroundColor: active ? theme.accent : theme.card,
+                    borderColor: active ? theme.accent : theme.cardBorder,
+                  }]}
+                >
+                  <Text style={s.bucketEmoji}>{b.emoji}</Text>
+                  <Text style={[s.bucketLabel, { color: active ? '#fff' : theme.subtext }]}>
+                    {b.label}{count > 0 ? ` ${count}` : ''}
+                  </Text>
+                </Pressable>
+              )
+            })}
           </View>
 
-          <ScrollView contentContainerStyle={[s.content, { paddingTop: 12 }]}>
-            {filteredTasks.length === 0 ? (
+          <View style={[s.addTodoRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+            <TextInput
+              value={draftTodo}
+              onChangeText={setDraftTodo}
+              placeholder={`Add to ${BUCKETS.find(b => b.key === bucket).label}…`}
+              placeholderTextColor={theme.muted}
+              returnKeyType="done"
+              onSubmitEditing={addQuickTodo}
+              style={[s.addTodoInput, { color: theme.text }]}
+            />
+            <Pressable onPress={addQuickTodo} hitSlop={8}>
+              <Text style={[s.addTodoPlus, { color: draftTodo.trim() ? theme.accent : theme.muted }]}>＋</Text>
+            </Pressable>
+          </View>
+
+          <ScrollView contentContainerStyle={[s.content, { paddingTop: 4 }]}>
+            {bucketTasks.length === 0 ? (
               <View style={[s.taskEmptyCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
                 <Text style={{ fontSize: 32, textAlign: 'center', marginBottom: 8 }}>
-                  {taskFilter === 'done' ? '🎉' : '📋'}
+                  {BUCKETS.find(b => b.key === bucket).emoji}
                 </Text>
                 <Text style={[s.emptyText, { color: theme.muted, textAlign: 'center' }]}>
-                  {taskFilter === 'done'     ? 'No completed tasks yet'
-                   : taskFilter === 'today'  ? 'Nothing due today'
-                   : taskFilter === 'upcoming' ? 'Nothing upcoming'
-                   : 'No active tasks — tap ＋ Task to add one'}
+                  {BUCKETS.find(b => b.key === bucket).hint}
                 </Text>
               </View>
-            ) : filteredTasks.map(task => {
+            ) : bucketTasks.map(task => {
               const pri = PRIORITY[task.priority] ?? PRIORITY.none
-              const isOverdue  = task.dueDate && task.dueDate < today && !task.done
-              const isDueToday = task.dueDate === today && !task.done
-              const dueDateColor = isOverdue ? '#ef4444' : isDueToday ? '#f59e0b' : theme.muted
-              const dueDateLabel = task.dueDate
-                ? isOverdue   ? `Overdue · ${formatDateShort(task.dueDate)}`
-                  : isDueToday ? 'Due today'
-                  : task.dueDate === tomorrowStr() ? 'Tomorrow'
-                  : formatDateShort(task.dueDate)
-                : null
+              const overdue = isOverdue(task)
+              const canDeadline = DEADLINE_BUCKETS.includes(task.bucket ?? 'today')
               return (
                 <Pressable
                   key={task.id}
-                  style={[s.taskRow, { backgroundColor: theme.card, borderColor: theme.cardBorder, borderLeftColor: pri.color, opacity: task.done ? 0.6 : 1 }]}
+                  style={[s.taskRow, {
+                    backgroundColor: theme.card,
+                    borderColor: overdue ? '#ef4444' : theme.cardBorder,
+                    borderLeftColor: pri.color,
+                    opacity: task.done ? 0.55 : 1,
+                  }]}
                   onPress={() => openEditTask(task)}
                 >
                   <Pressable
@@ -1316,13 +1526,18 @@ export default function CalendarScreen() {
                         {task.description}
                       </Text>
                     ) : null}
-                    {dueDateLabel ? (
-                      <Text style={[s.taskDueLabel, { color: dueDateColor }]}>
-                        {isOverdue ? '⚠ ' : isDueToday ? '⏰ ' : '📅 '}{dueDateLabel}
+                    {task.deadline ? (
+                      <Text style={[s.taskDueLabel, { color: overdue ? '#ef4444' : theme.subtext }]}>
+                        {overdue ? `⚠ overdue — was ${deadlineLabel(task.deadline)}` : `⏰ ${deadlineLabel(task.deadline)}`}
                       </Text>
                     ) : null}
                   </View>
                   <View style={s.taskRowRight}>
+                    {canDeadline && !task.done && (
+                      <Pressable onPress={() => setDeadlinePick(task)} hitSlop={10}>
+                        <Text style={{ fontSize: 15, opacity: task.deadline ? 1 : 0.45 }}>⏰</Text>
+                      </Pressable>
+                    )}
                     <View style={[s.taskPriorityDot, { backgroundColor: pri.color }]} />
                     <Pressable onPress={() => handleDeleteTask(task)} hitSlop={12}>
                       <Text style={s.deleteBtnText}>✕</Text>
@@ -1334,6 +1549,48 @@ export default function CalendarScreen() {
           </ScrollView>
         </View>
       )}
+
+      {/* ── Deadline picker ───────────────────────────────────────────────── */}
+      <Modal visible={deadlinePick !== null} transparent animationType="fade" onRequestClose={() => setDeadlinePick(null)}>
+        <Pressable style={s.pickerBackdrop} onPress={() => setDeadlinePick(null)}>
+          <View style={[s.pickerCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+            <Text style={[s.pickerTitle, { color: theme.text }]} numberOfLines={1}>
+              Deadline for "{deadlinePick?.title}"
+            </Text>
+            <ScrollView style={{ maxHeight: 360 }}>
+              <Pressable
+                onPress={() => setTaskDeadline(null)}
+                style={[s.pickerRow, !deadlinePick?.deadline && { backgroundColor: theme.accent + '22' }]}
+              >
+                <Text style={{ color: !deadlinePick?.deadline ? theme.accent : theme.text, fontWeight: !deadlinePick?.deadline ? '700' : '500', fontSize: 14 }}>
+                  No deadline
+                </Text>
+              </Pressable>
+              {(deadlinePick ? deadlineOptions(deadlinePick.bucket ?? 'today') : []).map(opt => {
+                const sel = deadlinePick?.deadline === opt.value
+                return (
+                  <Pressable
+                    key={opt.value}
+                    onPress={() => setTaskDeadline(opt.value)}
+                    style={[s.pickerRow, sel && { backgroundColor: theme.accent + '22' }]}
+                  >
+                    <Text style={{ color: sel ? theme.accent : theme.text, fontWeight: sel ? '700' : '500', fontSize: 14 }}>
+                      {opt.label}
+                    </Text>
+                    {sel && <Text style={{ color: theme.accent, fontWeight: '800' }}>✓</Text>}
+                  </Pressable>
+                )
+              })}
+            </ScrollView>
+          </View>
+        </Pressable>
+      </Modal>
+
+      <ScanScheduleModal
+        visible={scanOpen}
+        onClose={() => setScanOpen(false)}
+        onImport={handleImportClasses}
+      />
 
       {/* ── Add Event modal ────────────────────────────────────────────────── */}
       <Modal visible={addOpen} transparent animationType="slide" onRequestClose={() => setAddOpen(false)}>
@@ -1777,9 +2034,62 @@ const s = StyleSheet.create({
   saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
 
   // Tasks view
-  taskFilterBar: { flexDirection: 'row', paddingHorizontal: 14, paddingVertical: 10, gap: 8, borderBottomWidth: 1 },
-  filterChip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16 },
-  filterChipText: { fontSize: 12, fontWeight: '700' },
+  // Week view pane switcher (Time log / Schedule)
+  paneBar: { flexDirection: 'row', borderBottomWidth: StyleSheet.hairlineWidth },
+  paneBtn: {
+    flex: 1, alignItems: 'center', paddingVertical: 12,
+    borderBottomWidth: 2.5, borderBottomColor: 'transparent',
+  },
+  paneBtnText: { fontSize: 13.5, fontWeight: '700' },
+
+  // Time log day picker
+  logDayBar: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 10, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  logDayArrowBtn: { paddingHorizontal: 12, paddingVertical: 2 },
+  logDayArrow: { fontSize: 26, fontWeight: '700', lineHeight: 30 },
+  logDayLabel: { fontSize: 15, fontWeight: '800', textAlign: 'center', letterSpacing: -0.2 },
+
+  // "x/28 slots logged" row in the month day detail
+  logStatRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    borderRadius: 14, borderWidth: 1, padding: 12, marginBottom: 12,
+  },
+  logStatEmoji: { fontSize: 17 },
+  logStatText: { fontSize: 13, fontWeight: '600' },
+  logStatTrack: { height: 6, borderRadius: 3, marginTop: 7, overflow: 'hidden' },
+  logStatFill: { height: 6, borderRadius: 3 },
+  logStatPct: { fontSize: 14, fontWeight: '800' },
+
+  // To-do buckets
+  bucketBar: { flexDirection: 'row', gap: 6, paddingHorizontal: 12, paddingTop: 12, paddingBottom: 8 },
+  bucketBtn: {
+    flex: 1, alignItems: 'center', justifyContent: 'center', gap: 2,
+    paddingVertical: 8, borderRadius: 12, borderWidth: 1,
+  },
+  bucketEmoji: { fontSize: 14 },
+  bucketLabel: { fontSize: 10.5, fontWeight: '800' },
+  addTodoRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    marginHorizontal: 12, marginBottom: 10,
+    paddingLeft: 14, paddingRight: 12, paddingVertical: 2,
+    borderWidth: 1, borderRadius: 14,
+  },
+  addTodoInput: { flex: 1, fontSize: 14, paddingVertical: 11 },
+  addTodoPlus: { fontSize: 22, fontWeight: '700' },
+
+  // Deadline picker
+  pickerBackdrop: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center', justifyContent: 'center', padding: 32,
+  },
+  pickerCard: { alignSelf: 'stretch', borderWidth: 1, borderRadius: 20, padding: 18 },
+  pickerTitle: { fontSize: 15, fontWeight: '800', marginBottom: 10 },
+  pickerRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 11, paddingHorizontal: 10, borderRadius: 10,
+  },
 
   taskEmptyCard: { borderRadius: 20, padding: 24, borderWidth: 1, alignItems: 'center' },
   taskRow: {

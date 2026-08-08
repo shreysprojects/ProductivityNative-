@@ -2,7 +2,7 @@ import { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, ScrollView, TextInput,
   StyleSheet, Alert, ActivityIndicator, Switch,
-  KeyboardAvoidingView, Platform, Share,
+  KeyboardAvoidingView, Platform, Share, Modal,
 } from 'react-native'
 import { Image } from 'expo-image'
 import { useFocusEffect } from 'expo-router'
@@ -25,6 +25,10 @@ import {
   checkUsernameAvailable, upsertProfile, pickAndUploadAvatar,
 } from '../../lib/profileStorage'
 import { getSections, saveSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import {
+  getLogSettings, saveLogSettings, slotStarts, timeLabel,
+  LOG_INTERVALS, DEFAULT_LOG_SETTINGS,
+} from '../../lib/timeLogging'
 
 const ACCENT = '#6366f1'
 const DAY_ABBR = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
@@ -148,6 +152,10 @@ export default function SettingsScreen() {
   // App sections (drives the hidden SECTIONS / BOTTOM TABS toggle groups)
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
 
+  // Time logging
+  const [logSettings, setLogSettings] = useState(DEFAULT_LOG_SETTINGS)
+  const [timePicking, setTimePicking] = useState(null) // 'activeStart' | 'activeEnd' | null
+
   // Privacy & data
   const [blockedOpen, setBlockedOpen]       = useState(false)
   const [blockedList, setBlockedList]       = useState([])
@@ -155,13 +163,22 @@ export default function SettingsScreen() {
   const [exporting, setExporting]           = useState(false)
 
   useFocusEffect(useCallback(() => {
-    if (user) getSections(user.id).then(setSections)
+    if (user) {
+      getSections(user.id).then(setSections)
+      getLogSettings(user.id).then(setLogSettings)
+    }
   }, [user]))
 
   async function toggleSection(name) {
     const next = { ...sections, [name]: !sections[name] }
     setSections(next)
     await saveSections(user.id, next)
+  }
+
+  async function updateLogSettings(patch) {
+    const next = { ...logSettings, ...patch }
+    setLogSettings(next)
+    await saveLogSettings(user.id, next)
   }
 
   // Load profile into local state once per session
@@ -896,6 +913,82 @@ export default function SettingsScreen() {
         </View>
         </>)}
 
+        {/* ── Time Logging ──────────────────────────────────────────── */}
+        <SectionHeader title="TIME LOGGING" theme={theme} />
+        <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+          <View style={st.prefRow}>
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Log my day</Text>
+              <Text style={[st.tlHint, { color: theme.muted }]}>
+                Adds a Time log tab under Calendar → Week
+              </Text>
+            </View>
+            <Switch
+              value={logSettings.enabled}
+              onValueChange={v => updateLogSettings({ enabled: v })}
+              trackColor={{ false: '#e0e0f0', true: ACCENT }}
+              thumbColor="#ffffff"
+              ios_backgroundColor="#e0e0f0"
+            />
+          </View>
+
+          {logSettings.enabled && (<>
+            <View style={[st.tlDivider, { backgroundColor: theme.divider }]} />
+            <View style={st.prefRow}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Remind me to log</Text>
+              <Switch
+                value={logSettings.remind}
+                onValueChange={v => updateLogSettings({ remind: v })}
+                trackColor={{ false: '#e0e0f0', true: ACCENT }}
+                thumbColor="#ffffff"
+                ios_backgroundColor="#e0e0f0"
+              />
+            </View>
+
+            <View style={[st.tlDivider, { backgroundColor: theme.divider }]} />
+            <View style={st.prefRow}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Log every</Text>
+              <View style={st.tlSegment}>
+                {LOG_INTERVALS.map(iv => {
+                  const active = logSettings.interval === iv
+                  return (
+                    <Pressable
+                      key={iv}
+                      onPress={() => updateLogSettings({ interval: iv })}
+                      style={[st.tlSegmentBtn, {
+                        backgroundColor: active ? ACCENT : (theme.isDark ? '#1c1c32' : '#f0f0f8'),
+                      }]}
+                    >
+                      <Text style={[st.tlSegmentText, { color: active ? '#fff' : theme.subtext }]}>{iv}m</Text>
+                    </Pressable>
+                  )
+                })}
+              </View>
+            </View>
+
+            <View style={[st.tlDivider, { backgroundColor: theme.divider }]} />
+            <Pressable style={st.prefRow} onPress={() => setTimePicking('activeStart')}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Day starts</Text>
+              <Text style={[st.tlValue, { color: theme.accent }]}>
+                {timeLabel(logSettings.activeStart)}  ›
+              </Text>
+            </Pressable>
+
+            <View style={[st.tlDivider, { backgroundColor: theme.divider }]} />
+            <Pressable style={st.prefRow} onPress={() => setTimePicking('activeEnd')}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Day ends</Text>
+              <Text style={[st.tlValue, { color: theme.accent }]}>
+                {timeLabel(logSettings.activeEnd)}  ›
+              </Text>
+            </Pressable>
+
+            <Text style={[st.tlFootnote, { color: theme.muted }]}>
+              {slotStarts(logSettings).length} slots per day
+              {logSettings.remind ? ', with a reminder at the end of each one' : ''}
+            </Text>
+          </>)}
+        </View>
+
         {/* ── App Preferences ───────────────────────────────────────── */}
         <SectionHeader title="APP PREFERENCES" theme={theme} />
         <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
@@ -1052,6 +1145,37 @@ export default function SettingsScreen() {
           <Text style={st.deleteBtnText}>Delete Account</Text>
         </Pressable>
       </ScrollView>
+
+      {/* Day start / end picker for time logging */}
+      <Modal visible={timePicking !== null} transparent animationType="fade" onRequestClose={() => setTimePicking(null)}>
+        <Pressable style={st.tlBackdrop} onPress={() => setTimePicking(null)}>
+          <View style={[st.tlPickerCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+            <Text style={[st.tlPickerTitle, { color: theme.text }]}>
+              {timePicking === 'activeStart' ? 'Day starts at' : 'Day ends at'}
+            </Text>
+            <ScrollView style={{ maxHeight: 360 }}>
+              {(timePicking === 'activeStart'
+                ? Array.from({ length: 48 }, (_, i) => i * 30).filter(m => m < logSettings.activeEnd)
+                : Array.from({ length: 48 }, (_, i) => (i + 1) * 30).filter(m => m > logSettings.activeStart)
+              ).map(m => {
+                const sel = logSettings[timePicking] === m
+                return (
+                  <Pressable
+                    key={m}
+                    onPress={() => { updateLogSettings({ [timePicking]: m }); setTimePicking(null) }}
+                    style={[st.tlPickerRow, sel && { backgroundColor: ACCENT + '22' }]}
+                  >
+                    <Text style={{ color: sel ? ACCENT : theme.text, fontWeight: sel ? '700' : '500', fontSize: 14 }}>
+                      {timeLabel(m)}
+                    </Text>
+                    {sel && <Text style={{ color: ACCENT, fontWeight: '800' }}>✓</Text>}
+                  </Pressable>
+                )
+              })}
+            </ScrollView>
+          </View>
+        </Pressable>
+      </Modal>
     </KeyboardAvoidingView>
   )
 }
@@ -1071,6 +1195,25 @@ const st = StyleSheet.create({
     shadowOpacity: 0.06, shadowRadius: 8, elevation: 3,
   },
   cardSubLabel: { fontSize: 13, fontWeight: '600', marginBottom: 12 },
+
+  // Time logging
+  tlHint: { fontSize: 11.5, fontWeight: '500', marginTop: 3, lineHeight: 16 },
+  tlDivider: { height: StyleSheet.hairlineWidth, marginVertical: 13 },
+  tlSegment: { flexDirection: 'row', gap: 6 },
+  tlSegmentBtn: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 10 },
+  tlSegmentText: { fontSize: 12, fontWeight: '800' },
+  tlValue: { fontSize: 13.5, fontWeight: '700' },
+  tlFootnote: { fontSize: 11.5, fontWeight: '500', marginTop: 14, lineHeight: 16 },
+  tlBackdrop: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center', justifyContent: 'center', padding: 32,
+  },
+  tlPickerCard: { alignSelf: 'stretch', borderWidth: 1, borderRadius: 20, padding: 18 },
+  tlPickerTitle: { fontSize: 16, fontWeight: '800', marginBottom: 10 },
+  tlPickerRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 11, paddingHorizontal: 10, borderRadius: 10,
+  },
 
   fieldLabel: { fontSize: 12, fontWeight: '700', letterSpacing: 0.4, marginBottom: 8, marginTop: 14 },
   textInput: {
