@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   View, Text, Pressable, ScrollView, Modal,
   StyleSheet, ActivityIndicator, Alert,
@@ -53,6 +53,10 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
     setSkipped(new Set())
     setBusy(false)
   }
+
+  // Start every open fresh. Resetting here (not on import) means cancelling
+  // the replace-confirmation keeps the scan results — no re-scan needed.
+  useEffect(() => { if (visible) reset() }, [visible])
 
   function close() {
     reset()
@@ -174,8 +178,9 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
       if (dow != null && !item.days.includes(dow)) item.days.push(dow)
     }
     const items = [...grouped.values()].filter(i => i.days.length > 0)
+    // No reset here: the parent may ask "replace your schedule?" first, and a
+    // cancelled confirmation should come back to these results, not a rescan.
     onImport(items)
-    reset()
   }
 
   const keptCount = found ? found.length - skipped.size : 0
@@ -193,7 +198,8 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
               <Text style={[sc.body, { color: theme.subtext }]}>
                 Pick up to 3 screenshots of your timetable. Course code, course name, type
                 (lecture, tutorial, lab), day, time and room are read automatically — you
-                get to review everything before it's added.
+                get to review everything first. Importing replaces the classes currently
+                on your schedule.
               </Text>
               <Pressable
                 style={[sc.primaryBtn, { backgroundColor: theme.accent, opacity: busy ? 0.6 : 1 }]}
@@ -259,7 +265,7 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
                   onPress={confirm}
                 >
                   <Text style={sc.primaryBtnText}>
-                    Add {keptCount} class{keptCount === 1 ? '' : 'es'}
+                    Import {keptCount} class{keptCount === 1 ? '' : 'es'}
                   </Text>
                 </Pressable>
               </View>
