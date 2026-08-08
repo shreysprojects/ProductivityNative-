@@ -34,7 +34,9 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
   const cardScale = useRef(new Animated.Value(0.94)).current
   const cardOpacity = useRef(new Animated.Value(0)).current
 
-  // Pop-in animation on each new task
+  // Pop-in animation on each new task. Keyed on the task itself, not just the
+  // position: editing the routine mid-run can slide a different task into the
+  // same index.
   useEffect(() => {
     cardScale.setValue(0.94)
     cardOpacity.setValue(0)
@@ -42,7 +44,7 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
       Animated.spring(cardScale, { toValue: 1, useNativeDriver: true, speed: 18, bounciness: 10 }),
       Animated.timing(cardOpacity, { toValue: 1, duration: 180, useNativeDriver: true }),
     ]).start()
-  }, [currentStep])
+  }, [currentStep, step.id])
 
   // Elapsed timer
   useEffect(() => {
@@ -51,7 +53,7 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
-  }, [currentStep])
+  }, [currentStep, step.startedAt])
 
   function pressIn() {
     Animated.spring(btnScale, { toValue: 0.94, useNativeDriver: true, speed: 40, bounciness: 4 }).start()

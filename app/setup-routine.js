@@ -1,13 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
+import { useTheme } from '../lib/ThemeContext'
 import {
   getRoutineTemplate, saveRoutineTemplate, markSetupDone,
   addRoutine, getRoutineNames, getRoutineSettings, saveRoutineSettings,
   renameRoutine, shiftRoutinesAfter, RESERVED_ROUTINES, altRoutineName,
-  getRoutineGroupMap, saveRoutineGroupMap,
+  getRoutineGroupMap, saveRoutineGroupMap, getTodayRun,
 } from '../lib/storage'
 
 // Section identities — match the dashboard's Every day / Whenever headers
@@ -180,6 +181,8 @@ function fmtGoalSecs(s) {
 
 export default function SetupRoutine() {
   const { user } = useAuth()
+  const { theme } = useTheme()
+  const s = useMemo(() => makeStyles(theme), [theme])
   const { name: nameParam, variant: variantParam } = useLocalSearchParams()
 
   const isNew = nameParam === 'new'
@@ -189,7 +192,7 @@ export default function SetupRoutine() {
   // name, description, and schedule belong to the routine and stay shared.
   const isAltVariant = !!routineName && variantParam === 'alt'
 
-  const theme = routineTheme(routineName || 'Morning')
+  const accent = routineTheme(routineName || 'Morning')
 
   // Only routines the user created can be renamed (Morning/Fitness/Night are
   // hardcoded throughout the app and keep their names).
@@ -216,28 +219,39 @@ export default function SetupRoutine() {
   const [showEmojiPicker,  setShowEmojiPicker]  = useState(false)
   const [emojiTargetId,    setEmojiTargetId]    = useState(null)
   const [emojiQuery,       setEmojiQuery]       = useState('')
+  const [runInProgress,    setRunInProgress]    = useState(false)
 
   // Whenever routines have no day/time schedule.
   const isWhenever = isNew ? newGroup === 'whenever' : routineGroup === 'whenever'
 
   useEffect(() => {
     if (!user) return
+    // A brand new routine starts blank; only first-time setup seeds from Morning.
+    if (isNew) {
+      setTasks([])
+      setDescription('')
+      return
+    }
     const target = routineName || 'Morning'
     getRoutineTemplate(user.id, isAltVariant ? altRoutineName(target) : target).then(template =>
       setTasks(template.map(t => ({ ...t, subTasks: t.subTasks || [], timeGoalSecs: t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60 })))
     )
     if (!isFirstTime) {
-      getRoutineSettings(user.id, target).then(s => {
-        setActiveDays(s.activeDays)
-        setStartTimeMinutes(s.startTimeMinutes)
-        setPerDayMode(s.perDayMode)
-        setDayTimes(s.dayTimes)
-        setDescription(s.description ?? '')
+      getRoutineSettings(user.id, target).then(settings => {
+        setActiveDays(settings.activeDays)
+        setStartTimeMinutes(settings.startTimeMinutes)
+        setPerDayMode(settings.perDayMode)
+        setDayTimes(settings.dayTimes)
+        setDescription(settings.description ?? '')
       })
     }
-    if (routineName && !isNew) {
+    if (routineName) {
       getRoutineGroupMap(user.id).then(m => setRoutineGroup(m[routineName] ?? 'everyday'))
     }
+    // Editing mid-routine is allowed, so say what happens to today's progress.
+    getTodayRun(user.id, isAltVariant ? altRoutineName(target) : target)
+      .then(run => setRunInProgress(!!run && !run.finished))
+      .catch(() => {})
   }, [user, routineName, isFirstTime, isNew])
 
   const totalGoalSecs = tasks.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
@@ -430,7 +444,7 @@ export default function SetupRoutine() {
         <View style={[
           s.taskCard,
           isActive && s.taskCardActive,
-          isFirstTime && { borderLeftWidth: 4, borderLeftColor: theme.color + 'cc', marginHorizontal: 20 },
+          isFirstTime && { borderLeftWidth: 4, borderLeftColor: accent.color + 'cc', marginHorizontal: 20 },
         ]}>
           <Pressable
             onLongPress={drag}
@@ -438,13 +452,13 @@ export default function SetupRoutine() {
             delayLongPress={200}
             style={s.taskRow}
           >
-            <View style={[s.num, { backgroundColor: theme.color }]}>
+            <View style={[s.num, { backgroundColor: accent.color }]}>
               <Text style={[s.numText, { color: '#fff' }]}>{i + 1}</Text>
             </View>
             <Pressable
               style={[s.taskEmojiBadge, task.emoji
-                ? { backgroundColor: theme.bg }
-                : { borderWidth: 1.5, borderStyle: 'dashed', borderColor: theme.color + '44' }
+                ? { backgroundColor: accent.bg }
+                : { borderWidth: 1.5, borderStyle: 'dashed', borderColor: accent.color + '44' }
               ]}
               onPress={() => openEmojiPicker(task.id)}
               hitSlop={6}
@@ -455,12 +469,12 @@ export default function SetupRoutine() {
             </Pressable>
             <Text style={s.taskText}>{task.text}</Text>
             {task.timeGoalSecs > 0 && (
-              <View style={[s.goalBadge, { backgroundColor: theme.bg }]}>
-                <Text style={[s.goalBadgeText, { color: theme.color }]}>{fmtGoalSecs(task.timeGoalSecs)}</Text>
+              <View style={[s.goalBadge, { backgroundColor: accent.bg }]}>
+                <Text style={[s.goalBadgeText, { color: accent.color }]}>{fmtGoalSecs(task.timeGoalSecs)}</Text>
               </View>
             )}
             <Pressable onPress={() => toggleExpand(task.id)} hitSlop={8} style={s.expandBtn}>
-              <Text style={[s.expandBtnText, { color: theme.color }]}>{expanded ? '▲' : '⊕'}</Text>
+              <Text style={[s.expandBtnText, { color: accent.color }]}>{expanded ? '▲' : '⊕'}</Text>
             </Pressable>
             <Pressable onPress={() => removeTask(task.id)} hitSlop={8}>
               <Text style={s.remove}>✕</Text>
@@ -473,8 +487,8 @@ export default function SetupRoutine() {
               <View style={s.editNameRow}>
                 <Pressable
                   style={[s.taskEmojiBadge, task.emoji
-                    ? { backgroundColor: theme.bg }
-                    : { borderWidth: 1.5, borderStyle: 'dashed', borderColor: theme.color + '44' }
+                    ? { backgroundColor: accent.bg }
+                    : { borderWidth: 1.5, borderStyle: 'dashed', borderColor: accent.color + '44' }
                   ]}
                   onPress={() => openEmojiPicker(task.id)}
                   hitSlop={6}
@@ -488,7 +502,7 @@ export default function SetupRoutine() {
                   value={task.text}
                   onChangeText={v => setTasks(prev => prev.map(t => t.id === task.id ? { ...t, text: v } : t))}
                   placeholder="Task name"
-                  placeholderTextColor="#ccc"
+                  placeholderTextColor={theme.muted}
                   returnKeyType="done"
                   selectTextOnFocus
                 />
@@ -500,7 +514,7 @@ export default function SetupRoutine() {
                   <TextInput
                     style={s.goalInput}
                     placeholder="0"
-                    placeholderTextColor="#ccc"
+                    placeholderTextColor={theme.muted}
                     keyboardType="number-pad"
                     value={Math.floor((task.timeGoalSecs ?? 0) / 60) > 0 ? String(Math.floor((task.timeGoalSecs ?? 0) / 60)) : ''}
                     onChangeText={v => updateTaskGoalMins(task.id, v)}
@@ -510,7 +524,7 @@ export default function SetupRoutine() {
                   <TextInput
                     style={s.goalInput}
                     placeholder="0"
-                    placeholderTextColor="#ccc"
+                    placeholderTextColor={theme.muted}
                     keyboardType="number-pad"
                     value={(task.timeGoalSecs ?? 0) % 60 > 0 ? String((task.timeGoalSecs ?? 0) % 60) : ''}
                     onChangeText={v => updateTaskGoalSecs(task.id, v)}
@@ -522,7 +536,7 @@ export default function SetupRoutine() {
 
               {task.subTasks.map(st => (
                 <View key={st.id} style={s.subRow}>
-                  <View style={[s.subDot, { backgroundColor: theme.color + '66' }]} />
+                  <View style={[s.subDot, { backgroundColor: accent.color + '66' }]} />
                   <Text style={s.subText}>{st.text}</Text>
                   <Pressable onPress={() => removeSubTask(task.id, st.id)} hitSlop={8}>
                     <Text style={s.remove}>✕</Text>
@@ -533,14 +547,14 @@ export default function SetupRoutine() {
                 <TextInput
                   style={s.subInput}
                   placeholder="Add a step…"
-                  placeholderTextColor="#ccc"
+                  placeholderTextColor={theme.muted}
                   value={subInputs[task.id] || ''}
                   onChangeText={v => setSubInputs(prev => ({ ...prev, [task.id]: v }))}
                   onSubmitEditing={() => addSubTask(task.id)}
                   returnKeyType="done"
                 />
-                <Pressable style={[s.subAddBtn, { backgroundColor: theme.bg }]} onPress={() => addSubTask(task.id)}>
-                  <Text style={[s.subAddBtnText, { color: theme.color }]}>+</Text>
+                <Pressable style={[s.subAddBtn, { backgroundColor: accent.bg }]} onPress={() => addSubTask(task.id)}>
+                  <Text style={[s.subAddBtnText, { color: accent.color }]}>+</Text>
                 </Pressable>
               </View>
             </View>
@@ -568,15 +582,24 @@ export default function SetupRoutine() {
         <>
           <Text style={s.title}>{title}</Text>
           <Text style={s.subtitle}>{subtitle}</Text>
+          {runInProgress && (
+            <View style={[s.liveNote, { backgroundColor: accent.color + '14', borderColor: accent.color + '44' }]}>
+              <Text style={s.liveNoteEmoji}>▶</Text>
+              <Text style={[s.liveNoteText, { color: accent.color }]}>
+                This routine is running now. Your changes apply straight away — tasks you've already
+                ticked off stay done.
+              </Text>
+            </View>
+          )}
           {canRename && (
             <View style={s.renameWrap}>
-              <Text style={[s.renameLabel, { color: theme.color }]}>ROUTINE NAME</Text>
+              <Text style={[s.renameLabel, { color: accent.color }]}>ROUTINE NAME</Text>
               <TextInput
-                style={[s.nameInput, { borderColor: theme.color + '66' }]}
+                style={[s.nameInput, { borderColor: accent.color + '66' }]}
                 value={editName}
                 onChangeText={setEditName}
                 placeholder="Routine name"
-                placeholderTextColor="#bbb"
+                placeholderTextColor={theme.muted}
                 returnKeyType="done"
               />
             </View>
@@ -586,9 +609,9 @@ export default function SetupRoutine() {
 
       {isNew && (
         <TextInput
-          style={[s.nameInput, { borderColor: theme.color + '66' }]}
+          style={[s.nameInput, { borderColor: accent.color + '66' }]}
           placeholder="Routine name (e.g. Evening Walk)"
-          placeholderTextColor="#bbb"
+          placeholderTextColor={theme.muted}
           value={customName}
           onChangeText={setCustomName}
           returnKeyType="done"
@@ -598,7 +621,7 @@ export default function SetupRoutine() {
       {/* New routines pick their dashboard section */}
       {isNew && (
         <View style={s.groupPickWrap}>
-          <Text style={[s.renameLabel, { color: theme.color }]}>SHOW UNDER</Text>
+          <Text style={[s.renameLabel, { color: accent.color }]}>SHOW UNDER</Text>
           <View style={s.groupPickRow}>
             {[
               { key: 'everyday', emoji: '⭐', label: 'Every day', hint: 'Aim to do it daily', color: EVERYDAY_COLOR },
@@ -609,13 +632,13 @@ export default function SetupRoutine() {
                 <Pressable
                   key={opt.key}
                   style={[s.groupPickCard, {
-                    borderColor: active ? opt.color : '#e5e5f0',
-                    backgroundColor: active ? opt.color + '14' : '#fff',
+                    borderColor: active ? opt.color : theme.cardBorder,
+                    backgroundColor: active ? opt.color + '14' : theme.card,
                   }]}
                   onPress={() => setNewGroup(opt.key)}
                 >
                   <Text style={{ fontSize: 18 }}>{opt.emoji}</Text>
-                  <Text style={[s.groupPickLabel, { color: active ? opt.color : '#333' }]}>{opt.label}</Text>
+                  <Text style={[s.groupPickLabel, { color: active ? opt.color : theme.text }]}>{opt.label}</Text>
                   <Text style={s.groupPickHint}>{opt.hint}</Text>
                 </Pressable>
               )
@@ -626,11 +649,11 @@ export default function SetupRoutine() {
 
       {!isFirstTime && !isAltVariant && (
         <View style={s.descWrap}>
-          <Text style={[s.renameLabel, { color: theme.color }]}>DESCRIPTION</Text>
+          <Text style={[s.renameLabel, { color: accent.color }]}>DESCRIPTION</Text>
           <TextInput
-            style={[s.descInput, { borderColor: theme.color + '44' }]}
+            style={[s.descInput, { borderColor: accent.color + '44' }]}
             placeholder="What's this routine for? (optional)"
-            placeholderTextColor="#bbb"
+            placeholderTextColor={theme.muted}
             value={description}
             onChangeText={setDescription}
             multiline
@@ -641,17 +664,17 @@ export default function SetupRoutine() {
 
       {/* Whenever routines have no schedule — they're done, well, whenever */}
       {!isFirstTime && !isAltVariant && !isWhenever && (
-        <View style={[s.scheduleCard, { borderColor: theme.color + '33' }]}>
+        <View style={[s.scheduleCard, { borderColor: accent.color + '33' }]}>
           <View style={s.scheduleHeaderRow}>
-            <Text style={[s.scheduleLabel, { color: theme.color }]}>SCHEDULE</Text>
+            <Text style={[s.scheduleLabel, { color: accent.color }]}>SCHEDULE</Text>
             <Pressable
               onPress={() => {
                 if (!perDayMode) setDayTimes(Array(7).fill(startTimeMinutes))
                 setPerDayMode(p => !p)
               }}
-              style={[s.perDayBtn, perDayMode && { backgroundColor: theme.color }]}
+              style={[s.perDayBtn, perDayMode && { backgroundColor: accent.color }]}
             >
-              <Text style={[s.perDayBtnText, { color: perDayMode ? '#fff' : '#555' }]}>Per day</Text>
+              <Text style={[s.perDayBtnText, { color: perDayMode ? '#fff' : theme.subtext }]}>Per day</Text>
             </Pressable>
           </View>
 
@@ -659,10 +682,10 @@ export default function SetupRoutine() {
             {DAY_INITIALS.map((d, i) => (
               <Pressable
                 key={i}
-                style={[s.dayCircle, activeDays[i] ? { backgroundColor: theme.color } : s.dayCircleOff]}
+                style={[s.dayCircle, activeDays[i] ? { backgroundColor: accent.color } : s.dayCircleOff]}
                 onPress={() => toggleDay(i)}
               >
-                <Text style={[s.dayInitial, { color: activeDays[i] ? '#fff' : '#bbb' }]}>{d}</Text>
+                <Text style={[s.dayInitial, { color: activeDays[i] ? '#fff' : theme.muted }]}>{d}</Text>
                 {activeDays[i] && <Text style={s.dayCheck}>✓</Text>}
               </Pressable>
             ))}
@@ -676,7 +699,7 @@ export default function SetupRoutine() {
                   <Pressable style={s.timeBtn} onPress={() => setDayTimes(prev => prev.map((t, j) => j === i ? ((t - 15 + 1440) % 1440) : t))}>
                     <Text style={s.timeBtnText}>−</Text>
                   </Pressable>
-                  <Text style={[s.timeValue, { color: theme.color }]}>{fmtTime(dayTimes[i])}</Text>
+                  <Text style={[s.timeValue, { color: accent.color }]}>{fmtTime(dayTimes[i])}</Text>
                   <Pressable style={s.timeBtn} onPress={() => setDayTimes(prev => prev.map((t, j) => j === i ? ((t + 15) % 1440) : t))}>
                     <Text style={s.timeBtnText}>+</Text>
                   </Pressable>
@@ -691,7 +714,7 @@ export default function SetupRoutine() {
                   <Pressable style={s.timeBtn} onPress={() => adjustTime(-15)}>
                     <Text style={s.timeBtnText}>−</Text>
                   </Pressable>
-                  <Text style={[s.timeValue, { color: theme.color }]}>{fmtTime(startTimeMinutes)}</Text>
+                  <Text style={[s.timeValue, { color: accent.color }]}>{fmtTime(startTimeMinutes)}</Text>
                   <Pressable style={s.timeBtn} onPress={() => adjustTime(15)}>
                     <Text style={s.timeBtnText}>+</Text>
                   </Pressable>
@@ -715,7 +738,7 @@ export default function SetupRoutine() {
       <View style={[s.addSection, isFirstTime && { marginHorizontal: 20 }]}>
         <View style={s.addNameRow}>
           <Pressable
-            style={[s.addEmojiBtn, { borderColor: theme.color + '55', backgroundColor: taskEmoji ? theme.bg : '#fff' }]}
+            style={[s.addEmojiBtn, { borderColor: accent.color + '55', backgroundColor: taskEmoji ? accent.bg : theme.input }]}
             onPress={() => openEmojiPicker(null)}
           >
             <Text style={s.addEmojiBtnText}>{taskEmoji || '📋'}</Text>
@@ -723,7 +746,7 @@ export default function SetupRoutine() {
           <TextInput
             style={s.input}
             placeholder="Add a task…"
-            placeholderTextColor="#bbb"
+            placeholderTextColor={theme.muted}
             value={text}
             onChangeText={setText}
             onSubmitEditing={addTask}
@@ -734,7 +757,7 @@ export default function SetupRoutine() {
           <TextInput
             style={s.minsInput}
             placeholder="min"
-            placeholderTextColor="#ccc"
+            placeholderTextColor={theme.muted}
             keyboardType="number-pad"
             value={goalMins}
             onChangeText={setGoalMins}
@@ -743,13 +766,13 @@ export default function SetupRoutine() {
           <TextInput
             style={s.secsInput}
             placeholder="sec"
-            placeholderTextColor="#ccc"
+            placeholderTextColor={theme.muted}
             keyboardType="number-pad"
             value={goalSecs}
             onChangeText={setGoalSecs}
             maxLength={2}
           />
-          <Pressable style={[s.addBtn, { backgroundColor: theme.color }]} onPress={addTask}>
+          <Pressable style={[s.addBtn, { backgroundColor: accent.color }]} onPress={addTask}>
             <Text style={s.addBtnText}>+</Text>
           </Pressable>
         </View>
@@ -758,7 +781,7 @@ export default function SetupRoutine() {
       <Pressable
         style={[
           s.btn,
-          { backgroundColor: theme.color },
+          { backgroundColor: accent.color },
           isFirstTime && s.btnFirst,
           saving && { opacity: 0.6 },
         ]}
@@ -801,14 +824,14 @@ export default function SetupRoutine() {
         <KeyboardAvoidingView style={s.emojiOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }} />
           <View style={s.emojiSheet}>
-            <View style={[s.emojiHandle, { backgroundColor: '#ddd' }]} />
+            <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
             <View style={s.emojiHeaderRow}>
               <Text style={s.emojiHeaderTitle}>Choose an icon</Text>
               {(emojiTargetId !== null
                 ? tasks.find(t => t.id === emojiTargetId)?.emoji
                 : taskEmoji) && (
                 <Pressable onPress={clearEmoji} hitSlop={8}>
-                  <Text style={[s.emojiClearBtn, { color: theme.color }]}>Clear</Text>
+                  <Text style={[s.emojiClearBtn, { color: accent.color }]}>Clear</Text>
                 </Pressable>
               )}
             </View>
@@ -816,7 +839,7 @@ export default function SetupRoutine() {
             <TextInput
               style={s.emojiSearch}
               placeholder="Search  (e.g. run, coffee, book…)"
-              placeholderTextColor="#aaa"
+              placeholderTextColor={theme.muted}
               value={emojiQuery}
               onChangeText={setEmojiQuery}
               autoCapitalize="none"
@@ -869,14 +892,21 @@ export default function SetupRoutine() {
   )
 }
 
-const s = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#f6f7fb' },
+function makeStyles(theme) { return StyleSheet.create({
+  page: { flex: 1, backgroundColor: theme.bg },
   content: { padding: 24, paddingTop: 56, paddingBottom: 40 },
   contentFirst: { paddingBottom: 48 },
   back: { marginBottom: 20 },
-  backText: { color: '#4f46e5', fontSize: 15, fontWeight: '600' },
-  title: { fontSize: 26, fontWeight: '800', color: '#111', marginBottom: 8 },
-  subtitle: { fontSize: 14, color: '#666', marginBottom: 24, lineHeight: 20 },
+  backText: { color: theme.accent, fontSize: 15, fontWeight: '600' },
+  title: { fontSize: 26, fontWeight: '800', color: theme.text, marginBottom: 8 },
+  subtitle: { fontSize: 14, color: theme.subtext, marginBottom: 24, lineHeight: 20 },
+
+  liveNote: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: 10,
+    borderRadius: 14, borderWidth: 1, padding: 12, marginTop: -12, marginBottom: 22,
+  },
+  liveNoteEmoji: { fontSize: 12, marginTop: 2, color: theme.subtext },
+  liveNoteText: { flex: 1, fontSize: 12.5, fontWeight: '600', lineHeight: 18 },
 
   hero: {
     backgroundColor: '#4f46e5',
@@ -904,8 +934,8 @@ const s = StyleSheet.create({
   },
 
   nameInput: {
-    backgroundColor: '#fff', borderRadius: 14, padding: 14,
-    fontSize: 17, fontWeight: '600', borderWidth: 2, color: '#111', marginBottom: 20,
+    backgroundColor: theme.input, borderRadius: 14, padding: 14,
+    fontSize: 17, fontWeight: '600', borderWidth: 2, color: theme.text, marginBottom: 20,
   },
   renameWrap: { marginTop: 4 },
   renameLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 8 },
@@ -917,56 +947,56 @@ const s = StyleSheet.create({
     paddingVertical: 12, paddingHorizontal: 10, alignItems: 'center', gap: 3,
   },
   groupPickLabel: { fontSize: 14, fontWeight: '800', letterSpacing: -0.2 },
-  groupPickHint: { fontSize: 11, fontWeight: '500', color: '#999', textAlign: 'center' },
+  groupPickHint: { fontSize: 11, fontWeight: '500', color: theme.muted, textAlign: 'center' },
 
   descWrap: { marginTop: 4 },
   descInput: {
-    backgroundColor: '#fff', borderRadius: 14, padding: 14, paddingTop: 12,
-    fontSize: 14, fontWeight: '500', borderWidth: 2, color: '#111', marginBottom: 20,
+    backgroundColor: theme.input, borderRadius: 14, padding: 14, paddingTop: 12,
+    fontSize: 14, fontWeight: '500', borderWidth: 2, color: theme.text, marginBottom: 20,
     minHeight: 64, textAlignVertical: 'top',
   },
 
   scheduleCard: {
-    backgroundColor: '#fff', borderRadius: 18, padding: 16,
+    backgroundColor: theme.card, borderRadius: 18, padding: 16,
     borderWidth: 1.5, marginBottom: 20,
     shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.04, shadowRadius: 6, elevation: 1,
   },
   scheduleHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
   scheduleLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5 },
-  perDayBtn: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#ebebf5' },
+  perDayBtn: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: theme.divider },
   perDayBtnText: { fontSize: 12, fontWeight: '700', letterSpacing: 0.3 },
   perDayRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6 },
-  perDayName: { fontSize: 13, fontWeight: '600', color: '#888', width: 36 },
+  perDayName: { fontSize: 13, fontWeight: '600', color: theme.subtext, width: 36 },
   daysRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
   dayCircle: {
     width: 38, height: 38, borderRadius: 19,
     alignItems: 'center', justifyContent: 'center',
   },
-  dayCircleOff: { backgroundColor: '#f0f0f3' },
+  dayCircleOff: { backgroundColor: theme.divider },
   dayInitial: { fontSize: 12, fontWeight: '800' },
   dayCheck: { fontSize: 7, color: '#fff', fontWeight: '800', marginTop: 1 },
 
   timeRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
-  timeRowLabel: { fontSize: 13, fontWeight: '600', color: '#888' },
+  timeRowLabel: { fontSize: 13, fontWeight: '600', color: theme.subtext },
   timeStepper: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   timeBtn: {
-    width: 34, height: 34, borderRadius: 10, backgroundColor: '#f0f0f3',
+    width: 34, height: 34, borderRadius: 10, backgroundColor: theme.divider,
     alignItems: 'center', justifyContent: 'center',
   },
-  timeBtnText: { fontSize: 20, color: '#555', fontWeight: '300', lineHeight: 24 },
+  timeBtnText: { fontSize: 20, color: theme.subtext, fontWeight: '300', lineHeight: 24 },
   timeValue: { fontSize: 17, fontWeight: '700', minWidth: 90, textAlign: 'center' },
-  endTimeText: { fontSize: 12, color: '#aaa', textAlign: 'center', fontWeight: '500' },
+  endTimeText: { fontSize: 12, color: theme.muted, textAlign: 'center', fontWeight: '500' },
 
   taskCard: {
-    backgroundColor: '#fff', borderRadius: 14,
-    marginBottom: 10, borderWidth: 1, borderColor: '#f0f0f3', overflow: 'hidden',
+    backgroundColor: theme.card, borderRadius: 14,
+    marginBottom: 10, borderWidth: 1, borderColor: theme.cardBorder, overflow: 'hidden',
     shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.04, shadowRadius: 4, elevation: 1,
   },
   taskCardActive: {
     shadowOpacity: 0.15, shadowRadius: 12, elevation: 8,
-    borderColor: '#e0e0f5',
+    borderColor: theme.accent + '55',
   },
   taskRow: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 14 },
   num: {
@@ -974,38 +1004,38 @@ const s = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   numText: { fontSize: 13, fontWeight: '800' },
-  taskText: { flex: 1, fontSize: 15, color: '#222', fontWeight: '500' },
+  taskText: { flex: 1, fontSize: 15, color: theme.text, fontWeight: '500' },
   goalBadge: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   goalBadgeText: { fontSize: 11, fontWeight: '800' },
   expandBtn: { paddingHorizontal: 4 },
   expandBtnText: { fontSize: 16 },
-  remove: { color: '#ccc', fontSize: 16, paddingHorizontal: 4 },
+  remove: { color: theme.muted, fontSize: 16, paddingHorizontal: 4 },
 
-  subSection: { borderTopWidth: 1, borderTopColor: '#f6f7fb', paddingHorizontal: 14, paddingBottom: 12 },
-  editNameRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#f6f7fb' },
-  editNameInput: { flex: 1, fontSize: 15, fontWeight: '600', color: '#111', paddingVertical: 6, paddingHorizontal: 2, borderBottomWidth: 1.5, borderBottomColor: '#e0e0f5' },
+  subSection: { borderTopWidth: 1, borderTopColor: theme.divider, paddingHorizontal: 14, paddingBottom: 12 },
+  editNameRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: theme.divider },
+  editNameInput: { flex: 1, fontSize: 15, fontWeight: '600', color: theme.text, paddingVertical: 6, paddingHorizontal: 2, borderBottomWidth: 1.5, borderBottomColor: theme.inputBorder },
 
   goalRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#f6f7fb',
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: theme.divider,
   },
-  goalLabel: { fontSize: 13, fontWeight: '600', color: '#888' },
+  goalLabel: { fontSize: 13, fontWeight: '600', color: theme.subtext },
   goalInputWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   goalInput: {
-    width: 56, backgroundColor: '#f6f7fb', borderRadius: 9,
+    width: 56, backgroundColor: theme.input, borderRadius: 9,
     paddingHorizontal: 10, paddingVertical: 7, fontSize: 15,
-    fontWeight: '700', color: '#111', textAlign: 'center',
-    borderWidth: 1, borderColor: '#e5e7eb',
+    fontWeight: '700', color: theme.text, textAlign: 'center',
+    borderWidth: 1, borderColor: theme.inputBorder,
   },
-  goalUnit: { fontSize: 13, fontWeight: '600', color: '#aaa' },
+  goalUnit: { fontSize: 13, fontWeight: '600', color: theme.muted },
 
   subRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 7, paddingLeft: 8 },
   subDot: { width: 7, height: 7, borderRadius: 4 },
-  subText: { flex: 1, fontSize: 14, color: '#555' },
+  subText: { flex: 1, fontSize: 14, color: theme.subtext },
   subAddRow: { flexDirection: 'row', gap: 8, marginTop: 8, paddingLeft: 8 },
   subInput: {
-    flex: 1, backgroundColor: '#f6f7fb', borderRadius: 10,
-    paddingHorizontal: 10, paddingVertical: 8, fontSize: 14, color: '#111',
+    flex: 1, backgroundColor: theme.input, borderRadius: 10,
+    paddingHorizontal: 10, paddingVertical: 8, fontSize: 14, color: theme.text,
   },
   subAddBtn: {
     borderRadius: 10, width: 36, alignItems: 'center', justifyContent: 'center',
@@ -1029,21 +1059,21 @@ const s = StyleSheet.create({
 
   addRow: { flexDirection: 'row', gap: 8, marginBottom: 24, alignItems: 'center' },
   input: {
-    flex: 1, backgroundColor: '#fff', borderRadius: 14,
+    flex: 1, backgroundColor: theme.input, borderRadius: 14,
     paddingHorizontal: 14, paddingVertical: 12,
-    fontSize: 15, borderWidth: 1, borderColor: '#e6e6ef', color: '#111',
+    fontSize: 15, borderWidth: 1, borderColor: theme.inputBorder, color: theme.text,
   },
   minsInput: {
-    width: 52, backgroundColor: '#fff', borderRadius: 12,
+    width: 52, backgroundColor: theme.input, borderRadius: 12,
     paddingHorizontal: 8, paddingVertical: 12,
-    fontSize: 13, fontWeight: '600', borderWidth: 1, borderColor: '#e6e6ef',
-    color: '#111', textAlign: 'center',
+    fontSize: 13, fontWeight: '600', borderWidth: 1, borderColor: theme.inputBorder,
+    color: theme.text, textAlign: 'center',
   },
   secsInput: {
-    width: 46, backgroundColor: '#fff', borderRadius: 12,
+    width: 46, backgroundColor: theme.input, borderRadius: 12,
     paddingHorizontal: 8, paddingVertical: 12,
-    fontSize: 13, fontWeight: '600', borderWidth: 1, borderColor: '#e6e6ef',
-    color: '#111', textAlign: 'center',
+    fontSize: 13, fontWeight: '600', borderWidth: 1, borderColor: theme.inputBorder,
+    color: theme.text, textAlign: 'center',
   },
   addBtn: {
     borderRadius: 14, width: 48, alignItems: 'center', justifyContent: 'center', height: 48,
@@ -1052,33 +1082,33 @@ const s = StyleSheet.create({
 
   emojiOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
   emojiSheet: {
-    backgroundColor: '#fff', borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    backgroundColor: theme.card, borderTopLeftRadius: 28, borderTopRightRadius: 28,
     paddingTop: 10, paddingHorizontal: 20, paddingBottom: 44,
     shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
     shadowOpacity: 0.12, shadowRadius: 16, elevation: 16,
   },
   emojiHandle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 18 },
   emojiHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  emojiHeaderTitle: { fontSize: 17, fontWeight: '700', color: '#111' },
+  emojiHeaderTitle: { fontSize: 17, fontWeight: '700', color: theme.text },
   emojiClearBtn: { fontSize: 14, fontWeight: '600' },
   emojiSearch: {
-    backgroundColor: '#f6f7fb', borderRadius: 12,
+    backgroundColor: theme.input, borderRadius: 12,
     paddingHorizontal: 14, paddingVertical: 10,
-    fontSize: 15, color: '#111', marginBottom: 12,
+    fontSize: 15, color: theme.text, marginBottom: 12,
   },
   emojiScroll: { maxHeight: 420 },
   emojiCatLabel: {
-    fontSize: 10, fontWeight: '800', letterSpacing: 1.2, color: '#9ca3af',
+    fontSize: 10, fontWeight: '800', letterSpacing: 1.2, color: theme.muted,
     marginTop: 14, marginBottom: 8,
   },
   emojiNoResults: {
-    fontSize: 14, color: '#9ca3af', textAlign: 'center', paddingVertical: 28,
+    fontSize: 14, color: theme.muted, textAlign: 'center', paddingVertical: 28,
   },
   emojiGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, justifyContent: 'flex-start' },
   emojiItem: {
     width: 52, height: 52, borderRadius: 14,
     alignItems: 'center', justifyContent: 'center',
-    backgroundColor: '#f6f7fb',
+    backgroundColor: theme.input,
   },
   emojiItemText: { fontSize: 28 },
   btn: { borderRadius: 16, padding: 18, alignItems: 'center' },
@@ -1095,5 +1125,5 @@ const s = StyleSheet.create({
   btnText: { color: '#fff', fontWeight: '800', fontSize: 17 },
   btnTextFirst: { fontSize: 18, letterSpacing: 0.3 },
   skipBtn: { alignItems: 'center', paddingVertical: 16, marginHorizontal: 20 },
-  skipText: { color: '#999', fontSize: 15, fontWeight: '600' },
-})
+  skipText: { color: theme.subtext, fontSize: 15, fontWeight: '600' },
+}) }
