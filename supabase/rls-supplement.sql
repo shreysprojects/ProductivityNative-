@@ -125,9 +125,11 @@ CREATE POLICY "day_todos_own" ON public.day_todos
 -- ── weekly_routines ────────────────────────────────────────────────────────
 -- Weekly routines (with their lists): full array as JSONB per user.
 CREATE TABLE IF NOT EXISTS public.weekly_routines (
-  user_id  UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  routines JSONB NOT NULL DEFAULT '[]'
+  user_id    UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  routines   JSONB NOT NULL DEFAULT '[]',
+  updated_at TIMESTAMPTZ
 );
+ALTER TABLE public.weekly_routines ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 
 ALTER TABLE public.weekly_routines ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "weekly_routines_own" ON public.weekly_routines;
@@ -137,9 +139,11 @@ CREATE POLICY "weekly_routines_own" ON public.weekly_routines
 -- ── day_rules ──────────────────────────────────────────────────────────────
 -- Dashboard "Rules for today": [{id, text}] per user, persists until edited.
 CREATE TABLE IF NOT EXISTS public.day_rules (
-  user_id UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  rules   JSONB NOT NULL DEFAULT '[]'
+  user_id    UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  rules      JSONB NOT NULL DEFAULT '[]',
+  updated_at TIMESTAMPTZ
 );
+ALTER TABLE public.day_rules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 
 ALTER TABLE public.day_rules ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "day_rules_own" ON public.day_rules;
