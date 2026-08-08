@@ -69,9 +69,21 @@ Deno.serve(async (req) => {
         ? json({ error: 'image_too_large', reason: 'That image is too large. Please try a smaller photo.' }, 413)
         : null
 
+    // A counter that cannot be reached is NOT the same as a limit that has
+    // been hit. Reporting the two the same way once had every AI feature
+    // claiming a limit the user had never used.
+    const limitUnavailable = () => json(
+      {
+        error: 'limit_unavailable',
+        reason: 'We could not check your usage limit right now. Please try again in a moment.',
+      },
+      503,
+    )
+
     if (GENERATIVE.has(action)) {
       const rl = await consumeLimit('generative', MAX_PER_DAY)
-      if (!rl || !rl.allowed) {
+      if (!rl) return limitUnavailable()
+      if (!rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Daily limit of ${MAX_PER_DAY} AI uses reached. Try again tomorrow.` },
           429,
@@ -81,7 +93,8 @@ Deno.serve(async (req) => {
       // Weekly cap (Mon–Sun, UTC), separate from the daily generative limit.
       // Workout and timetable imports share the same counter.
       const rl = await consumeLimit('workout', MAX_EXTRACT_PER_WEEK)
-      if (!rl || !rl.allowed) {
+      if (!rl) return limitUnavailable()
+      if (!rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Weekly limit of ${MAX_EXTRACT_PER_WEEK} screenshot imports reached. It resets on Monday.` },
           429,
