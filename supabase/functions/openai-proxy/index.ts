@@ -27,6 +27,22 @@ const PAID_MOD = new Set(['moderate_routine', 'moderate_profile_picture', 'moder
 
 const PICTURE_MOD_PROMPT = 'You are a content moderator for a family-friendly productivity app.\nReview this profile picture.\n\nBLOCK (allowed: false) if the image contains:\n- Nudity or sexual content\n- Hate symbols (swastikas, Nazi imagery, KKK, extremist symbols)\n- Violence or gore\n- Slurs or harassment text\n\nALLOW everything else: selfies, logos, art, memes, animals, landscapes, etc.\n\nReply with ONLY valid JSON:\n{"allowed": true}\n{"allowed": false, "reason": "one sentence, addressed to the user"}'
 
+// App style rule: AI-written text the user sees must not contain em dashes.
+// The prompts ask for this too, but models slip, so outputs are scrubbed as
+// well. Extraction actions (workout/schedule) are exempt: they transcribe
+// what's in the screenshot verbatim.
+const noEmDash = (s: string) => s.replace(/\s*—\s*/g, ', ').replace(/–/g, '-')
+const noEmDashDeep = (v: unknown): unknown => {
+  if (typeof v === 'string') return noEmDash(v)
+  if (Array.isArray(v)) return v.map(noEmDashDeep)
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, noEmDashDeep(x)])
+    )
+  }
+  return v
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
 
@@ -80,6 +96,11 @@ Deno.serve(async (req) => {
       503,
     )
 
+    // Carries the protocol_helper chat token from the billing check below to
+    // the handler's response. Null means this call was billed as a new chat
+    // and the handler must mint a fresh token for it.
+    let helperChatToken: string | null = null
+
     if (GENERATIVE.has(action)) {
       const rl = await consumeLimit('generative', MAX_PER_DAY)
       if (!rl) return limitUnavailable()
@@ -88,6 +109,32 @@ Deno.serve(async (req) => {
           { error: 'daily_limit', reason: `Daily limit of ${MAX_PER_DAY} AI uses reached. Try again tomorrow.` },
           429,
         )
+      }
+    } else if (action === 'protocol_helper') {
+      // One helper chat = one generative credit, charged on the opening
+      // message; the follow-ups in the same chat ride free. The chat's
+      // identity used to be read off the client-supplied history (charge only
+      // when it held a single user turn), which let a caller pre-pad the
+      // history and ride the most expensive path here for free, forever.
+      // Identity is now proven server-side: the billed call returns a signed
+      // token, and only a request echoing a valid fresh one rides free.
+      // Everything else — opening turn, missing token, bad signature, token
+      // older than two hours — is billed as a new chat, so the default is to
+      // charge and free rides must be proven. Old clients that never echo the
+      // token simply pay per call, which is safe. The turn caps in the
+      // handler still bound how many paid calls one credit can make.
+      const turns = (Array.isArray(body.messages) ? body.messages : [])
+        .filter((m: { role?: string }) => m?.role === 'user').length
+      if (turns > 1) helperChatToken = await verifyChatToken(user.id, body.chatToken)
+      if (!helperChatToken) {
+        const rl = await consumeLimit('generative', MAX_PER_DAY)
+        if (!rl) return limitUnavailable()
+        if (!rl.allowed) {
+          return json(
+            { error: 'daily_limit', reason: `Daily limit of ${MAX_PER_DAY} AI uses reached. Try again tomorrow.` },
+            429,
+          )
+        }
       }
     } else if (action === 'extract_workout' || action === 'extract_schedule') {
       // Weekly cap (Mon–Sun, UTC), separate from the daily generative limit.
@@ -147,7 +194,8 @@ Deno.serve(async (req) => {
 
         if (!flagged) {
           const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-            model: 'gpt-4o-mini',
+            model: 'gpt-5.6-luna',
+            reasoning_effort: 'low',
             messages: [{
               role: 'user',
               content: [
@@ -155,13 +203,15 @@ Deno.serve(async (req) => {
                 { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } },
               ],
             }],
-            max_tokens: 80,
+            // Reasoning tokens count against this budget — keep headroom
+            // well above the tiny JSON reply or it comes back empty.
+            max_completion_tokens: 4000,
             response_format: { type: 'json_object' },
           })
           const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}')
           if (parsed.allowed === false) {
             flagged = true
-            if (typeof parsed.reason === 'string' && parsed.reason.trim()) reason = parsed.reason.trim()
+            if (typeof parsed.reason === 'string' && parsed.reason.trim()) reason = noEmDash(parsed.reason.trim())
           }
         }
       } catch (e) {
@@ -214,12 +264,13 @@ Deno.serve(async (req) => {
         `You are a personal productivity coach. Create an optimized ${routineName} routine.\n\n` +
         `User preferences:\n${qs}\n\n` +
         `Return a JSON object: {"tasks": [{"text": "concise task name", "emoji": "1 relevant emoji", "timeGoalSecs": integer_or_0}]}\n` +
-        `Include 5–8 specific, actionable tasks realistic for the available time.${fitnessClause} Set timeGoalSecs to 0 for open-ended tasks.`
+        `Include 5–8 specific, actionable tasks realistic for the available time.${fitnessClause} Set timeGoalSecs to 0 for open-ended tasks. Never use em dashes in any text.`
 
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4o-mini',
+        model: 'gpt-5.6-luna',
+        reasoning_effort: 'low',
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 600,
+        max_completion_tokens: 8000,
         response_format: { type: 'json_object' },
       })
 
@@ -230,7 +281,7 @@ Deno.serve(async (req) => {
       const tasks = raw
         .map((t, i) => ({
           id: Date.now() + i,
-          text: String(t.text ?? '').trim(),
+          text: noEmDash(String(t.text ?? '').trim()),
           emoji: String(t.emoji ?? ''),
           timeGoalSecs: Math.max(0, Math.round(Number(t.timeGoalSecs) || 0)),
           subTasks: [],
@@ -251,16 +302,114 @@ Deno.serve(async (req) => {
       const prompt =
         `You are a personal productivity coach. Analyze this ${routineName} routine and give concise advice:\n\n` +
         `${taskList}\n\n` +
-        `In 2–3 short paragraphs: what is good, what to add, remove, or change, and any timing tips. Be specific and direct.${fitnessClause} Under 200 words.`
+        `In 2–3 short paragraphs: what is good, what to add, remove, or change, and any timing tips. Be specific and direct.${fitnessClause} Under 200 words. Never use em dashes.`
 
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4o-mini',
+        model: 'gpt-5.6-luna',
+        reasoning_effort: 'low',
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 400,
+        max_completion_tokens: 8000,
       })
 
-      const advice = chat.choices?.[0]?.message?.content?.trim() ?? ''
+      const advice = noEmDash(chat.choices?.[0]?.message?.content?.trim() ?? '')
       return json({ advice })
+    }
+
+    if (action === 'protocol_helper') {
+      // Coaching chat that produces protocols along the way. The client sends
+      // the whole history each call (assistant turns include a bracketed
+      // summary of any protocol they proposed, so the model remembers its own
+      // work). Turn 1 always asks questions; after that the model decides each
+      // turn whether to ask more or deliver a (new or updated) protocol; the
+      // final allowed turn must deliver.
+      const MAX_HELPER_TURNS = 8
+      const msgs = (Array.isArray(body.messages) ? body.messages : [])
+        .filter((m: { role?: string; content?: unknown }) =>
+          (m?.role === 'user' || m?.role === 'assistant') &&
+          typeof m?.content === 'string' && (m.content as string).trim().length > 0)
+        .slice(-16)
+        .map((m: { role: string; content: string }) => ({
+          role: m.role, content: m.content.slice(0, 2000),
+        }))
+      const userTurns = msgs.filter(m => m.role === 'user').length
+      if (userTurns === 0) return json({ error: 'no_message' }, 400)
+      if (userTurns > MAX_HELPER_TURNS) {
+        return json({ error: 'chat_over', reason: 'This chat is finished. Apply the protocol or start over.' }, 400)
+      }
+
+      const userText = msgs.filter(m => m.role === 'user').map(m => m.content).join('\n').slice(0, 4000)
+      const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: userText })
+      if (mod.results?.[0]?.flagged) {
+        return json({ error: 'flagged', reason: 'Input contains inappropriate content.' }, 422)
+      }
+
+      const EMOJI_CHOICES = ['🛟', '🚨', '🧘', '💪', '🧠', '❤️']
+      const existingName = String(body.protocolName ?? '').slice(0, 60)
+      const system =
+        'You are the user\'s buddy inside a productivity app, the friend they text when things get hard. A "protocol" is a short emergency checklist they run in a hard moment: an urge to relapse, a spiral, feeling stuck. They will tell you what they struggle with, what they want to quit, and what they want to do when they feel a certain way.' +
+        (existingName ? ` They are rebuilding their existing protocol "${existingName}".` : '') +
+        '\nAlways reply with ONLY valid JSON: {"reply": "your message to the user", "protocol": null | {"name": "short name", "emoji": "one of ' + EMOJI_CHOICES.join(' ') + '", "steps": [{"text": "concrete action", "timeGoalMins": integer_or_null}], "note": {"title": "short title", "text": "2-4 sentence letter they read after finishing the protocol"}}}' +
+        '\nHow to talk: like a close friend, not a therapist reading a script. Casual, warm, direct. Use contractions and plain words, react to what they actually said, and echo their own words back. No lectures, no clinical language, no pep-talk cliches, no bullet lists in the reply. Under 110 words per reply. Never use em dashes anywhere. Never give medical diagnoses. If they mention self-harm or suicide, gently tell them to reach a crisis line or a professional right away, and stay kind.' +
+        '\nHow to think (this matters most): reason carefully about everything they told you before writing anything.' +
+        ' Anything they said has helped them before MUST appear in the protocol, early and explicitly. Their own working strategies beat any generic technique.' +
+        ' Anything they said triggers the urge or makes it worse must NEVER be a step. Do not route them back into the situation that caused the moment; the protocol\'s job is to break the loop first. At most the final step may gently hand them back to normal life once the urge has passed, and only if that fits what they told you.' +
+        ' Every step must earn its place for THIS person and THIS urge. If a step would fit anyone, it is probably filler: cut it or make it specific to them. Prefer physical, concrete actions over vague mental ones ("Splash cold water on your face" beats "Practice mindfulness").' +
+        '\nProtocol shape: 4-8 steps in the order they should actually do them (interrupt the moment first, then calm the body, then redirect somewhere safe), each doable within minutes, written as commands. timeGoalMins is a small optional goal (1-15) or null. The note is a short letter from their calmer self that they read after finishing: make it personal to what they told you, not a generic pep talk.'
+      const phase = userTurns === 1
+        ? 'This is their FIRST message. Reply like a friend who just read it: react to what they said, then ask 1-2 natural questions that will make the protocol better (what the urge feels like, what has actually helped before, where they usually are when it hits, what makes it worse). Set "protocol" to null, do NOT create it yet.'
+        : userTurns >= MAX_HELPER_TURNS
+          ? 'This is the last exchange of this chat. Reply like a friend, and you MUST include the complete protocol now, built from everything they told you: what they said helps goes in, what they said triggers stays out. "protocol" cannot be null.'
+          : 'From here, use your judgment each turn. If something is still missing that would genuinely change the protocol, ask about it and set "protocol" to null for now. Otherwise reply like a friend with one short, real piece of advice and include the protocol: built from their answers, what they said helps goes in, what they said triggers stays out. If you already proposed a protocol and they kept talking, treat their message as feedback or new information and deliver an UPDATED protocol that folds it in. Do not stall: never go two replies in a row without a protocol unless they asked you a question that needs answering first.'
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: 'gpt-5.6-luna',
+        // Medium effort: low produced tone-deaf protocols (ignored the user's
+        // stated coping strategies, prescribed their trigger back as a step).
+        // The reasoning here is the product, so pay for it.
+        reasoning_effort: 'medium',
+        messages: [{ role: 'system', content: system + '\n\n' + phase }, ...msgs],
+        max_completion_tokens: 12000,
+        response_format: { type: 'json_object' },
+      })
+
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const parsed = JSON.parse(choice?.message?.content ?? '{}')
+      const reply = noEmDash(String(parsed.reply ?? '').trim().slice(0, 1500))
+
+      let protocol = null
+      const p = parsed.protocol
+      if (p && typeof p === 'object') {
+        const steps = (Array.isArray(p.steps) ? p.steps : [])
+          .map((s: { text?: unknown; timeGoalMins?: unknown }) => {
+            const mins = Math.round(Number(s?.timeGoalMins) || 0)
+            return {
+              text: noEmDash(String(s?.text ?? '').trim().slice(0, 120)),
+              timeGoalMins: mins >= 1 && mins <= 120 ? mins : null,
+            }
+          })
+          .filter(s => s.text)
+          .slice(0, 10)
+        const noteText = noEmDash(String(p.note?.text ?? '').trim().slice(0, 1000))
+        if (steps.length > 0) {
+          protocol = {
+            name: noEmDash(String(p.name ?? '').trim().slice(0, 50)) || 'My Protocol',
+            emoji: EMOJI_CHOICES.includes(p.emoji) ? p.emoji : '🛟',
+            steps,
+            note: noteText
+              ? { title: noEmDash(String(p.note?.title ?? '').trim().slice(0, 60)) || 'Note to self', text: noteText }
+              : null,
+          }
+        }
+      }
+      if (!reply && !protocol) return json({ error: 'internal_error' }, 500)
+      // Echo the token that earned this free ride unchanged — re-minting each
+      // turn would restart the two-hour clock and let one credit chain free
+      // calls forever. A billed call mints a fresh token for its chat.
+      const chatToken = helperChatToken ?? await mintChatToken(user.id)
+      return json({ reply, protocol, chatToken })
     }
 
     if (action === 'moderate_profile_picture') {
@@ -268,7 +417,8 @@ Deno.serve(async (req) => {
       if (!avatarUrl) return json({ allowed: true })
       try {
         const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-          model: 'gpt-4o-mini',
+          model: 'gpt-5.6-luna',
+          reasoning_effort: 'low',
           messages: [{
             role: 'user',
             content: [
@@ -276,11 +426,11 @@ Deno.serve(async (req) => {
               { type: 'image_url', image_url: { url: avatarUrl, detail: 'low' } },
             ],
           }],
-          max_tokens: 80,
+          max_completion_tokens: 4000,
           response_format: { type: 'json_object' },
         })
         const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}')
-        return json({ allowed: parsed.allowed !== false, reason: parsed.reason ?? null })
+        return json({ allowed: parsed.allowed !== false, reason: typeof parsed.reason === 'string' ? noEmDash(parsed.reason) : null })
       } catch { return json({ allowed: true }) }
     }
 
@@ -324,13 +474,14 @@ Deno.serve(async (req) => {
       ].join('\n')
       try {
         const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-          model: 'gpt-4o-mini',
+          model: 'gpt-5.6-luna',
+          reasoning_effort: 'low',
           messages: [{ role: 'user', content: prompt }],
-          max_tokens: 80,
+          max_completion_tokens: 4000,
           response_format: { type: 'json_object' },
         })
         const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}')
-        return json({ allowed: parsed.allowed !== false, reason: parsed.reason ?? null })
+        return json({ allowed: parsed.allowed !== false, reason: typeof parsed.reason === 'string' ? noEmDash(parsed.reason) : null })
       } catch { return json({ allowed: true }) }
     }
 
@@ -345,7 +496,8 @@ Deno.serve(async (req) => {
       }
 
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4o-mini',
+        model: 'gpt-5.6-luna',
+        reasoning_effort: 'low',
         messages: [{
           role: 'user',
           content: [
@@ -356,7 +508,7 @@ Deno.serve(async (req) => {
             })),
           ],
         }],
-        max_tokens: 1200,
+        max_completion_tokens: 16000,
         response_format: { type: 'json_object' },
       })
 
@@ -387,19 +539,27 @@ Deno.serve(async (req) => {
         if (oversize) return oversize
       }
 
+      // Grid reading needs deep reasoning more than a big model: gpt-4o-mini,
+      // gpt-4.1 and even gpt-5 at medium effort misplaced classes by day, and
+      // gpt-5.6 + HIGH effort fixed it. Keep effort high if the model changes,
+      // and keep the audit field — it forces a per-column transcription before
+      // any merging. (Terra also verified working here; Luna is the cheap tier.)
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4o-mini',
+        model: 'gpt-5.6-luna',
+        reasoning_effort: 'high',
         messages: [{
           role: 'user',
           content: [
-            { type: 'text', text: 'The attached screenshots show a student\'s class schedule / timetable. Read the ENTIRE timetable, checking every visible day/column in every screenshot. Extract every distinct recurring class meeting pattern.\n\nReturn ONLY valid JSON:\n{"classes":[{"courseCode":"CS 135","courseName":"Designing Functional Programs","type":"Lecture","days":["Mon","Wed","Fri"],"startTime":"14:30","endTime":"15:20","location":"MC 2054"}]}\n\nRules:\n- days: include EVERY weekday on which that exact course, type, time, and location meets. Never keep only the first day. Use three-letter values from Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n- If a course has different times, types, or rooms on different days, return separate objects with the correct days for each pattern.\n- Inspect all seven day columns and all supplied screenshots before answering. Do not omit later days or repeated meetings.\n- courseCode: the short code as shown (e.g. "CS 135", "MATH 137"). If none is visible, use a short form of the name.\n- courseName: the full course title. If not visible, repeat the course code.\n- type: one of "Lecture", "Tutorial", "Lab", "Seminar", "Other" — infer from markers like LEC/TUT/LAB/SEM.\n- startTime/endTime: 24-hour "HH:MM".\n- location: the room/building as shown, or null if not visible.\n- If the images do not show a class schedule, return {"classes":[]}.' },
+            { type: 'text', text: 'The attached screenshots show a student\'s class schedule / timetable. Extract every recurring class meeting with the CORRECT day of the week and times.\n\nMost timetables are a grid: day columns across the top, a time axis down the side. The #1 mistake is assigning a class block to the wrong day column. Avoid it by working column by column:\n1. Locate each day header and its horizontal span.\n2. For each column, read every class block inside that column top to bottom, taking start/end from the time axis rows the block spans.\n3. Assign a block ONLY to the day whose column it sits in. Never assume patterns like MWF or TuTh — trust only the columns. A course CAN meet at different times on different days.\nIf the schedule is a list rather than a grid, read each day/date heading and the classes under it; convert specific dates to their weekday.\n\nReturn ONLY valid JSON:\n{"audit":[{"day":"Mon","blocks":["CS 135 LEC 14:30-15:20 MC 2054"]}],"classes":[{"courseCode":"CS 135","courseName":"Designing Functional Programs","type":"Lecture","days":["Mon","Wed","Fri"],"startTime":"14:30","endTime":"15:20","location":"MC 2054"}]}\n\naudit: FIRST transcribe every day that has classes — one entry per day, one string per block with course, type, time range and room. This is your worksheet; complete it before deciding anything else.\nclasses: THEN merge the audit into recurring patterns. Every audit block must appear in exactly one classes entry, and every day listed for a class must have a matching audit block.\n\nRules:\n- days: every weekday on which that exact course, type, start/end time and location meets. Three-letter values from Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n- If a course has different times, types, or rooms on different days, return separate objects with the correct days for each pattern.\n- courseCode: the short code as shown (e.g. "CS 135", "MATH 137"). If none is visible, use a short form of the name.\n- courseName: the full course title. If not visible, repeat the course code.\n- type: exactly one of "Lecture", "Tutorial", "Lab", "Seminar", "Other". Actively look for the type marker on EVERY block — it is often abbreviated or buried in the section code: LEC/Lec 001 = Lecture, TUT/T01/CONF/DIS/REC = Tutorial, LAB/PRA = Lab, SEM = Seminar. If a block has no visible marker, infer it from context: a course\'s main classroom meeting is a "Lecture", a smaller discussion/problem session is a "Tutorial", a hands-on computer/science session is a "Lab". Use "Other" ONLY when you genuinely cannot tell.\n- startTime/endTime: 24-hour "HH:MM" with leading zeros. Convert AM/PM times ("2:30 PM" → "14:30").\n- location: the room/building as shown, or null if not visible.\n- If the images do not show a class schedule, return {"audit":[],"classes":[]}.' },
             ...images.map(b64 => ({
               type: 'image_url',
               image_url: { url: `data:image/jpeg;base64,${b64}`, detail: 'high' },
             })),
           ],
         }],
-        max_tokens: 3000,
+        // Reasoning tokens count against this budget; too tight and the reply
+        // comes back empty. High effort thinks longer, so leave real headroom.
+        max_completion_tokens: 24000,
         response_format: { type: 'json_object' },
       })
 
@@ -416,8 +576,27 @@ Deno.serve(async (req) => {
         thu: 'Thu', thur: 'Thu', thurs: 'Thu', thursday: 'Thu',
         fri: 'Fri', friday: 'Fri', sat: 'Sat', saturday: 'Sat',
       }
-      const TYPES = ['Lecture', 'Tutorial', 'Lab', 'Seminar', 'Other']
-      const timeOk = (t: unknown) => typeof t === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(t)
+      // Models often return the marker as printed on the timetable ("LEC",
+      // "Tut 002", "Conf") — an exact-match check silently turned every one
+      // of those into 'Other'. Normalize by prefix instead.
+      const TYPE_PREFIXES: Array<[string, string]> = [
+        ['lec', 'Lecture'],
+        ['tut', 'Tutorial'], ['conf', 'Tutorial'], ['dis', 'Tutorial'], ['rec', 'Tutorial'],
+        ['lab', 'Lab'], ['pra', 'Lab'],
+        ['sem', 'Seminar'],
+      ]
+      const classType = (t: unknown): string => {
+        const s = String(t ?? '').trim().toLowerCase()
+        const hit = TYPE_PREFIXES.find(([prefix]) => s.startsWith(prefix))
+        return hit ? hit[1] : 'Other'
+      }
+      // Zero-pad "9:05" → "09:05"; unpadded hours made the start<end string
+      // comparison drop every morning class that ran past 10:00.
+      const normTime = (t: unknown): string | null => {
+        const m = /^(\d{1,2}):([0-5]\d)$/.exec(String(t ?? '').trim())
+        if (!m || Number(m[1]) > 23) return null
+        return `${m[1].padStart(2, '0')}:${m[2]}`
+      }
       const classes = raw
         .flatMap(c => {
           const suppliedDays = Array.isArray(c.days) ? c.days : [c.day]
@@ -427,16 +606,16 @@ Deno.serve(async (req) => {
           return days.map(day => ({
             courseCode: String(c.courseCode ?? '').trim().slice(0, 20),
             courseName: String(c.courseName ?? '').trim().slice(0, 80),
-            type: TYPES.includes(String(c.type)) ? String(c.type) : 'Other',
+            type: classType(c.type),
             day,
-            startTime: c.startTime,
-            endTime: c.endTime,
+            startTime: normTime(c.startTime),
+            endTime: normTime(c.endTime),
             location: c.location ? String(c.location).trim().slice(0, 60) : null,
           }))
         })
         .filter(c =>
           (c.courseCode || c.courseName) && DAYS.includes(c.day) &&
-          timeOk(c.startTime) && timeOk(c.endTime) && String(c.startTime) < String(c.endTime)
+          c.startTime && c.endTime && c.startTime < c.endTime
         )
       return json({ classes })
     }
@@ -446,16 +625,41 @@ Deno.serve(async (req) => {
       const oversize = checkImageSize(base64)
       if (oversize) return oversize
 
+      // Same pre-check as upload_avatar: run the selfie through the
+      // moderation endpoint before it ever reaches the analysis model. The
+      // prompt below asks the model to refuse inappropriate images too, but a
+      // prompt is self-policing, not a gate — and like upload_avatar this
+      // fails closed: if the check itself cannot run, the photo goes nowhere.
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+          model: 'omni-moderation-latest',
+          input: [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } }],
+        })
+        if (mod.results?.[0]?.flagged === true) {
+          return json(
+            { error: 'flagged', reason: 'That photo does not fit our community guidelines. Please pick another one.' },
+            422,
+          )
+        }
+      } catch (e) {
+        console.error('analyze_looks moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'We could not check that image right now. Please try again.' },
+          503,
+        )
+      }
+
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4o-mini',
+        model: 'gpt-5.6-luna',
+        reasoning_effort: 'low',
         messages: [{
           role: 'user',
           content: [
-            { type: 'text', text: 'Analyze this facial photo and provide a personalized foundational skincare and hair care routine.\nReturn ONLY a valid JSON object.\n\nIf the image contains inappropriate, explicit, or offensive content, return exactly: {"error":"inappropriate"}\nOnly return {"error":"quality"} if the image is so dark, blurry, or obscured that NO facial features are visible at all.\n\nOtherwise return:\n{"skinNote":"Optional short compliment if skin looks notably clear/healthy — omit entirely if not applicable","categories":[{"name":"Category name","steps":[{"name":"Step name","product":"Specific accessible drugstore product","explanation":"1-sentence reason based on what you observe"}]}]}\n\nInclude 2-4 skin categories AND one "Hair Care" category (2-4 steps each). For Hair Care: identify hair type, washing frequency, and product recommendations. For skin: reference observable features (oiliness, dryness, texture). Use affordable drugstore products. No medical diagnoses or attractiveness judgments.' },
+            { type: 'text', text: 'Analyze this facial photo and provide a personalized foundational skincare and hair care routine.\nReturn ONLY a valid JSON object.\n\nIf the image contains inappropriate, explicit, or offensive content, return exactly: {"error":"inappropriate"}\nOnly return {"error":"quality"} if the image is so dark, blurry, or obscured that NO facial features are visible at all.\n\nOtherwise return:\n{"skinNote":"Optional short compliment if skin looks notably clear/healthy — omit entirely if not applicable","categories":[{"name":"Category name","steps":[{"name":"Step name","product":"Specific accessible drugstore product","explanation":"1-sentence reason based on what you observe"}]}]}\n\nInclude 2-4 skin categories AND one "Hair Care" category (2-4 steps each). For Hair Care: identify hair type, washing frequency, and product recommendations. For skin: reference observable features (oiliness, dryness, texture). Use affordable drugstore products. No medical diagnoses or attractiveness judgments. Never use em dashes in any text.' },
             { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' } },
           ],
         }],
-        max_tokens: 1200,
+        max_completion_tokens: 16000,
         response_format: { type: 'json_object' },
       })
 
@@ -464,7 +668,7 @@ Deno.serve(async (req) => {
         return json({ error: 'inappropriate' })
       }
       const parsed = JSON.parse(choice?.message?.content ?? '{}')
-      return json(parsed)
+      return json(noEmDashDeep(parsed))
     }
 
     return json({ error: 'unknown_action' }, 400)
@@ -473,6 +677,47 @@ Deno.serve(async (req) => {
     return json({ error: 'internal_error' }, 500)
   }
 })
+
+// ── Protocol-helper chat tokens ──────────────────────────────────────────────
+// A chat token is proof that a helper chat already paid its generative credit.
+// It is an HMAC over the user id and the time the credit was charged, signed
+// with the service-role key (already server-only; the function has no separate
+// signing secret), so a client can neither mint one nor transplant another
+// user's. Format: "<issuedAtMs>.<hex hmac>". Expiry is checked against the
+// signed timestamp, so one credit buys at most two hours of follow-ups.
+
+const HELPER_TOKEN_TTL_MS = 2 * 60 * 60 * 1000
+
+let hmacKey: Promise<CryptoKey> | null = null
+const chatTokenKey = () => (hmacKey ??= crypto.subtle.importKey(
+  'raw', new TextEncoder().encode(SERVICE_KEY),
+  { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'],
+))
+
+async function mintChatToken(userId: string): Promise<string> {
+  const issuedAt = Date.now()
+  const sig = await crypto.subtle.sign(
+    'HMAC', await chatTokenKey(), new TextEncoder().encode(`${userId}.${issuedAt}`))
+  const hex = [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('')
+  return `${issuedAt}.${hex}`
+}
+
+// Returns the token itself when it is genuine and fresh, else null. Every
+// failure mode (absent, malformed, expired, dated in the future, wrong user,
+// forged) verifies to null on purpose: billing is the default, and a free
+// ride has to be proven. crypto.subtle.verify compares in constant time.
+async function verifyChatToken(userId: string, token: unknown): Promise<string | null> {
+  if (typeof token !== 'string') return null
+  const m = /^(\d{1,15})\.([0-9a-f]{64})$/.exec(token)
+  if (!m) return null
+  const issuedAt = Number(m[1])
+  const age = Date.now() - issuedAt
+  if (age < 0 || age > HELPER_TOKEN_TTL_MS) return null
+  const sig = Uint8Array.from(m[2].match(/.{2}/g)!.map(h => parseInt(h, 16)))
+  const ok = await crypto.subtle.verify(
+    'HMAC', await chatTokenKey(), sig, new TextEncoder().encode(`${userId}.${issuedAt}`))
+  return ok ? token : null
+}
 
 async function callOpenAI(url: string, body: unknown): Promise<Record<string, unknown>> {
   const res = await fetch(url, {

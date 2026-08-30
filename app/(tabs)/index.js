@@ -1,4 +1,4 @@
-import { useState, useCallback, useLayoutEffect, useEffect } from 'react'
+import { useState, useCallback, useLayoutEffect, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, Pressable, StyleSheet, ScrollView,
   Modal, Switch, Alert, KeyboardAvoidingView, Platform,
@@ -9,17 +9,23 @@ import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
-import { getRoutineNames, getRoutineTemplate, getTodayRunEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
+import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import { getProtocols, trackerDays } from '../../lib/protocolStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
 
 const DEFAULT_ROUTINES = new Set(['Morning', 'Fitness', 'Night'])
 
+// Focus refetch throttle: a tab hop back here within this window keeps
+// rendering cached state instead of hitting the network again.
+const REFETCH_MS = 30 * 1000
+
 // Section identities for the routine groups (chip + rule tint)
 const EVERYDAY_COLOR = '#f59e0b'
 const WHENEVER_COLOR = '#06b6d4'
+const PROTOCOL_COLOR = '#ec4899'
 
 function fmtMs(ms) {
   const s = Math.floor(ms / 1000)
@@ -70,6 +76,9 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
   const [rulesOpen, setRulesOpen] = useState(false)
   const [draftRules, setDraftRules] = useState([])
   const [newRule, setNewRule] = useState('')
+  // Stamped on each successful fetch — focus refetches inside the throttle
+  // window keep showing what's already here.
+  const lastDashLoadRef = useRef(0)
 
   useEffect(() => {
     if (!user?.id) return
@@ -111,6 +120,7 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
 
   useFocusEffect(useCallback(() => {
     if (!user?.id) return
+    if (Date.now() - lastDashLoadRef.current < REFETCH_MS) return
     const key = today()
     Promise.all([
       getCalendarEvents(user.id),
@@ -132,7 +142,8 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
       setPendingTodos(todos.filter(t => !t.done).slice(0, 2))
       setTasksToday(allTasks.filter(t => !t.done && t.dueDate === key).slice(0, 3))
       setTodayJournal(jEntries[key] ?? null)
-    })
+      lastDashLoadRef.current = Date.now()
+    }).catch(() => {}) // a failed refetch keeps whatever is already on screen
   }, [user?.id]))
 
   const visible   = routines.filter(r => !hiddenSet.has(r.name))
@@ -863,9 +874,6 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
   )
 }
 
-// ── Habits ────────────────────────────────────────────────────────────────
-
-
 // ── Main screen ───────────────────────────────────────────────────────────
 
 export default function RoutinesScreen() {
@@ -882,9 +890,17 @@ export default function RoutinesScreen() {
   const [activeTab, setActiveTab] = useState('daily')
   const [weeklyRoutines, setWeeklyRoutines] = useState([])
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
+  const [protocols, setProtocols] = useState([])
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
   // Which dashboard group each routine is in: 'everyday' (default) | 'whenever'
   const [groupMap, setGroupMap] = useState({})
+  // Stale-while-revalidate: once anything has loaded, focus refetches keep
+  // rendering the current content — the blank/error states are first-load only.
+  const hasLoadedRef = useRef(false)
+  const lastLoadAtRef = useRef(0)
+  // Fingerprint of everything the notification sync schedules from, so the
+  // sync (which re-reads the routine list itself) only fires on real changes.
+  const notifSyncKeyRef = useRef(null)
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -896,30 +912,33 @@ export default function RoutinesScreen() {
     })
   }, [navigation, theme])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ force = false } = {}) => {
     if (!user) return
+    // A focus refetch inside the throttle window keeps rendering cached state.
+    if (!force && hasLoadedRef.current && Date.now() - lastLoadAtRef.current < REFETCH_MS) return
     try {
-      const [names, hiddenArr, str, split, rStreaks, gMap] = await Promise.all([
-        getRoutineNames(user.id),
+      // Only the per-routine reads depend on the names list — everything else
+      // runs in one parallel batch right behind the single names query.
+      const names = await getRoutineNames(user.id)
+      const [templates, runs, settingsArr, hiddenArr, str, split, rStreaks, gMap, wkRoutines, sec] = await Promise.all([
+        getRoutineTemplates(user.id, names),
+        getTodayRunsEither(user.id, names),
+        Promise.all(names.map(n => getRoutineSettings(user.id, n))), // device-local reads
         getHiddenDefaults(user.id),
         getStreak(user.id),
         getGymSplit(user.id),
         getRoutineStreaks(user.id),
         getRoutineGroupMap(user.id),
+        getWeeklyRoutines(user.id),
+        getSections(user.id),
       ])
       setGroupMap(gMap)
-      const [templates, runs, settingsArr] = await Promise.all([
-        Promise.all(names.map(n => getRoutineTemplate(user.id, n))),
-        Promise.all(names.map(n => getTodayRunEither(user.id, n))),
-        Promise.all(names.map(n => getRoutineSettings(user.id, n))),
-      ])
-      setRoutines(names.map((name, i) => ({ name, template: templates[i], run: runs[i], settings: settingsArr[i] })))
+      setRoutines(names.map((name, i) => ({ name, template: templates[name], run: runs[name], settings: settingsArr[i] })))
       setHiddenSet(new Set(hiddenArr))
       setStreak(str)
       setRoutineStreaks(rStreaks)
       const muscle = split?.days?.[todaySplitIndex()] ?? null
       setTodayMuscle(muscle)
-      const wkRoutines = await getWeeklyRoutines(user.id)
       const todayStr = today()
       const todayDow = new Date().getDay()
       let wkUpdated = false
@@ -937,14 +956,26 @@ export default function RoutinesScreen() {
       })
       if (wkUpdated) await saveWeeklyRoutines(user.id, wkReset)
       setWeeklyRoutines(wkReset)
-      const sec = await getSections(user.id)
       setSections(sec)
       setActiveTab(prev => (prev === 'weekly' && !sec.weekly) ? 'daily' : prev)
       setError(false)
-      // Keep routine start-time reminders in sync (no-op unless schedule changed).
-      syncRoutineNotifications(user.id)
+      hasLoadedRef.current = true
+      lastLoadAtRef.current = Date.now()
+      // Protocols are additive to the dashboard — a failed fetch must not take
+      // the routines list down with it.
+      getProtocols(user.id).then(setProtocols).catch(() => {})
+      // Keep routine start-time reminders in sync. The sync re-reads the
+      // routine list itself, so only fire it when something it schedules from
+      // (names, groups, hidden set, per-routine schedules) actually changed.
+      const notifKey = JSON.stringify([names, gMap, [...hiddenArr].sort(), settingsArr])
+      if (notifSyncKeyRef.current !== notifKey) {
+        notifSyncKeyRef.current = notifKey
+        syncRoutineNotifications(user.id)
+      }
     } catch {
-      setError(true)
+      // A failed refetch keeps the stale screen — the error page only appears
+      // when there is nothing loaded to show instead.
+      if (!hasLoadedRef.current) setError(true)
     } finally {
       setLoading(false)
     }
@@ -980,8 +1011,13 @@ export default function RoutinesScreen() {
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Delete', style: 'destructive', onPress: async () => {
-          await deleteRoutine(user.id, name)
-          load()
+          try {
+            await deleteRoutine(user.id, name)
+          } catch (e) {
+            Alert.alert('Delete Failed', e?.message ?? 'Something went wrong. Please try again.')
+            return
+          }
+          load({ force: true })
         }},
       ]
     )
@@ -1179,6 +1215,54 @@ export default function RoutinesScreen() {
             >
               <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
             </Pressable>
+
+            {/* ── Protocols — emergency checklists for hard moments ── */}
+            <View style={[s.groupHeaderRow, { marginTop: 18 }]}>
+              <View style={[s.groupChip, { backgroundColor: PROTOCOL_COLOR + '1c' }]}>
+                <Text style={s.groupHeaderEmoji}>🛟</Text>
+                <Text style={[s.groupHeaderText, { color: PROTOCOL_COLOR }]}>PROTOCOLS</Text>
+              </View>
+              <Text style={[s.groupHeaderHint, { color: theme.muted }]}>for the hard moments</Text>
+              <View style={[s.groupRule, { backgroundColor: PROTOCOL_COLOR + '2a' }]} />
+            </View>
+            {protocols.length === 0 && (
+              <Text style={[s.groupEmptyHint, { color: theme.muted }]}>
+                A protocol is a step-by-step plan for when you're unmotivated or close to slipping — set it up now so it's there when you need it.
+              </Text>
+            )}
+            {protocols.map(p => {
+              const days = trackerDays(p)
+              return (
+                <Pressable
+                  key={p.id}
+                  onPress={() => router.push('/protocol/' + p.id)}
+                  style={[s.protocolCard, { backgroundColor: theme.card, borderColor: PROTOCOL_COLOR + '3a' }]}
+                >
+                  <Text style={s.protocolEmoji}>{p.emoji ?? '🛟'}</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.protocolName, { color: theme.text }]} numberOfLines={1}>{p.name}</Text>
+                    <Text style={[s.protocolMeta, { color: theme.subtext }]}>
+                      {p.steps.length} step{p.steps.length === 1 ? '' : 's'}
+                      {p.activeRun ? <Text style={{ color: PROTOCOL_COLOR, fontWeight: '800' }}>  ·  ▶ in progress</Text> : null}
+                    </Text>
+                  </View>
+                  {days !== null && (
+                    <View style={[s.protocolDaysBadge, { backgroundColor: PROTOCOL_COLOR + '16' }]}>
+                      <Text style={[s.protocolDaysText, { color: PROTOCOL_COLOR }]}>
+                        {days}d
+                      </Text>
+                    </View>
+                  )}
+                  <Text style={[s.protocolChevron, { color: theme.muted }]}>›</Text>
+                </Pressable>
+              )
+            })}
+            <Pressable
+              style={[s.addBtn, { borderColor: PROTOCOL_COLOR + '44' }]}
+              onPress={() => router.push('/protocol/new')}
+            >
+              <Text style={[s.addBtnText, { color: PROTOCOL_COLOR }]}>＋  Add Protocol</Text>
+            </Pressable>
           </>
         ) : (
           <>
@@ -1298,6 +1382,18 @@ const s = StyleSheet.create({
     borderWidth: 1.5, borderStyle: 'dashed',
   },
   addBtnText: { fontWeight: '700', fontSize: 15 },
+
+  // Protocols
+  protocolCard: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    borderRadius: 18, borderWidth: 1.5, padding: 14, marginBottom: 10,
+  },
+  protocolEmoji: { fontSize: 22 },
+  protocolName: { fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
+  protocolMeta: { fontSize: 12, fontWeight: '600', marginTop: 2 },
+  protocolDaysBadge: { borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
+  protocolDaysText: { fontSize: 13, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  protocolChevron: { fontSize: 20, fontWeight: '700' },
 
   // Bottom-sheet scaffolding (used by the Weekly Routine + label modals)
   settingsOverlay: { flex: 1, justifyContent: 'flex-end' },

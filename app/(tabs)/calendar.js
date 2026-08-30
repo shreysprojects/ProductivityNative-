@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView,
   Modal, TextInput, Alert, KeyboardAvoidingView, Platform,
@@ -16,15 +16,16 @@ import {
   getJournalEntries, saveJournalEntry, deleteJournalEntry,
   getWorkoutLog, getMeals,
 } from '../../lib/storage'
-import { loadHabits } from '../../lib/habitsStorage'
 import { readingStats } from '../../lib/textStats'
 import DayLogTimeline from '../../components/DayLogTimeline'
 import ScanScheduleModal from '../../components/ScanScheduleModal'
+import ClassAttendancePrompt from '../../components/ClassAttendancePrompt'
+import { syncClassNotifications } from '../../lib/classNotifications'
+import { getProtocols, getProtocolJournals, deleteProtocolJournal, deleteProtocolReset } from '../../lib/protocolStorage'
 import {
   getLogSettings, getAllTimeLogs, slotStarts, DEFAULT_LOG_SETTINGS,
+  autoLogSpan, dismissAutoLog, unloggedMarkers, timeToMins, nowMins,
 } from '../../lib/timeLogging'
-
-const HABIT_DOT_COLOR = '#f43f5e'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -226,6 +227,12 @@ function deadlineOptions(bucket) {
   })
 }
 
+// Inverse of parseFormTime: "14:30" → the h/m/ap form-field values.
+function formTimeParts(t) {
+  const [h, m] = String(t ?? '8:00').split(':').map(Number)
+  return { h: String(h % 12 || 12), m: String(m).padStart(2, '0'), ap: h >= 12 ? 'PM' : 'AM' }
+}
+
 function parseFormTime(h, m, ap) {
   const hi = parseInt(h, 10), mi = parseInt(m, 10)
   if (isNaN(hi) || isNaN(mi) || hi < 1 || hi > 12 || mi < 0 || mi > 59) return null
@@ -309,8 +316,9 @@ export default function CalendarScreen() {
   const [saving, setSaving]       = useState(false)
   const [hasPerm, setHasPerm]     = useState(false)
 
-  // Add class modal
+  // Add / edit class modal (editingClass null = adding a new one)
   const [classOpen, setClassOpen] = useState(false)
+  const [editingClass, setEditingClass] = useState(null)
   const [cTitle, setCTitle]       = useState('')
   const [cLoc, setCLoc]           = useState('')
   const [cDays, setCDays]         = useState([])
@@ -341,20 +349,32 @@ export default function CalendarScreen() {
   // Time logging
   const [logSettings, setLogSettings] = useState(DEFAULT_LOG_SETTINGS)
   const [logCounts, setLogCounts]     = useState({})  // day -> logged slot count
-  const [weekPane, setWeekPane]       = useState('log') // 'log' | 'schedule'
   const [logDay, setLogDay]           = useState(todayStr())
   const [scanOpen, setScanOpen]       = useState(false)
+  // Bumped whenever something outside DayLogTimeline writes to the log, so it
+  // re-reads instead of showing a stale day.
+  const [logRefresh, setLogRefresh]   = useState(0)
+
+  // Classes that finished today and haven't been answered for yet.
+  const [attendQueue, setAttendQueue] = useState([])
+  // "Ask me later" holds off until the next app launch, so dismissing doesn't
+  // re-prompt every time this tab regains focus.
+  const attendSnoozed = useRef(false)
 
   // Journal
   const [journalEntries, setJournalEntries] = useState({})
   const [journalOpen, setJournalOpen]       = useState(false)
+  const [jReadOnly, setJReadOnly]           = useState(false)
+  // Reading a protocol journal reuses the same full-screen page with its own
+  // title (the protocol's name instead of the date).
+  const [jTitleOverride, setJTitleOverride] = useState(null)
+  const [protocolJournals, setProtocolJournals] = useState({})
+  // Counter resets by date: { [day]: [{ id, name, emoji }] }
+  const [protocolResets, setProtocolResets] = useState({})
   const [jDate, setJDate]                   = useState(null)
   const [jMood, setJMood]                   = useState(null)
   const [jText, setJText]                   = useState('')
   const [jSaving, setJSaving]               = useState(false)
-
-  // Habits
-  const [habitEventsByDate, setHabitEventsByDate] = useState({})
 
   // Load state
   const [loading, setLoading] = useState(true)
@@ -381,15 +401,26 @@ export default function CalendarScreen() {
   const load = useCallback(async () => {
     if (!user) return
     try {
-      const [hist, str, evts, sched, taskList, jEntries, habitsData, lSettings, allLogs] = await Promise.all([
+      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs] = await Promise.all([
         getHistory(user.id), getStreak(user.id),
         getCalendarEvents(user.id), getScheduleItems(user.id),
         getTasks(user.id), getJournalEntries(user.id),
-        loadHabits(user.id),
         getLogSettings(user.id),
         // Never let the time-log sync take the whole calendar down with it.
         getAllTimeLogs(user.id).catch(() => ({})),
       ])
+      // Additive — a failed fetch must not break the rest of the calendar.
+      getProtocolJournals(user.id).then(setProtocolJournals).catch(() => {})
+      getProtocols(user.id).then(list => {
+        const m = {}
+        for (const p of list) {
+          for (const r of p.resets ?? []) {
+            if (!r?.date) continue
+            ;(m[r.date] ??= []).push({ id: r.id, protocolId: p.id, name: p.name, emoji: p.emoji ?? '🛟' })
+          }
+        }
+        setProtocolResets(m)
+      }).catch(() => {})
       setLogSettings(lSettings)
       const counts = {}
       for (const [d, slots] of Object.entries(allLogs)) counts[d] = Object.keys(slots).length
@@ -407,15 +438,9 @@ export default function CalendarScreen() {
       setScheduleItems(sched)
       setTasks(taskList)
       setJournalEntries(jEntries)
-      const hmap = {}
-      for (const habit of habitsData.breaking) {
-        for (const entry of habit.history) {
-          const d = entry.date.slice(0, 10)
-          if (!hmap[d]) hmap[d] = []
-          hmap[d].push({ type: entry.type, habitName: habit.name })
-        }
-      }
-      setHabitEventsByDate(hmap)
+      // A routine finished on another screen may have written itself into the
+      // log while this tab was in the background.
+      setLogRefresh(n => n + 1)
       setError(false)
 
       if (openJournalParam) {
@@ -427,6 +452,8 @@ export default function CalendarScreen() {
         setJDate(td)
         setJMood(existing?.mood ?? null)
         setJText(existing?.text ?? '')
+        setJReadOnly(false) // this path always opens today
+        setJTitleOverride(null)
         setJournalOpen(true)
         router.setParams({ openJournal: undefined })
       }
@@ -505,6 +532,21 @@ export default function CalendarScreen() {
     return result
   }, [weekDays, events, scheduleItems])
 
+  // The Schedule pane describes a recurring weekly timetable, so it reads as
+  // weekdays rather than dates. Any day of the week can appear, but a day
+  // earns its chip by having something on it — an empty day stays hidden until
+  // a class is added. The day you're currently on is always shown, so arrowing
+  // onto a free day can't strand you with no chip selected.
+  // "Day" is the schedule view now that Time log has its own top-bar tab.
+  const scheduleMode = viewMode === 'week'
+  const stripDays = useMemo(() => {
+    if (!scheduleMode) return weekDays
+    const busy = d => (weekEventsByDay[d]?.length ?? 0) > 0
+    // Nothing scheduled all week: show the whole week rather than a lone chip.
+    if (!weekDays.some(busy)) return weekDays
+    return weekDays.filter(d => busy(d) || d === logDay)
+  }, [scheduleMode, weekDays, logDay, weekEventsByDay])
+
   const upcomingEvents = useMemo(() => {
     const tomorrow = tomorrowStr()
     return events
@@ -554,7 +596,7 @@ export default function CalendarScreen() {
 
   function switchView(mode) {
     setViewMode(mode)
-    if (mode === 'week' && selected) setLogDay(selected)
+    if ((mode === 'week' || mode === 'log') && selected) setLogDay(selected)
   }
 
   function openAdd() {
@@ -564,10 +606,23 @@ export default function CalendarScreen() {
   }
 
   function openAddClass() {
+    setEditingClass(null)
     setCTitle(''); setCLoc(''); setCDays([])
     setCSH('8'); setCSM('00'); setCSAp('AM')
     setCEH('9'); setCEM('00'); setCEAp('AM')
     setCColor('#3b82f6'); setCFrom(''); setCTo('')
+    setClassOpen(true)
+  }
+
+  function openEditClass(item) {
+    const st = formTimeParts(item.startTime), et = formTimeParts(item.endTime)
+    setEditingClass(item)
+    setCTitle(item.title); setCLoc(item.location ?? ''); setCDays(item.days ?? [])
+    setCSH(st.h); setCSM(st.m); setCSAp(st.ap)
+    setCEH(et.h); setCEM(et.m); setCEAp(et.ap)
+    setCColor(item.color ?? '#3b82f6')
+    setCFrom(item.semesterStart ? fmtDateForInput(item.semesterStart) : '')
+    setCTo(item.semesterEnd ? fmtDateForInput(item.semesterEnd) : '')
     setClassOpen(true)
   }
 
@@ -640,39 +695,80 @@ export default function CalendarScreen() {
       if (!semesterEnd) { Alert.alert('Invalid date', 'Semester end: use MM/DD/YYYY'); return }
     }
     setCeSaving(true)
+    // Spreading the original first keeps fields the form doesn't own (id,
+    // scan meta like course code/type) when editing.
     const item = {
-      id: genId(), title: cTitle.trim(),
+      ...(editingClass ?? {}),
+      id: editingClass?.id ?? genId(), title: cTitle.trim(),
       location: cLoc.trim() || null,
       days: cDays, startTime, endTime, color: cColor,
       semesterStart, semesterEnd,
     }
     await saveScheduleItem(user.id, item)
-    setScheduleItems(prev => [...prev, item])
-    setClassOpen(false); setCeSaving(false)
+    setScheduleItems(prev => editingClass
+      ? prev.map(i => i.id === item.id ? item : i)
+      : [...prev, item])
+    setClassOpen(false); setCeSaving(false); setEditingClass(null)
+  }
+
+  function handleDeleteClass() {
+    const item = editingClass
+    if (!item) return
+    Alert.alert('Delete Class', `Remove "${item.title}" from your schedule?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive',
+        onPress: async () => {
+          await deleteScheduleItem(user.id, item.id)
+          setScheduleItems(prev => prev.filter(i => i.id !== item.id))
+          setClassOpen(false); setEditingClass(null)
+        },
+      },
+    ])
+  }
+
+  // "Forget that day": erase one reset record from the calendar. The
+  // protocol's live counter is untouched — this only rewrites history.
+  function handleForgetReset(r, date) {
+    Alert.alert(
+      'Forget this reset?',
+      `The reset mark for "${r.name}" will be removed from this day. The running counter isn't affected.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Forget it', style: 'destructive',
+          onPress: async () => {
+            await deleteProtocolReset(user.id, r.protocolId, r.id)
+            setProtocolResets(prev => {
+              const list = (prev[date] ?? []).filter(x => x.id !== r.id)
+              const next = { ...prev }
+              if (list.length) next[date] = list
+              else delete next[date]
+              return next
+            })
+          },
+        },
+      ]
+    )
   }
 
   function handleWeekEventPress(ev) {
+    // Tapping a class opens it for editing; delete lives inside that menu.
+    if (ev.kind === 'class') {
+      const item = scheduleItems.find(i => i.id === ev._scheduleId)
+      if (item) { openEditClass(item); return }
+    }
     const timeRange = `${fmtTime(ev.startTime)} – ${fmtTime(ev.endTime)}`
-    const body = [
-      ev.meta?.courseName && ev.meta.courseName !== ev.meta.courseCode ? ev.meta.courseName : null,
-      ev.meta?.type && ev.meta.type !== 'Other' ? ev.meta.type : null,
-      timeRange,
-      ev.location,
-    ].filter(Boolean).join('\n')
+    const body = [timeRange, ev.location].filter(Boolean).join('\n')
     Alert.alert(ev.title, body, [
       { text: 'Close', style: 'cancel' },
       {
-        text: ev.kind === 'class' ? 'Delete Class' : 'Delete Event',
+        text: 'Delete Event',
         style: 'destructive',
         onPress: async () => {
-          if (ev.kind === 'class') {
-            await deleteScheduleItem(user.id, ev._scheduleId)
-            setScheduleItems(prev => prev.filter(i => i.id !== ev._scheduleId))
-          } else {
-            if (ev.notifId) { try { await Notifications.cancelScheduledNotificationAsync(ev.notifId) } catch {} }
-            await deleteCalendarEvent(user.id, ev.id)
-            setEvents(prev => prev.filter(e => e.id !== ev.id))
-          }
+          if (ev.notifId) { try { await Notifications.cancelScheduledNotificationAsync(ev.notifId) } catch {} }
+          await deleteCalendarEvent(user.id, ev.id)
+          setEvents(prev => prev.filter(e => e.id !== ev.id))
         },
       },
     ])
@@ -698,6 +794,70 @@ export default function CalendarScreen() {
     await saveTask(user.id, updated)
   }
 
+  // Keep the "class starts soon" reminders in step with the timetable. Keyed
+  // off scheduleItems so every path that changes it — load, scan import, edit,
+  // delete — re-syncs; the sync itself no-ops when nothing actually changed.
+  useEffect(() => {
+    if (!user) return
+    syncClassNotifications(user.id).catch(() => {})
+  }, [user, scheduleItems])
+
+  // ── Class attendance → time log ───────────────────────────────────────────
+  // Queue up today's classes that have already ended and haven't been answered
+  // for. Rebuilt whenever the schedule reloads (i.e. on tab focus), so a class
+  // that finished while the app sat open is picked up next time you land here.
+  useEffect(() => {
+    if (!user || !logSettings.enabled || attendSnoozed.current) return
+    const day = todayStr()
+    const dow = new Date(day + 'T12:00:00').getDay()
+    const now = nowMins()
+    const ended = scheduleItems.filter(i => {
+      if (!Array.isArray(i.days) || !i.days.includes(dow)) return false
+      if (i.semesterStart && day < i.semesterStart) return false
+      if (i.semesterEnd   && day > i.semesterEnd)   return false
+      const end = timeToMins(i.endTime)
+      return end !== null && end <= now
+    })
+    if (ended.length === 0) { setAttendQueue(q => q.length ? [] : q); return }
+
+    let cancelled = false
+    unloggedMarkers(user.id, ended.map(i => `class:${i.id}:${day}`))
+      .then(pending => {
+        if (cancelled) return
+        const open = new Set(pending)
+        setAttendQueue(ended.filter(i => open.has(`class:${i.id}:${day}`)).map(i => ({ ...i, day })))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [user, scheduleItems, logSettings.enabled])
+
+  async function answerAttendance(attended) {
+    const item = attendQueue[0]
+    if (!item) return
+    setAttendQueue(q => q.slice(1))
+    const marker = `class:${item.id}:${item.day}`
+    const start = timeToMins(item.startTime)
+    if (!attended || start === null) { dismissAutoLog(user.id, marker).catch(() => {}); return }
+
+    const end = timeToMins(item.endTime)
+    const written = await autoLogSpan(user.id, marker, {
+      day: item.day,
+      startMins: start,
+      durationMins: Math.max(0, (end ?? start) - start),
+      text: item.title,
+      kind: 'class',
+    }).catch(() => 0)
+    if (written > 0) {
+      setLogCounts(prev => ({ ...prev, [item.day]: (prev[item.day] ?? 0) + written }))
+      setLogRefresh(n => n + 1)
+    }
+  }
+
+  function snoozeAttendance() {
+    attendSnoozed.current = true
+    setAttendQueue([])
+  }
+
   // A scan is a fresh timetable: it REPLACES the class schedule, so stale
   // classes from last term can't pile up next to the new ones.
   async function handleImportClasses(items) {
@@ -709,7 +869,6 @@ export default function CalendarScreen() {
       for (const item of previous) await deleteScheduleItem(user.id, item.id)
       for (const item of saved) await saveScheduleItem(user.id, item)
       setViewMode('week')
-      setWeekPane('schedule')
       setLogDay(today)
       Alert.alert(
         'Schedule updated',
@@ -780,13 +939,47 @@ export default function CalendarScreen() {
     ])
   }
 
+  // Writing is limited to the last 3 days, but reading is not: an entry from
+  // any past day opens the same full-screen page in read-only mode.
   function openJournal(date) {
-    if (date > today || date < addDays(today, -2)) return
+    const canWrite = date <= today && date >= addDays(today, -2)
     const existing = journalEntries[date]
+    if (!canWrite && !existing) return
+    setJTitleOverride(null)
+    setJReadOnly(!canWrite)
     setJDate(date)
     setJMood(existing?.mood ?? null)
     setJText(existing?.text ?? '')
     setJournalOpen(true)
+  }
+
+  // Protocol journals are written on the protocol screen; here they only read.
+  function openProtocolJournal(entry) {
+    setJTitleOverride(`🛟 ${entry.protocolName}`)
+    setJReadOnly(true)
+    setJDate(entry.date)
+    setJMood(null)
+    setJText(entry.text ?? '')
+    setJournalOpen(true)
+  }
+
+  function handleDeleteProtocolJournal(entry) {
+    Alert.alert('Delete Protocol Journal?', 'This entry will be permanently deleted.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive',
+        onPress: async () => {
+          await deleteProtocolJournal(user.id, entry.id, entry.date)
+          setProtocolJournals(prev => {
+            const list = (prev[entry.date] ?? []).filter(e => e.id !== entry.id)
+            const next = { ...prev }
+            if (list.length) next[entry.date] = list
+            else delete next[entry.date]
+            return next
+          })
+        },
+      },
+    ])
   }
 
   async function handleDeleteJournal(date) {
@@ -840,7 +1033,7 @@ export default function CalendarScreen() {
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {[['month', 'Month'], ['week', 'Day'], ['tasks', 'To-do']].map(([mode, label]) => (
+          {[['month', 'Month'], ['week', 'Day'], ['tasks', 'To-do'], ...(logSettings.enabled ? [['log', 'Time log']] : [])].map(([mode, label]) => (
             <Pressable
               key={mode}
               style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}
@@ -853,7 +1046,7 @@ export default function CalendarScreen() {
           ))}
         </View>
         <View style={s.toggleActions}>
-          {viewMode === 'week' && (!logSettings.enabled || weekPane === 'schedule') && (
+          {viewMode === 'week' && (
             <>
               <Pressable
                 style={[s.toggleActionBtn, { backgroundColor: theme.accent + '20' }]}
@@ -953,8 +1146,8 @@ export default function CalendarScreen() {
                         {journalEntries[ds] && (
                           <View style={[s.eventDot, { backgroundColor: '#0ea5e9' }]} />
                         )}
-                        {habitEventsByDate[ds] && (
-                          <View style={[s.eventDot, { backgroundColor: HABIT_DOT_COLOR }]} />
+                        {(protocolJournals[ds]?.length > 0 || protocolResets[ds]?.length > 0) && (
+                          <View style={[s.eventDot, { backgroundColor: '#ec4899' }]} />
                         )}
                         {logSettings.enabled && logCounts[ds] > 0 && (
                           <View style={[s.eventDot, { backgroundColor: '#14b8a6' }]} />
@@ -968,7 +1161,7 @@ export default function CalendarScreen() {
 
             <View style={[s.legendDivider, { backgroundColor: theme.divider }]} />
             <View style={s.legend}>
-              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],[HABIT_DOT_COLOR,'Habit'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
+              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],['#ec4899','Protocol'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
                 <View key={l} style={s.legendItem}>
                   <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
                   <Text style={[s.legendText, { color: theme.muted }]}>{l}</Text>
@@ -994,7 +1187,7 @@ export default function CalendarScreen() {
                 return (
                   <Pressable
                     style={[s.logStatRow, { backgroundColor: '#14b8a610', borderColor: '#14b8a640' }]}
-                    onPress={() => { setLogDay(selected); setViewMode('week'); setWeekPane('log') }}
+                    onPress={() => { setLogDay(selected); setViewMode('log') }}
                   >
                     <Text style={s.logStatEmoji}>⏱</Text>
                     <View style={{ flex: 1 }}>
@@ -1097,8 +1290,7 @@ export default function CalendarScreen() {
                     {entry ? (
                       <Pressable
                         style={[s.journalPreview, { backgroundColor: theme.isDark ? '#1c1c32' : '#f4f8ff', borderColor: theme.cardBorder }]}
-                        onPress={canWrite ? () => openJournal(selected) : undefined}
-                        disabled={!canWrite}
+                        onPress={() => openJournal(selected)}
                       >
                         {entry.mood && (
                           <Text style={{ fontSize: 20, marginBottom: 4 }}>
@@ -1112,6 +1304,7 @@ export default function CalendarScreen() {
                             </Text>
                             <Text style={[s.journalPreviewStats, { color: theme.muted }]}>
                               {readingStats(entry.text)}
+                              {!canWrite && <Text style={{ color: theme.accent }}>  ·  Tap to read</Text>}
                             </Text>
                           </>
                         ) : (
@@ -1133,6 +1326,62 @@ export default function CalendarScreen() {
                   </View>
                 )
               })()}
+
+              {/* ── Protocol journals — written after completing a protocol ── */}
+              {(protocolJournals[selected] ?? []).length > 0 && (
+                <View style={s.journalSection}>
+                  <Text style={[s.sectionLabel, { color: theme.muted, marginBottom: 8 }]}>PROTOCOL JOURNALS</Text>
+                  {(protocolJournals[selected] ?? []).map(entry => (
+                    <Pressable
+                      key={entry.id}
+                      style={[s.journalPreview, {
+                        backgroundColor: theme.isDark ? '#2a1c28' : '#fdf2f8',
+                        borderColor: '#ec489944', marginBottom: 8,
+                      }]}
+                      onPress={() => openProtocolJournal(entry)}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <Text style={{ fontSize: 12.5, fontWeight: '800', color: '#ec4899', flex: 1 }} numberOfLines={1}>
+                          🛟 {entry.protocolName}
+                        </Text>
+                        <Pressable hitSlop={10} onPress={() => handleDeleteProtocolJournal(entry)}>
+                          <Text style={{ fontSize: 13, fontWeight: '700', color: theme.muted }}>✕</Text>
+                        </Pressable>
+                      </View>
+                      <Text style={[s.journalPreviewText, { color: theme.subtext, marginTop: 4 }]} numberOfLines={3}>
+                        {entry.text}
+                      </Text>
+                      <Text style={[s.journalPreviewStats, { color: theme.muted }]}>
+                        {readingStats(entry.text)}
+                        <Text style={{ color: theme.accent }}>  ·  Tap to read</Text>
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+
+              {/* ── Protocol counter resets ── */}
+              {(protocolResets[selected] ?? []).length > 0 && (
+                <>
+                  <Text style={[s.sectionLabel, { color: theme.muted }]}>PROTOCOL RESETS</Text>
+                  {(protocolResets[selected] ?? []).map(r => (
+                    <View key={r.id} style={[s.routineRow, { borderBottomColor: theme.divider }]}>
+                      <View style={[s.routineDot, { backgroundColor: '#ec4899' }]} />
+                      <Text style={[s.routineName, { color: theme.text }]}>
+                        {r.emoji} {r.name}
+                        <Text style={{ color: theme.muted, fontWeight: '600', fontSize: 12 }}>  ·  counter reset</Text>
+                      </Text>
+                      <Pressable
+                        onPress={() => handleForgetReset(r, selected)}
+                        hitSlop={8}
+                        style={[s.forgetResetBtn, { borderColor: '#ec489955' }]}
+                      >
+                        <Text style={s.forgetResetText}>✕ Forget</Text>
+                      </Pressable>
+                    </View>
+                  ))}
+                </>
+              )}
 
               {selectedEntries.length > 0 && (
                 <>
@@ -1200,23 +1449,6 @@ export default function CalendarScreen() {
                 )
               })()}
 
-              {(habitEventsByDate[selected] ?? []).length > 0 && (
-                <>
-                  <Text style={[s.sectionLabel, { color: theme.muted }]}>HABIT EVENTS</Text>
-                  {(habitEventsByDate[selected] ?? []).map((ev, i) => (
-                    <View key={i} style={[s.routineRow, { borderBottomColor: theme.divider }]}>
-                      <View style={[s.routineDot, { backgroundColor: ev.type === 'relapse' ? HABIT_DOT_COLOR : '#10b981' }]} />
-                      <Text style={[s.routineName, { color: theme.text }]}>{ev.habitName}</Text>
-                      <Text style={[s.routinePct, {
-                        color: ev.type === 'relapse' ? HABIT_DOT_COLOR : '#10b981',
-                        fontWeight: '600', fontSize: 12,
-                      }]}>
-                        {ev.type === 'relapse' ? '↩ Relapse' : '✓ Started'}
-                      </Text>
-                    </View>
-                  ))}
-                </>
-              )}
             </View>
           )}
 
@@ -1259,39 +1491,26 @@ export default function CalendarScreen() {
       )}
 
       {/* ── Week view ──────────────────────────────────────────────────────── */}
-      {viewMode === 'week' && logSettings.enabled && (
-        <View style={[s.paneBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
-          {[['log', '⏱  Time log'], ['schedule', '📅  Schedule']].map(([key, label]) => (
-            <Pressable
-              key={key}
-              style={[s.paneBtn, weekPane === key && { borderBottomColor: theme.accent }]}
-              onPress={() => setWeekPane(key)}
-            >
-              <Text style={[s.paneBtnText, { color: weekPane === key ? theme.accent : theme.subtext }]}>
-                {label}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-      )}
-
-      {/* Shared day navigation for Schedule and Time log. */}
-      {viewMode === 'week' && (
+      {/* Shared day navigation for the Day (schedule) and Time log tabs. */}
+      {(viewMode === 'week' || viewMode === 'log') && (
         <View style={[s.dayPicker, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
           <View style={s.dayNav}>
             <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.dayNavArrowBtn}>
               <Text style={[s.dayNavArrow, { color: theme.accent }]}>‹</Text>
             </Pressable>
-            <Pressable onPress={() => setLogDay(today)} style={{ flex: 1 }}>
-              <Text style={[s.dayNavTitle, { color: theme.text }]} numberOfLines={1}>
-                {logDay === today ? 'Today' : formatDateShort(logDay)}
+            {/* The title is the jump-to-today control — accented while you're
+                away from today to show it does something. */}
+            <Pressable onPress={() => setLogDay(today)} hitSlop={10} style={{ flex: 1 }}>
+              <Text
+                style={[s.dayNavTitle, { color: logDay === today ? theme.text : theme.accent }]}
+                numberOfLines={1}
+              >
+                {logDay === today
+                  ? 'Today'
+                  : scheduleMode
+                    ? new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
+                    : formatDateShort(logDay)}
               </Text>
-            </Pressable>
-            <Pressable
-              onPress={() => setLogDay(today)}
-              style={[s.dayTodayBtn, { backgroundColor: theme.accent + '18' }]}
-            >
-              <Text style={[s.dayTodayText, { color: theme.accent }]}>Today</Text>
             </Pressable>
             <Pressable onPress={() => setLogDay(d => addDays(d, 1))} hitSlop={10} style={s.dayNavArrowBtn}>
               <Text style={[s.dayNavArrow, { color: theme.accent }]}>›</Text>
@@ -1299,22 +1518,36 @@ export default function CalendarScreen() {
           </View>
 
           <View style={s.dayStrip}>
-            {weekDays.map(d => {
-              const active = d === logDay
+            {stripDays.map(d => {
+              const active  = d === logDay
+              const isToday = d === today
               const dObj = new Date(d + 'T12:00:00')
-              const count = (!logSettings.enabled || weekPane === 'schedule')
+              const count = scheduleMode
                 ? (weekEventsByDay[d]?.length ?? 0)
                 : (logCounts[d] ?? 0)
               return (
                 <Pressable
                   key={d}
                   onPress={() => setLogDay(d)}
-                  style={[s.dayChip, active && { backgroundColor: theme.accent }]}
+                  style={[s.dayChip, {
+                    backgroundColor: active ? theme.accent : 'transparent',
+                    // Selected reads as a fill, today as a ring; the border is
+                    // always present so highlighting can't resize the chip.
+                    borderColor: !active && isToday ? theme.accent : 'transparent',
+                  }]}
                 >
-                  <Text style={[s.dayChipName, { color: active ? '#fff' : theme.subtext }]}>
+                  <Text style={[s.dayChipName, {
+                    color: active ? '#fff' : isToday ? theme.accent : theme.subtext,
+                  }]}>
                     {dObj.toLocaleDateString('en-US', { weekday: 'short' })}
                   </Text>
-                  <Text style={[s.dayChipNum, { color: active ? '#fff' : theme.text }]}>{dObj.getDate()}</Text>
+                  {!scheduleMode && (
+                    <Text style={[s.dayChipNum, {
+                      color: active ? '#fff' : isToday ? theme.accent : theme.text,
+                    }]}>
+                      {dObj.getDate()}
+                    </Text>
+                  )}
                   <View style={[s.dayChipCount, { backgroundColor: active ? '#ffffff2e' : theme.accent + '15' }]}>
                     <Text style={[s.dayChipCountText, { color: active ? '#fff' : theme.accent }]}>{count}</Text>
                   </View>
@@ -1326,13 +1559,15 @@ export default function CalendarScreen() {
       )}
 
       {/* Time log — one row per slot for the chosen day. */}
-      {viewMode === 'week' && logSettings.enabled && weekPane === 'log' && (
+      {viewMode === 'log' && logSettings.enabled && (
         <DayLogTimeline
           key={logDay}
           userId={user.id}
           day={logDay}
           todayStr={today}
           settings={logSettings}
+          refreshKey={logRefresh}
+          onImported={load}
           onCountsChange={(filled) => setLogCounts(prev => (
             prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
           ))}
@@ -1340,7 +1575,7 @@ export default function CalendarScreen() {
       )}
 
       {/* Schedule — a readable agenda for the chosen day. */}
-      {viewMode === 'week' && (!logSettings.enabled || weekPane === 'schedule') && (
+      {viewMode === 'week' && (
         <ScrollView
           style={{ flex: 1 }}
           contentInsetAdjustmentBehavior="automatic"
@@ -1556,6 +1791,17 @@ export default function CalendarScreen() {
         onImport={handleImportClasses}
       />
 
+      {attendQueue.length > 0 && !scanOpen && !classOpen && (
+        <ClassAttendancePrompt
+          item={attendQueue[0]}
+          index={0}
+          total={attendQueue.length}
+          onAttended={() => answerAttendance(true)}
+          onSkipped={() => answerAttendance(false)}
+          onClose={snoozeAttendance}
+        />
+      )}
+
       {/* ── Add Event modal ────────────────────────────────────────────────── */}
       <Modal visible={addOpen} transparent animationType="slide" onRequestClose={() => setAddOpen(false)}>
         <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
@@ -1612,14 +1858,14 @@ export default function CalendarScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ── Add Class modal ────────────────────────────────────────────────── */}
+      {/* ── Add / Edit Class modal ─────────────────────────────────────────── */}
       <Modal visible={classOpen} transparent animationType="slide" onRequestClose={() => setClassOpen(false)}>
         <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
           <Pressable style={[StyleSheet.absoluteFillObject, s.modalBg]} onPress={() => setClassOpen(false)} />
           <View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card }]}>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
               <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
-              <Text style={[s.modalTitle, { color: theme.text }]}>Add Class</Text>
+              <Text style={[s.modalTitle, { color: theme.text }]}>{editingClass ? 'Edit Class' : 'Add Class'}</Text>
 
               <Text style={[s.fieldLabel, { color: theme.muted }]}>COURSE NAME</Text>
               <TextInput
@@ -1690,8 +1936,15 @@ export default function CalendarScreen() {
                 style={[s.saveBtn, { backgroundColor: theme.accent, opacity: cSaving ? 0.6 : 1, marginBottom: 8 }]}
                 onPress={handleSaveClass} disabled={cSaving}
               >
-                <Text style={s.saveBtnText}>{cSaving ? 'Saving…' : 'Add to Schedule'}</Text>
+                <Text style={s.saveBtnText}>
+                  {cSaving ? 'Saving…' : editingClass ? 'Save Changes' : 'Add to Schedule'}
+                </Text>
               </Pressable>
+              {!!editingClass && (
+                <Pressable onPress={handleDeleteClass} hitSlop={8} style={s.deleteClassBtn}>
+                  <Text style={s.deleteClassText}>Delete Class</Text>
+                </Pressable>
+              )}
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
@@ -1793,33 +2046,44 @@ export default function CalendarScreen() {
               <Text style={[s.journalClose, { color: theme.muted }]}>✕</Text>
             </Pressable>
             <Text style={[s.journalHeaderTitle, { color: theme.text }]} numberOfLines={1}>
-              {jDate ? formatDate(jDate) : 'Journal'}
+              {jTitleOverride ?? (jDate ? formatDate(jDate) : 'Journal')}
             </Text>
-            <Pressable onPress={handleSaveJournal} disabled={jSaving} hitSlop={12}>
-              <Text style={[s.journalSave, { opacity: jSaving ? 0.5 : 1 }]}>
-                {jSaving ? 'Saving…' : 'Save'}
-              </Text>
-            </Pressable>
+            {jReadOnly ? (
+              // Spacer the width of the Save button, so the title stays centered.
+              <View style={{ width: 44 }} />
+            ) : (
+              <Pressable onPress={handleSaveJournal} disabled={jSaving} hitSlop={12}>
+                <Text style={[s.journalSave, { opacity: jSaving ? 0.5 : 1 }]}>
+                  {jSaving ? 'Saving…' : 'Save'}
+                </Text>
+              </Pressable>
+            )}
           </View>
 
           <View style={s.journalBody}>
-            <Text style={[s.fieldLabel, { color: theme.muted }]}>MOOD</Text>
-            <View style={s.moodRow}>
-              {MOODS.map(m => (
-                <Pressable
-                  key={m.key}
-                  style={[
-                    s.moodBtn,
-                    { borderColor: jMood === m.key ? '#0ea5e9' : theme.cardBorder,
-                      backgroundColor: jMood === m.key ? '#0ea5e918' : (theme.isDark ? '#1c1c32' : '#f4f8ff') },
-                  ]}
-                  onPress={() => setJMood(jMood === m.key ? null : m.key)}
-                >
-                  <Text style={s.moodBtnEmoji}>{m.emoji}</Text>
-                  <Text style={[s.moodBtnLabel, { color: jMood === m.key ? '#0ea5e9' : theme.muted }]}>{m.label}</Text>
-                </Pressable>
-              ))}
-            </View>
+            {/* Reading an old entry with no mood: skip the empty picker. */}
+            {(!jReadOnly || jMood) && (
+              <>
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>MOOD</Text>
+                <View style={s.moodRow}>
+                  {(jReadOnly ? MOODS.filter(m => m.key === jMood) : MOODS).map(m => (
+                    <Pressable
+                      key={m.key}
+                      disabled={jReadOnly}
+                      style={[
+                        s.moodBtn,
+                        { borderColor: jMood === m.key ? '#0ea5e9' : theme.cardBorder,
+                          backgroundColor: jMood === m.key ? '#0ea5e918' : (theme.isDark ? '#1c1c32' : '#f4f8ff') },
+                      ]}
+                      onPress={() => setJMood(jMood === m.key ? null : m.key)}
+                    >
+                      <Text style={s.moodBtnEmoji}>{m.emoji}</Text>
+                      <Text style={[s.moodBtnLabel, { color: jMood === m.key ? '#0ea5e9' : theme.muted }]}>{m.label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </>
+            )}
 
             <View style={s.entryLabelRow}>
               <Text style={[s.fieldLabel, { color: theme.muted }]}>ENTRY</Text>
@@ -1827,10 +2091,11 @@ export default function CalendarScreen() {
             </View>
             <TextInput
               style={[s.journalTextArea, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-              placeholder="What's on your mind today?"
+              placeholder={jReadOnly ? '(no text for this day)' : "What's on your mind today?"}
               placeholderTextColor={theme.muted}
               value={jText}
               onChangeText={setJText}
+              editable={!jReadOnly}
               multiline
               scrollEnabled
             />
@@ -1896,9 +2161,14 @@ const s = StyleSheet.create({
   eventDotsRow: { flexDirection: 'row', gap: 2, justifyContent: 'center', marginTop: 2, height: 7 },
   eventDot: { width: 5, height: 5, borderRadius: 3 },
   legendDivider: { height: 1, marginTop: 10, marginBottom: 10 },
-  legend: { flexDirection: 'row', justifyContent: 'center', gap: 20 },
-  legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  legendDot: { width: 10, height: 10, borderRadius: 5 },
+  // Seven entries never fit one row on a phone — wrap instead of letting the
+  // last labels get clipped.
+  legend: {
+    flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center',
+    columnGap: 14, rowGap: 8, paddingHorizontal: 6,
+  },
+  legendItem: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  legendDot: { width: 10, height: 10, borderRadius: 5, flexShrink: 0 },
   legendText: { fontSize: 11 },
 
   addBtn: { borderRadius: 20, paddingHorizontal: 14, paddingVertical: 7 },
@@ -1967,10 +2237,11 @@ const s = StyleSheet.create({
   dayNavArrowBtn: { paddingHorizontal: 8, paddingVertical: 2 },
   dayNavArrow: { fontSize: 26, fontWeight: '700', lineHeight: 28 },
   dayNavTitle: { fontSize: 14, fontWeight: '700', textAlign: 'center' },
-  dayTodayBtn: { borderRadius: 12, paddingHorizontal: 10, paddingVertical: 5 },
-  dayTodayText: { fontSize: 11.5, fontWeight: '800' },
   dayStrip: { flexDirection: 'row', gap: 5, paddingHorizontal: 10 },
-  dayChip: { flex: 1, minWidth: 40, alignItems: 'center', gap: 1, paddingVertical: 7, borderRadius: 15 },
+  dayChip: {
+    flex: 1, minWidth: 40, alignItems: 'center', gap: 1, paddingVertical: 7,
+    borderRadius: 15, borderWidth: 1.5,
+  },
   dayChipName: { fontSize: 10.5, fontWeight: '700' },
   dayChipNum: { fontSize: 15, fontWeight: '800', fontVariant: ['tabular-nums'] },
   dayChipCount: { minWidth: 20, height: 18, borderRadius: 9, paddingHorizontal: 5, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
@@ -2036,6 +2307,10 @@ const s = StyleSheet.create({
 
   saveBtn: { borderRadius: 16, paddingVertical: 15, alignItems: 'center', marginTop: 8 },
   saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  deleteClassBtn: { alignItems: 'center', paddingVertical: 12, marginBottom: 4 },
+  deleteClassText: { fontSize: 14, fontWeight: '700', color: '#ef4444' },
+  forgetResetBtn: { borderWidth: 1.5, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
+  forgetResetText: { fontSize: 11.5, fontWeight: '800', color: '#ec4899' },
 
   // Tasks view
   // Week view pane switcher (Time log / Schedule)

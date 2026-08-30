@@ -30,7 +30,7 @@ export default function ForgotPassword() {
 
   async function handleReset() {
     if (!code.trim()) return Alert.alert('Enter the code from your email')
-    if (newPassword.length < 6) return Alert.alert('Password too short', 'Use at least 6 characters.')
+    if (newPassword.length < 8) return Alert.alert('Weak password', 'Password must be at least 8 characters.')
     setLoading(true)
     try {
       await confirmPasswordReset(email, code, newPassword)

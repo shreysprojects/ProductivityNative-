@@ -1,6 +1,6 @@
 import { Platform, Alert, StyleSheet } from 'react-native'
 import * as AppleAuthentication from 'expo-apple-authentication'
-import { useAuth } from '../lib/AuthContext'
+import { useAuth, createNoncePair } from '../lib/AuthContext'
 import { router } from 'expo-router'
 
 export default function AppleSignInButton() {
@@ -10,13 +10,15 @@ export default function AppleSignInButton() {
 
   async function handlePress() {
     try {
+      const { raw, hashed } = await createNoncePair()
       const credential = await AppleAuthentication.signInAsync({
         requestedScopes: [
           AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
           AppleAuthentication.AppleAuthenticationScope.EMAIL,
         ],
+        nonce: hashed,
       })
-      await signInWithApple(credential)
+      await signInWithApple(credential, raw)
       router.replace('/(tabs)')
     } catch (e) {
       if (e.code !== 'ERR_CANCELED') {

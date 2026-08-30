@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import {
-  View, Text, Pressable, StyleSheet, ScrollView,
+  View, Text, Pressable, StyleSheet, ScrollView, FlatList,
   Alert, TextInput, Modal, Animated, ActivityIndicator, Dimensions,
   Linking, Platform,
 } from 'react-native'
@@ -17,15 +17,18 @@ import { todaySplitIndex, DAY_LABELS, muscleColor, muscleTextColor, normalizeDay
 import {
   getRoutineTemplate, saveRoutineTemplate, getTodayRun, startRun, advanceRun, completeRun,
   saveRun, resetTodayRun, getGymSplit, getWorkoutRoutineList, deleteWorkoutPlan, renameWorkoutPlan, getWorkoutPlan,
-  getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today, getRoutineSettings,
+  getDayTodos, saveDayTodos, getWorkoutLogsRange, getAllWorkoutLogs, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
   setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine, taskGoalSecs,
+  stepImageUnlocked, subStepImageUnlocked, runWithAdjustedStart,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
+import ImageViewerModal from '../../components/ImageViewerModal'
 import MuscleMap from '../../components/MuscleMap'
 import { supabase } from '../../lib/supabase'
 import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
+import { autoLogSpan } from '../../lib/timeLogging'
 import { maybePromptReview } from '../../lib/review'
 
 const CELL_W = Math.floor((Dimensions.get('window').width - 20 - 24) / 7)
@@ -1185,20 +1188,16 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
             <ActivityIndicator color={accentColor} size="large" />
           </View>
         ) : (
-          <ScrollView
-            contentContainerStyle={hcs.scrollContent}
-            onScroll={({ nativeEvent }) => {
-              const { layoutMeasurement, contentOffset, contentSize } = nativeEvent
-              if (contentOffset.y + layoutMeasurement.height >= contentSize.height - 300) {
-                setMonthCount(c => c + 6)
-              }
-            }}
-            scrollEventThrottle={32}
-            showsVerticalScrollIndicator={false}
-          >
-            {months.map(({ year, month }) => (
+          <FlatList
+            // Virtualized so a year of months doesn't mount at once — every
+            // logged day cell carries a MuscleMap (a body PNG plus overlay
+            // images), so the old ScrollView paid for all ~12 months of them
+            // on open. Only the months near the viewport mount now; offscreen
+            // ones are recycled as the user scrolls.
+            data={months}
+            keyExtractor={({ year, month }) => `${year}-${month}`}
+            renderItem={({ item: { year, month } }) => (
               <MonthCalendar
-                key={`${year}-${month}`}
                 year={year}
                 month={month}
                 logMap={logMap}
@@ -1207,9 +1206,18 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
                 onDayPress={log => setDetailLog(log)}
                 musclesByGroup={musclesByGroup}
               />
-            ))}
-            <View style={{ height: 40 }} />
-          </ScrollView>
+            )}
+            initialNumToRender={3}
+            maxToRenderPerBatch={3}
+            windowSize={7}
+            // Same endless paging the ScrollView's onScroll did by hand: near
+            // the bottom, extend the month list and let useMemo grow `months`.
+            onEndReached={() => setMonthCount(c => c + 6)}
+            onEndReachedThreshold={0.5}
+            contentContainerStyle={hcs.scrollContent}
+            showsVerticalScrollIndicator={false}
+            ListFooterComponent={<View style={{ height: 40 }} />}
+          />
         )}
 
         {/* Detail overlay */}
@@ -1323,20 +1331,28 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
       d.setDate(startDay.getDate() + i)
       return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
     })
-    Promise.all(days.map(d => getWorkoutLog(userId, d))).then(async results => {
-      setWeekLogs(days.map((date, i) => ({ date, log: results[i] })))
-      const muscles = {}
-      await Promise.all(days.map(async (date, i) => {
-        const log = results[i]
-        if (!log?.muscleGroup) return
-        const plan = await getWorkoutPlan(userId, log.muscleGroup)
+    // The whole strip in ONE range query — this used to be fourteen
+    // getWorkoutLog calls, one per cell. Then one plan fetch per UNIQUE
+    // muscle group: a split repeats the same few groups across the two
+    // weeks, so fetching per day re-downloaded the same plan over and over.
+    getWorkoutLogsRange(userId, days[0], days[days.length - 1]).then(async logsByDate => {
+      setWeekLogs(days.map(date => ({ date, log: logsByDate[date] ?? null })))
+      const groups = [...new Set(days.map(d => logsByDate[d]?.muscleGroup).filter(Boolean))]
+      const byGroup = {}
+      await Promise.all(groups.map(async group => {
+        const plan = await getWorkoutPlan(userId, group)
         const primary = new Set(), secondary = new Set()
         plan.forEach(ex => {
           ex.muscles?.forEach(m => m?.name && primary.add(m.name))
           ex.musclesSecondary?.forEach(m => m?.name && secondary.add(m.name))
         })
-        muscles[date] = { primary: [...primary], secondary: [...secondary] }
+        byGroup[group] = { primary: [...primary], secondary: [...secondary] }
       }))
+      const muscles = {}
+      for (const date of days) {
+        const group = logsByDate[date]?.muscleGroup
+        if (group) muscles[date] = byGroup[group]
+      }
       setWeekMuscles(muscles)
     })
   }, [userId]))
@@ -1801,6 +1817,26 @@ export default function RoutineScreen() {
     }
   }, [run?.finished])
 
+  // A finished routine writes itself onto the time log. This watches `finished`
+  // rather than hooking each finish path (timer, checklist, quick-check) so
+  // every one of them is covered; autoLogSpan's marker makes re-entry a no-op,
+  // so re-opening a done routine can't resurrect a block you deleted.
+  useEffect(() => {
+    if (!user || !run?.finished) return
+    // Quick-checked runs have no timer, so the tick time is the whole span.
+    const startedAt = run.startedAt ?? run.completedAt
+    const completedAt = run.completedAt ?? startedAt
+    if (!startedAt) return
+    const d = new Date(startedAt)
+    autoLogSpan(user.id, `routine:${storageName}:${run.date}`, {
+      day: run.date,
+      startMins: d.getHours() * 60 + d.getMinutes(),
+      durationMins: Math.round(Math.max(0, completedAt - startedAt) / 60000),
+      text: `${name} routine`,
+      kind: 'routine',
+    }).catch(() => {})
+  }, [user, run?.finished, run?.date, run?.startedAt, run?.completedAt, storageName, name])
+
   function startBtnPressIn() {
     Animated.spring(startBtnScale, { toValue: 0.96, useNativeDriver: true, speed: 40, bounciness: 4 }).start()
   }
@@ -1815,8 +1851,16 @@ export default function RoutineScreen() {
 
   // Tick a task off without starting the timer — records the check timestamp.
   async function handlePreviewToggle(taskId) {
-    const updated = await quickCheckToggle(user.id, storageName, template, taskId)
-    setRun(updated)
+    try {
+      const updated = await quickCheckToggle(user.id, storageName, template, taskId)
+      setRun(updated)
+    } catch (e) {
+      // storage refuses the toggle when the run can't be read from anywhere
+      // (cloud unreachable, no local mirror) — building on a guess would let
+      // a blank run replay over real progress. Tell the user rather than
+      // letting the tap silently do nothing.
+      Alert.alert('Couldn’t update', e.message)
+    }
   }
 
   async function handleStepDone(elapsedMs) {
@@ -1845,11 +1889,55 @@ export default function RoutineScreen() {
     setRun(updated)
   }
 
+  // Jump back to an arbitrary earlier task (used by the "unfinished steps"
+  // prompt on Finish). Same reopening semantics as handleGoBack.
+  async function handleJumpTo(idx) {
+    if (!run || idx < 0 || idx >= run.steps.length) return
+    const updated = {
+      ...run,
+      currentStep: idx,
+      steps: run.steps.map((s, i) =>
+        i === idx ? { ...s, completedAt: null, elapsedMs: 0, startedAt: Date.now() } : s
+      ),
+    }
+    await saveRun(user.id, storageName, updated)
+    setRun(updated)
+  }
+
+  // The user says the current task really began at a different time — reset
+  // its timer to match, and let the routine's own start follow so total time
+  // and the auto time-log stay truthful.
+  async function handleAdjustStart(newStartedAt) {
+    if (!run) return
+    const updated = runWithAdjustedStart(run, newStartedAt, Date.now())
+    await saveRun(user.id, storageName, updated)
+    setRun(updated)
+  }
+
   async function handleToggleSubTask(subTaskId) {
     const updated = {
       ...run,
       steps: run.steps.map((step, i) =>
         i === run.currentStep
+          ? { ...step, subTasks: step.subTasks.map(st => st.id === subTaskId ? { ...st, done: !st.done } : st) }
+          : step
+      ),
+    }
+    await saveRun(user.id, storageName, updated)
+    setRun(updated)
+  }
+
+  // Photo the user tapped to see full screen, or null when nothing is open.
+  const [photoViewer, setPhotoViewer] = useState(null)
+
+  // Checklist mode: which tasks are expanded to show their sub-steps
+  const [clExpanded, setClExpanded] = useState({})
+
+  async function handleChecklistSubToggle(stepIdx, subTaskId) {
+    const updated = {
+      ...run,
+      steps: run.steps.map((step, i) =>
+        i === stepIdx
           ? { ...step, subTasks: step.subTasks.map(st => st.id === subTaskId ? { ...st, done: !st.done } : st) }
           : step
       ),
@@ -2112,6 +2200,12 @@ export default function RoutineScreen() {
   const quickDoneCount = run?.steps?.filter(st => st.completedAt).length ?? 0
   const quickPct = template.length ? Math.round((quickDoneCount / template.length) * 100) : 0
 
+  // The preview lists the template, but whether a task is done lives on the
+  // run. Line them up in routine order so picture unlocking can read straight
+  // down the list; before the routine is started every entry is undefined,
+  // which correctly leaves everything past the first task locked.
+  const previewSteps = template.map(t => run?.steps?.find(st => st.id === t.id))
+
   return (
     <View style={[s.page, { backgroundColor: theme.bg }]}>
       {/* Header */}
@@ -2215,6 +2309,8 @@ export default function RoutineScreen() {
                 onFinish={handleFinish}
                 onGoBack={handleGoBack}
                 onToggleSubTask={handleToggleSubTask}
+                onJumpTo={handleJumpTo}
+                onAdjustStart={handleAdjustStart}
               />
             ) : (
               <View>
@@ -2238,8 +2334,69 @@ export default function RoutineScreen() {
                           {step.text}
                         </Text>
                         {step.subTasks?.length > 0 && (
-                          <Text style={[s.clSubCount, { color: card.color }]}>{step.subTasks.length} sub-steps</Text>
+                          <Pressable
+                            onPress={() => setClExpanded(m => ({ ...m, [step.id]: !m[step.id] }))}
+                            hitSlop={8}
+                          >
+                            <Text style={[s.clSubCount, { color: card.color }]}>
+                              {step.subTasks.filter(st => st.done).length} / {step.subTasks.length} sub-steps  {clExpanded[step.id] ? '▾' : '▸'}
+                            </Text>
+                          </Pressable>
                         )}
+                        {/* The picture waits until everything above it is ticked off.
+                            It sits inside the row that checks the task off, so it
+                            swallows its own taps — looking at the reference photo
+                            should not complete the task. */}
+                        {!!step.image && (
+                          stepImageUnlocked(run.steps, i) ? (
+                            <Pressable onPress={() => setPhotoViewer(step.image)}>
+                              <Image
+                                source={{ uri: step.image }}
+                                style={[s.stepImage, { backgroundColor: theme.divider }]}
+                                contentFit="cover"
+                                transition={220}
+                              />
+                            </Pressable>
+                          ) : (
+                            <Text style={[s.stepImageLocked, { color: theme.muted }]}>
+                              🔒 Photo unlocks when the steps above are checked
+                            </Text>
+                          )
+                        )}
+                        {clExpanded[step.id] && step.subTasks?.map((st, j) => (
+                          <View key={st.id}>
+                            <Pressable
+                              style={s.clSubRow}
+                              onPress={() => handleChecklistSubToggle(i, st.id)}
+                              hitSlop={4}
+                            >
+                              <View style={[s.clSubCheck, { borderColor: st.done ? card.color : theme.cardBorder }, st.done && { backgroundColor: card.color }]}>
+                                {st.done && <Text style={s.clSubMark}>✓</Text>}
+                              </View>
+                              <Text style={[s.clSubText, { color: st.done ? theme.muted : theme.text }, st.done && { textDecorationLine: 'line-through' }]}>
+                                {st.text}
+                              </Text>
+                            </Pressable>
+                            {/* This step's photo waits for the steps above it,
+                                and for the task itself to be reachable. */}
+                            {!!st.image && (
+                              stepImageUnlocked(run.steps, i) && subStepImageUnlocked(step.subTasks, j) ? (
+                                <Pressable onPress={() => setPhotoViewer(st.image)}>
+                                  <Image
+                                    source={{ uri: st.image }}
+                                    style={[s.subStepImage, { backgroundColor: theme.divider }]}
+                                    contentFit="cover"
+                                    transition={220}
+                                  />
+                                </Pressable>
+                              ) : (
+                                <Text style={[s.stepImageLocked, { color: theme.muted }]}>
+                                  🔒 Photo unlocks when the steps above are checked
+                                </Text>
+                              )
+                            )}
+                          </View>
+                        ))}
                       </View>
                     </Pressable>
                   )
@@ -2596,6 +2753,23 @@ export default function RoutineScreen() {
                       )}
                     </View>
                   )}
+                  {/* The picture waits until everything above it is ticked off */}
+                  {!!task.image && (
+                    stepImageUnlocked(previewSteps, i) ? (
+                      <Pressable onPress={() => setPhotoViewer(task.image)}>
+                        <Image
+                          source={{ uri: task.image }}
+                          style={[s.stepImage, { backgroundColor: theme.divider }]}
+                          contentFit="cover"
+                          transition={220}
+                        />
+                      </Pressable>
+                    ) : (
+                      <Text style={[s.stepImageLocked, { color: theme.muted }]}>
+                        🔒 Photo unlocks when the steps above are checked
+                      </Text>
+                    )
+                  )}
                 </View>
                 {(() => {
                   const step = run?.steps?.find(st => st.id === task.id)
@@ -2783,6 +2957,8 @@ export default function RoutineScreen() {
           </Animated.View>
         </Animated.View>
       )}
+
+      <ImageViewerModal uri={photoViewer} onClose={() => setPhotoViewer(null)} />
     </View>
   )
 }
@@ -3222,7 +3398,17 @@ const s = StyleSheet.create({
   clCheckMark: { color: '#fff', fontWeight: '800', fontSize: 13 },
   clItemText: { fontSize: 17, fontWeight: '600' },
   clItemDone: { textDecorationLine: 'line-through', opacity: 0.38 },
+  stepImage: { width: '100%', height: 150, borderRadius: 14, marginTop: 10 },
+  subStepImage: { width: '100%', height: 130, borderRadius: 12, marginTop: 2, marginBottom: 8 },
+  stepImageLocked: { fontSize: 12, fontWeight: '600', marginTop: 6, opacity: 0.8 },
   clSubCount: { fontSize: 12, fontWeight: '600', marginTop: 3 },
+  clSubRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 7, paddingRight: 8 },
+  clSubCheck: {
+    width: 22, height: 22, borderRadius: 7, borderWidth: 2,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  clSubMark: { color: '#fff', fontSize: 11, fontWeight: '800' },
+  clSubText: { flex: 1, fontSize: 14.5, fontWeight: '600', lineHeight: 19 },
 
   errorWrap: { alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 },
   errorTitle: { fontSize: 17, fontWeight: '700', textAlign: 'center', letterSpacing: -0.2 },

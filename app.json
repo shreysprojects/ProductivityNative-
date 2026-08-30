@@ -17,9 +17,9 @@
       "package": "com.shreyj.productivityapp",
       "softwareKeyboardLayoutMode": "resize",
       "permissions": [
-        "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO",
-        "android.permission.CAMERA",
+        "android.permission.CAMERA"
+      ],
+      "blockedPermissions": [
         "android.permission.RECORD_AUDIO"
       ]
     },
@@ -34,14 +34,17 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes"
+          "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes, take progress photos, and analyze your skin for personalized skincare tips.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
         }
       ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow LifeLayer to access your photos for AI skin analysis.",
-          "cameraPermission": "Allow LifeLayer to take a photo for AI skin analysis."
+          "photosPermission": "Allow LifeLayer to access your photos to set a profile picture, save progress photos, and analyze your skin for personalized skincare tips.",
+          "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes, take progress photos, and analyze your skin for personalized skincare tips.",
+          "microphonePermission": false
         }
       ],
       [
@@ -51,7 +54,8 @@
           "color": "#5c5ef0",
           "sounds": []
         }
-      ]
+      ],
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": false

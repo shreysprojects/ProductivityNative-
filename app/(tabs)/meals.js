@@ -1,10 +1,11 @@
-import { useState, useCallback, useMemo } from 'react'
+import { useState, useCallback, useMemo, useRef } from 'react'
 import { View, Text, Pressable, ScrollView, StyleSheet, Alert } from 'react-native'
 import { useFocusEffect } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
+import { supabase } from '../../lib/supabase'
 import {
-  getMeals, saveMeal, deleteMeal, today,
+  saveMeal, deleteMeal, today,
   getSavedMeals, upsertSavedMeal, deleteSavedMeal, getRecentMealHistory,
 } from '../../lib/storage'
 import { getUserGoals } from '../../lib/goalsStorage'
@@ -469,15 +470,28 @@ export default function MealsScreen() {
   const [expandedId, setExpandedId] = useState(null)
   const [selectedDate, setSelectedDate] = useState(today())
   const [weekOffset, setWeekOffset] = useState(0)
+  const [loadError, setLoadError] = useState(false)
+  // Which date the meals on screen actually belong to — a failed load for a
+  // day we've already shown keeps the stale list instead of an error page.
+  const loadedDateRef = useRef(null)
 
+  // getMeals() treats a failed fetch and an empty day identically, so the row
+  // is queried directly here: a network failure must not render as
+  // "Nothing logged yet".
   const load = useCallback(async () => {
     if (!user) return
-    const [mealData, goalData] = await Promise.all([
-      getMeals(user.id, selectedDate),
+    const [mealsRes, goalData] = await Promise.all([
+      supabase.from('meals').select('meals').eq('user_id', user.id).eq('date', selectedDate).maybeSingle(),
       getUserGoals(user.id),
     ])
-    setMeals(mealData)
+    if (mealsRes.error) {
+      if (loadedDateRef.current !== selectedDate) setLoadError(true)
+      return
+    }
+    setMeals(mealsRes.data?.meals ?? [])
     setGoals(goalData)
+    setLoadError(false)
+    loadedDateRef.current = selectedDate
   }, [user, selectedDate])
 
   useFocusEffect(useCallback(() => { load() }, [load]))
@@ -525,6 +539,15 @@ export default function MealsScreen() {
         weekOffset={weekOffset}
         onWeekChange={handleWeekChange}
       />
+      {loadError ? (
+        <View style={s.errorWrap}>
+          <Text style={s.errorTitle}>We couldn't load this day</Text>
+          <Text style={s.errorSub}>Check your connection and try again.</Text>
+          <Pressable style={s.errorBtn} onPress={load}>
+            <Text style={s.errorBtnText}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
       <ScrollView contentContainerStyle={s.content}>
       <DailySummary totals={totals} goals={goals} selectedDate={selectedDate} />
 
@@ -602,8 +625,8 @@ export default function MealsScreen() {
           sectionLabel={activeSection.label}
           sectionColor={activeSection.color}
           loadSaved={() => getSavedMeals(user.id)}
-          onSaveTemplate={meal => upsertSavedMeal(user.id, meal)}
-          onDeleteTemplate={id => deleteSavedMeal(user.id, id)}
+          onSaveTemplate={meal => upsertSavedMeal(user.id, meal).catch(e => Alert.alert('Could not save meal', e.message))}
+          onDeleteTemplate={id => deleteSavedMeal(user.id, id).catch(e => Alert.alert('Could not delete meal', e.message))}
           onAdd={handleMealAdded}
           onClose={closeAll}
         />
@@ -620,6 +643,7 @@ export default function MealsScreen() {
         />
       )}
       </ScrollView>
+      )}
     </View>
   )
 }
@@ -684,6 +708,12 @@ function makeStyles(theme) { return StyleSheet.create({
 
   emptyRow: { paddingVertical: 16, alignItems: 'center' },
   emptyText: { fontSize: 14, color: theme.muted, fontStyle: 'italic' },
+
+  errorWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
+  errorTitle: { fontSize: 17, fontWeight: '700', color: theme.text, letterSpacing: -0.2, textAlign: 'center' },
+  errorSub: { fontSize: 13, fontWeight: '500', color: theme.subtext, textAlign: 'center', marginTop: 6, lineHeight: 18 },
+  errorBtn: { borderRadius: 14, paddingVertical: 13, paddingHorizontal: 30, marginTop: 20, backgroundColor: theme.accent },
+  errorBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 
   mealCard: {
     backgroundColor: theme.input, borderRadius: 14, borderWidth: 1.5, borderColor: theme.divider,
