@@ -7,7 +7,6 @@
     "icon": "./assets/icon.png",
     "scheme": "productivityapp",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.shreyj.productivityapp",
@@ -55,7 +54,9 @@
           "sounds": []
         }
       ],
-      "expo-font"
+      "expo-font",
+      "expo-image",
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": false
@@ -71,7 +72,10 @@
       "policy": "sdkVersion"
     },
     "updates": {
-      "url": "https://u.expo.dev/a3a61b51-3b0b-4f6f-8ddb-e07fba21ec41"
+      "url": "https://u.expo.dev/a3a61b51-3b0b-4f6f-8ddb-e07fba21ec41",
+      "requestHeaders": {
+        "expo-channel-name": "main"
+      }
     }
   }
 }
