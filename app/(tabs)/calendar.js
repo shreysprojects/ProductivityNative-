@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView,
   Modal, TextInput, Alert, KeyboardAvoidingView, Platform,
+  Animated, PanResponder, Keyboard, Dimensions,
 } from 'react-native'
 import * as Notifications from 'expo-notifications'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -21,7 +22,6 @@ import DayLogTimeline from '../../components/DayLogTimeline'
 import ScanScheduleModal from '../../components/ScanScheduleModal'
 import ClassAttendancePrompt from '../../components/ClassAttendancePrompt'
 import { syncClassNotifications } from '../../lib/classNotifications'
-import { getProtocols, getProtocolJournals, deleteProtocolJournal, deleteProtocolReset } from '../../lib/protocolStorage'
 import {
   getLogSettings, getAllTimeLogs, slotStarts, DEFAULT_LOG_SETTINGS,
   autoLogSpan, dismissAutoLog, unloggedMarkers, timeToMins, nowMins,
@@ -333,6 +333,18 @@ export default function CalendarScreen() {
   const [cTo, setCTo]             = useState('')
   const [cSaving, setCeSaving]    = useState(false)
 
+  // Drag-down-to-dismiss for the class sheet. Tapping a class autofocuses the
+  // course-name field, so the sheet opens with the keyboard up and almost no
+  // backdrop left to tap — the grabber has to be a real handle, not decoration.
+  const classDragY   = useRef(new Animated.Value(0)).current
+  // Backdrop fades with the pull so a drag reads as a dismissal, not a nudge.
+  const classBackdrop = useRef(classDragY.interpolate({
+    inputRange: [0, 260], outputRange: [1, 0], extrapolate: 'clamp',
+  })).current
+  // Pulling the form itself only dismisses when it is already scrolled to the
+  // top; anywhere else the ScrollView keeps the gesture.
+  const classAtTop   = useRef(true)
+
   // To-dos
   const [tasks, setTasks]               = useState([])
   const [bucket, setBucket]             = useState('today')
@@ -365,12 +377,6 @@ export default function CalendarScreen() {
   const [journalEntries, setJournalEntries] = useState({})
   const [journalOpen, setJournalOpen]       = useState(false)
   const [jReadOnly, setJReadOnly]           = useState(false)
-  // Reading a protocol journal reuses the same full-screen page with its own
-  // title (the protocol's name instead of the date).
-  const [jTitleOverride, setJTitleOverride] = useState(null)
-  const [protocolJournals, setProtocolJournals] = useState({})
-  // Counter resets by date: { [day]: [{ id, name, emoji }] }
-  const [protocolResets, setProtocolResets] = useState({})
   const [jDate, setJDate]                   = useState(null)
   const [jMood, setJMood]                   = useState(null)
   const [jText, setJText]                   = useState('')
@@ -409,18 +415,6 @@ export default function CalendarScreen() {
         // Never let the time-log sync take the whole calendar down with it.
         getAllTimeLogs(user.id).catch(() => ({})),
       ])
-      // Additive — a failed fetch must not break the rest of the calendar.
-      getProtocolJournals(user.id).then(setProtocolJournals).catch(() => {})
-      getProtocols(user.id).then(list => {
-        const m = {}
-        for (const p of list) {
-          for (const r of p.resets ?? []) {
-            if (!r?.date) continue
-            ;(m[r.date] ??= []).push({ id: r.id, protocolId: p.id, name: p.name, emoji: p.emoji ?? '🛟' })
-          }
-        }
-        setProtocolResets(m)
-      }).catch(() => {})
       setLogSettings(lSettings)
       const counts = {}
       for (const [d, slots] of Object.entries(allLogs)) counts[d] = Object.keys(slots).length
@@ -453,7 +447,6 @@ export default function CalendarScreen() {
         setJMood(existing?.mood ?? null)
         setJText(existing?.text ?? '')
         setJReadOnly(false) // this path always opens today
-        setJTitleOverride(null)
         setJournalOpen(true)
         router.setParams({ openJournal: undefined })
       }
@@ -611,6 +604,8 @@ export default function CalendarScreen() {
     setCSH('8'); setCSM('00'); setCSAp('AM')
     setCEH('9'); setCEM('00'); setCEAp('AM')
     setCColor('#3b82f6'); setCFrom(''); setCTo('')
+    classDragY.setValue(0)
+    classAtTop.current = true
     setClassOpen(true)
   }
 
@@ -623,8 +618,59 @@ export default function CalendarScreen() {
     setCColor(item.color ?? '#3b82f6')
     setCFrom(item.semesterStart ? fmtDateForInput(item.semesterStart) : '')
     setCTo(item.semesterEnd ? fmtDateForInput(item.semesterEnd) : '')
+    classDragY.setValue(0)
+    classAtTop.current = true
     setClassOpen(true)
   }
+
+  // Slide the sheet the rest of the way out, then unmount it. The travel is a
+  // screen height rather than the measured sheet height because dismissing the
+  // keyboard re-lays the sheet out taller mid-animation. Resetting the offset
+  // after the modal is gone keeps the next open from starting off screen.
+  const closeClassSheet = useCallback(() => {
+    Keyboard.dismiss()
+    Animated.timing(classDragY, {
+      toValue: Dimensions.get('window').height, duration: 180, useNativeDriver: true,
+    }).start(() => {
+      setClassOpen(false)
+      setEditingClass(null)
+      classDragY.setValue(0)
+    })
+  }, [classDragY])
+
+  // Shared drag behaviour for both grab points. The keyboard is dismissed the
+  // moment a drag starts: it is what the user is reaching past, and the sheet
+  // cannot travel down into space the keyboard still occupies.
+  const classDragHandlers = useRef({
+    onPanResponderGrant: () => { Keyboard.dismiss() },
+    onPanResponderMove: (_, g) => { classDragY.setValue(Math.max(0, g.dy)) },
+    // The ScrollView asks for the gesture back once it starts moving; refusing
+    // keeps a pull that began as a dismissal a dismissal.
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderRelease: (_, g) => {
+      // A long pull or a quick flick closes; anything shorter snaps back.
+      if (g.dy > 120 || (g.dy > 40 && g.vy > 0.6)) closeClassSheet()
+      else Animated.spring(classDragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+    onPanResponderTerminate: () => {
+      Animated.spring(classDragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+  }).current
+
+  // The grabber and title: always draggable, wherever the form is scrolled to.
+  const classHandlePan = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    ...classDragHandlers,
+  })).current
+
+  // The form body: claims the gesture only on a clear downward pull from the
+  // top of the scroll, so ordinary scrolling and field taps are untouched.
+  const classBodyPan = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) =>
+      classAtTop.current && g.dy > 8 && g.dy > Math.abs(g.dx),
+    ...classDragHandlers,
+  })).current
 
   async function handleSaveEvent() {
     if (!newTitle.trim()) { Alert.alert('Missing title'); return }
@@ -725,31 +771,6 @@ export default function CalendarScreen() {
         },
       },
     ])
-  }
-
-  // "Forget that day": erase one reset record from the calendar. The
-  // protocol's live counter is untouched — this only rewrites history.
-  function handleForgetReset(r, date) {
-    Alert.alert(
-      'Forget this reset?',
-      `The reset mark for "${r.name}" will be removed from this day. The running counter isn't affected.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Forget it', style: 'destructive',
-          onPress: async () => {
-            await deleteProtocolReset(user.id, r.protocolId, r.id)
-            setProtocolResets(prev => {
-              const list = (prev[date] ?? []).filter(x => x.id !== r.id)
-              const next = { ...prev }
-              if (list.length) next[date] = list
-              else delete next[date]
-              return next
-            })
-          },
-        },
-      ]
-    )
   }
 
   function handleWeekEventPress(ev) {
@@ -945,41 +966,11 @@ export default function CalendarScreen() {
     const canWrite = date <= today && date >= addDays(today, -2)
     const existing = journalEntries[date]
     if (!canWrite && !existing) return
-    setJTitleOverride(null)
     setJReadOnly(!canWrite)
     setJDate(date)
     setJMood(existing?.mood ?? null)
     setJText(existing?.text ?? '')
     setJournalOpen(true)
-  }
-
-  // Protocol journals are written on the protocol screen; here they only read.
-  function openProtocolJournal(entry) {
-    setJTitleOverride(`🛟 ${entry.protocolName}`)
-    setJReadOnly(true)
-    setJDate(entry.date)
-    setJMood(null)
-    setJText(entry.text ?? '')
-    setJournalOpen(true)
-  }
-
-  function handleDeleteProtocolJournal(entry) {
-    Alert.alert('Delete Protocol Journal?', 'This entry will be permanently deleted.', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete', style: 'destructive',
-        onPress: async () => {
-          await deleteProtocolJournal(user.id, entry.id, entry.date)
-          setProtocolJournals(prev => {
-            const list = (prev[entry.date] ?? []).filter(e => e.id !== entry.id)
-            const next = { ...prev }
-            if (list.length) next[entry.date] = list
-            else delete next[entry.date]
-            return next
-          })
-        },
-      },
-    ])
   }
 
   async function handleDeleteJournal(date) {
@@ -1146,9 +1137,6 @@ export default function CalendarScreen() {
                         {journalEntries[ds] && (
                           <View style={[s.eventDot, { backgroundColor: '#0ea5e9' }]} />
                         )}
-                        {(protocolJournals[ds]?.length > 0 || protocolResets[ds]?.length > 0) && (
-                          <View style={[s.eventDot, { backgroundColor: '#ec4899' }]} />
-                        )}
                         {logSettings.enabled && logCounts[ds] > 0 && (
                           <View style={[s.eventDot, { backgroundColor: '#14b8a6' }]} />
                         )}
@@ -1161,7 +1149,7 @@ export default function CalendarScreen() {
 
             <View style={[s.legendDivider, { backgroundColor: theme.divider }]} />
             <View style={s.legend}>
-              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],['#ec4899','Protocol'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
+              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
                 <View key={l} style={s.legendItem}>
                   <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
                   <Text style={[s.legendText, { color: theme.muted }]}>{l}</Text>
@@ -1326,62 +1314,6 @@ export default function CalendarScreen() {
                   </View>
                 )
               })()}
-
-              {/* ── Protocol journals — written after completing a protocol ── */}
-              {(protocolJournals[selected] ?? []).length > 0 && (
-                <View style={s.journalSection}>
-                  <Text style={[s.sectionLabel, { color: theme.muted, marginBottom: 8 }]}>PROTOCOL JOURNALS</Text>
-                  {(protocolJournals[selected] ?? []).map(entry => (
-                    <Pressable
-                      key={entry.id}
-                      style={[s.journalPreview, {
-                        backgroundColor: theme.isDark ? '#2a1c28' : '#fdf2f8',
-                        borderColor: '#ec489944', marginBottom: 8,
-                      }]}
-                      onPress={() => openProtocolJournal(entry)}
-                    >
-                      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                        <Text style={{ fontSize: 12.5, fontWeight: '800', color: '#ec4899', flex: 1 }} numberOfLines={1}>
-                          🛟 {entry.protocolName}
-                        </Text>
-                        <Pressable hitSlop={10} onPress={() => handleDeleteProtocolJournal(entry)}>
-                          <Text style={{ fontSize: 13, fontWeight: '700', color: theme.muted }}>✕</Text>
-                        </Pressable>
-                      </View>
-                      <Text style={[s.journalPreviewText, { color: theme.subtext, marginTop: 4 }]} numberOfLines={3}>
-                        {entry.text}
-                      </Text>
-                      <Text style={[s.journalPreviewStats, { color: theme.muted }]}>
-                        {readingStats(entry.text)}
-                        <Text style={{ color: theme.accent }}>  ·  Tap to read</Text>
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-              )}
-
-              {/* ── Protocol counter resets ── */}
-              {(protocolResets[selected] ?? []).length > 0 && (
-                <>
-                  <Text style={[s.sectionLabel, { color: theme.muted }]}>PROTOCOL RESETS</Text>
-                  {(protocolResets[selected] ?? []).map(r => (
-                    <View key={r.id} style={[s.routineRow, { borderBottomColor: theme.divider }]}>
-                      <View style={[s.routineDot, { backgroundColor: '#ec4899' }]} />
-                      <Text style={[s.routineName, { color: theme.text }]}>
-                        {r.emoji} {r.name}
-                        <Text style={{ color: theme.muted, fontWeight: '600', fontSize: 12 }}>  ·  counter reset</Text>
-                      </Text>
-                      <Pressable
-                        onPress={() => handleForgetReset(r, selected)}
-                        hitSlop={8}
-                        style={[s.forgetResetBtn, { borderColor: '#ec489955' }]}
-                      >
-                        <Text style={s.forgetResetText}>✕ Forget</Text>
-                      </Pressable>
-                    </View>
-                  ))}
-                </>
-              )}
 
               {selectedEntries.length > 0 && (
                 <>
@@ -1859,94 +1791,114 @@ export default function CalendarScreen() {
       </Modal>
 
       {/* ── Add / Edit Class modal ─────────────────────────────────────────── */}
-      <Modal visible={classOpen} transparent animationType="slide" onRequestClose={() => setClassOpen(false)}>
+      <Modal visible={classOpen} transparent animationType="slide" onRequestClose={closeClassSheet}>
         <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <Pressable style={[StyleSheet.absoluteFillObject, s.modalBg]} onPress={() => setClassOpen(false)} />
-          <View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card }]}>
-            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <Animated.View
+            pointerEvents="none"
+            style={[StyleSheet.absoluteFillObject, s.modalBg, { opacity: classBackdrop }]}
+          />
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={closeClassSheet} />
+          <Animated.View
+            style={[s.modalSheet, s.classSheet, {
+              backgroundColor: theme.card,
+              transform: [{ translateY: classDragY }],
+            }]}
+          >
+            {/* Grab area: the whole header, not just the 4px bar, so the sheet
+                can be pulled down even with the keyboard covering the rest. */}
+            <View {...classHandlePan.panHandlers} style={s.sheetGrabArea}>
               <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
               <Text style={[s.modalTitle, { color: theme.text }]}>{editingClass ? 'Edit Class' : 'Add Class'}</Text>
-
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>COURSE NAME</Text>
-              <TextInput
-                style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                placeholder='e.g. "MATH 133-001"'
-                placeholderTextColor={theme.muted}
-                value={cTitle} onChangeText={setCTitle} autoFocus returnKeyType="next"
-              />
-
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION (optional)</Text>
-              <TextInput
-                style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                placeholder='e.g. "McConnell Engineering B202"'
-                placeholderTextColor={theme.muted}
-                value={cLoc} onChangeText={setCLoc} returnKeyType="next"
-              />
-
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>DAYS</Text>
-              <View style={s.daysRow}>
-                {WEEK_DAY_BTNS.map(d => {
-                  const on = cDays.includes(d.value)
-                  return (
-                    <Pressable
-                      key={d.value}
-                      style={[s.dayBtn, { backgroundColor: on ? theme.accent : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
-                      onPress={() => setCDays(prev => on ? prev.filter(v => v !== d.value) : [...prev, d.value])}
-                    >
-                      <Text style={[s.dayBtnText, { color: on ? '#fff' : theme.subtext }]}>{d.label}</Text>
-                    </Pressable>
-                  )
-                })}
-              </View>
-
-              <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
-              <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
-
-              <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>END TIME</Text>
-              <TimeInput h={cEH} m={cEM} ap={cEAp} onH={setCEH} onM={setCEM} onAp={setCEAp} theme={theme} />
-
-              <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>COLOR</Text>
-              <View style={s.colorRow}>
-                {SCHEDULE_COLORS.map(c => (
-                  <Pressable
-                    key={c}
-                    style={[s.colorSwatch, { backgroundColor: c }, cColor === c && s.colorSwatchActive]}
-                    onPress={() => setCColor(c)}
-                  />
-                ))}
-              </View>
-
-              <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>SEMESTER DATE RANGE (optional)</Text>
-              <View style={s.semRow}>
-                <TextInput
-                  style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                  placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
-                  value={cFrom} onChangeText={setCFrom} keyboardType="numbers-and-punctuation" maxLength={10}
-                />
-                <Text style={[s.semArrow, { color: theme.muted }]}>→</Text>
-                <TextInput
-                  style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                  placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
-                  value={cTo} onChangeText={setCTo} keyboardType="numbers-and-punctuation" maxLength={10}
-                />
-              </View>
-              <Text style={[s.hint, { color: theme.muted }]}>Leave blank to show every week indefinitely</Text>
-
-              <Pressable
-                style={[s.saveBtn, { backgroundColor: theme.accent, opacity: cSaving ? 0.6 : 1, marginBottom: 8 }]}
-                onPress={handleSaveClass} disabled={cSaving}
+            </View>
+            <View {...classBodyPan.panHandlers} style={s.sheetFormWrap}>
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                bounces={false}
+                scrollEventThrottle={16}
+                onScroll={e => { classAtTop.current = e.nativeEvent.contentOffset.y <= 0 }}
               >
-                <Text style={s.saveBtnText}>
-                  {cSaving ? 'Saving…' : editingClass ? 'Save Changes' : 'Add to Schedule'}
-                </Text>
-              </Pressable>
-              {!!editingClass && (
-                <Pressable onPress={handleDeleteClass} hitSlop={8} style={s.deleteClassBtn}>
-                  <Text style={s.deleteClassText}>Delete Class</Text>
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>COURSE NAME</Text>
+                <TextInput
+                  style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                  placeholder='e.g. "MATH 133-001"'
+                  placeholderTextColor={theme.muted}
+                  value={cTitle} onChangeText={setCTitle} autoFocus returnKeyType="next"
+                />
+  
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION (optional)</Text>
+                <TextInput
+                  style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                  placeholder='e.g. "McConnell Engineering B202"'
+                  placeholderTextColor={theme.muted}
+                  value={cLoc} onChangeText={setCLoc} returnKeyType="next"
+                />
+  
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>DAYS</Text>
+                <View style={s.daysRow}>
+                  {WEEK_DAY_BTNS.map(d => {
+                    const on = cDays.includes(d.value)
+                    return (
+                      <Pressable
+                        key={d.value}
+                        style={[s.dayBtn, { backgroundColor: on ? theme.accent : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                        onPress={() => setCDays(prev => on ? prev.filter(v => v !== d.value) : [...prev, d.value])}
+                      >
+                        <Text style={[s.dayBtnText, { color: on ? '#fff' : theme.subtext }]}>{d.label}</Text>
+                      </Pressable>
+                    )
+                  })}
+                </View>
+  
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
+                <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
+  
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>END TIME</Text>
+                <TimeInput h={cEH} m={cEM} ap={cEAp} onH={setCEH} onM={setCEM} onAp={setCEAp} theme={theme} />
+  
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>COLOR</Text>
+                <View style={s.colorRow}>
+                  {SCHEDULE_COLORS.map(c => (
+                    <Pressable
+                      key={c}
+                      style={[s.colorSwatch, { backgroundColor: c }, cColor === c && s.colorSwatchActive]}
+                      onPress={() => setCColor(c)}
+                    />
+                  ))}
+                </View>
+  
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>SEMESTER DATE RANGE (optional)</Text>
+                <View style={s.semRow}>
+                  <TextInput
+                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
+                    value={cFrom} onChangeText={setCFrom} keyboardType="numbers-and-punctuation" maxLength={10}
+                  />
+                  <Text style={[s.semArrow, { color: theme.muted }]}>→</Text>
+                  <TextInput
+                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
+                    value={cTo} onChangeText={setCTo} keyboardType="numbers-and-punctuation" maxLength={10}
+                  />
+                </View>
+                <Text style={[s.hint, { color: theme.muted }]}>Leave blank to show every week indefinitely</Text>
+  
+                <Pressable
+                  style={[s.saveBtn, { backgroundColor: theme.accent, opacity: cSaving ? 0.6 : 1, marginBottom: 8 }]}
+                  onPress={handleSaveClass} disabled={cSaving}
+                >
+                  <Text style={s.saveBtnText}>
+                    {cSaving ? 'Saving…' : editingClass ? 'Save Changes' : 'Add to Schedule'}
+                  </Text>
                 </Pressable>
-              )}
-            </ScrollView>
-          </View>
+                {!!editingClass && (
+                  <Pressable onPress={handleDeleteClass} hitSlop={8} style={s.deleteClassBtn}>
+                    <Text style={s.deleteClassText}>Delete Class</Text>
+                  </Pressable>
+                )}
+              </ScrollView>
+            </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
 
@@ -2046,7 +1998,7 @@ export default function CalendarScreen() {
               <Text style={[s.journalClose, { color: theme.muted }]}>✕</Text>
             </Pressable>
             <Text style={[s.journalHeaderTitle, { color: theme.text }]} numberOfLines={1}>
-              {jTitleOverride ?? (jDate ? formatDate(jDate) : 'Journal')}
+              {jDate ? formatDate(jDate) : 'Journal'}
             </Text>
             {jReadOnly ? (
               // Spacer the width of the Save button, so the title stays centered.
@@ -2282,6 +2234,12 @@ const s = StyleSheet.create({
     shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
   },
   classSheet: { maxHeight: '92%' },
+  // Full-bleed header strip so the grabber's touch target is the whole width,
+  // not the 40px bar. Negative margin cancels the sheet's own side padding.
+  sheetGrabArea: { marginHorizontal: -24, paddingHorizontal: 24, paddingTop: 4 },
+  // Lets the form shrink inside the sheet's maxHeight so the ScrollView stays
+  // bounded now that the header sits outside it.
+  sheetFormWrap: { flexShrink: 1 },
   modalHandle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 20 },
   modalTitle: { fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 16 },
 
@@ -2309,8 +2267,6 @@ const s = StyleSheet.create({
   saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
   deleteClassBtn: { alignItems: 'center', paddingVertical: 12, marginBottom: 4 },
   deleteClassText: { fontSize: 14, fontWeight: '700', color: '#ef4444' },
-  forgetResetBtn: { borderWidth: 1.5, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
-  forgetResetText: { fontSize: 11.5, fontWeight: '800', color: '#ec4899' },
 
   // Tasks view
   // Week view pane switcher (Time log / Schedule)

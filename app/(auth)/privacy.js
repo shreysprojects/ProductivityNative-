@@ -90,7 +90,7 @@ export default function Privacy() {
 
         <Section title="AI features and third-party processing">
           <P>
-            Some features are powered by AI: routine generation, routine advice, the protocol AI chat,
+            Some features are powered by AI: routine generation, routine advice,
             importing a workout from a screenshot, importing a class schedule from a screenshot of your
             timetable, and skin and hair analysis. When you use one of these, the relevant text or image is sent
             through our secure server to OpenAI for one-time processing, and the result comes back to you.
@@ -98,13 +98,6 @@ export default function Privacy() {
           <P>
             <Text style={s.strong}>We do not store those images or inputs after the request finishes.</Text>{' '}
             OpenAI processes them as our service provider so that we can return your result.
-          </P>
-          <P>
-            <Text style={s.strong}>Protocol AI chat.</Text> What you type in the protocol AI chat — which can
-            include sensitive things, like a habit you are trying to quit or how you are feeling — is sent the
-            same way, to OpenAI through our secure server, only to generate each reply. It is not used to train
-            AI models, and LifeLayer does not keep the conversation once the chat ends. The chat is not a
-            substitute for professional help, and crisis resources are available in the app.
           </P>
           <P>
             Content you post publicly, and profile pictures, are automatically screened for safety before they go
