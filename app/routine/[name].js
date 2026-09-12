@@ -30,6 +30,9 @@ import { supabase } from '../../lib/supabase'
 import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
 import { autoLogSpan } from '../../lib/timeLogging'
 import { maybePromptReview } from '../../lib/review'
+import {
+  getSleep, startSleep, cancelSleep, wakeUp, sleepDurationShort, clockLabel,
+} from '../../lib/sleepStorage'
 
 const CELL_W = Math.floor((Dimensions.get('window').width - 20 - 24) / 7)
 const CELL_H = CELL_W
@@ -395,6 +398,213 @@ function WeightTracker({ userId, theme, color, morningSettings, onUpdateSettings
     </View>
   )
 }
+
+// ── Looks section ─────────────────────────────────────────────────────────
+
+// ── Night: sleep tracker ──────────────────────────────────────────────────
+// The Night counterpart of the weight tracker: set the time you're going to
+// sleep (and, optionally, when you want to be up). The home dashboard then
+// shows how long you've slept and asks whether you're up; each night is logged.
+
+const SLEEP_BLUE = '#3b82f6'
+
+function timeParts(ms) {
+  const d = new Date(ms)
+  const h = d.getHours()
+  return { h: String(h % 12 || 12), m: String(d.getMinutes()).padStart(2, '0'), ap: h >= 12 ? 'PM' : 'AM' }
+}
+
+// h:m AM/PM form fields → minutes since midnight, or null when invalid.
+function partsToMins(h, m, ap) {
+  const hi = parseInt(h, 10), mi = parseInt(m, 10)
+  if (isNaN(hi) || isNaN(mi) || hi < 1 || hi > 12 || mi < 0 || mi > 59) return null
+  let h24 = hi
+  if (ap === 'PM' && hi < 12) h24 += 12
+  if (ap === 'AM' && hi === 12) h24 = 0
+  return h24 * 60 + mi
+}
+
+function SleepTimeField({ h, m, ap, onH, onM, onAp, theme, color }) {
+  return (
+    <View style={sl.timeField}>
+      <TextInput
+        style={[sl.timeInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+        value={h} onChangeText={onH} keyboardType="number-pad" maxLength={2}
+        placeholder="—" placeholderTextColor={theme.muted}
+      />
+      <Text style={[sl.timeColon, { color: theme.muted }]}>:</Text>
+      <TextInput
+        style={[sl.timeInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+        value={m} onChangeText={onM} keyboardType="number-pad" maxLength={2}
+        placeholder="—" placeholderTextColor={theme.muted}
+      />
+      <View style={[sl.apToggle, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
+        {['AM', 'PM'].map(v => (
+          <Pressable key={v} style={[sl.apBtn, ap === v && { backgroundColor: color }]} onPress={() => onAp(v)}>
+            <Text style={[sl.apText, { color: ap === v ? '#fff' : theme.subtext }]}>{v}</Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  )
+}
+
+function SleepTracker({ userId, theme, color }) {
+  const [sleep, setSleep] = useState({ session: null, logs: [] })
+  const [busy, setBusy] = useState(false)
+  const now = timeParts(Date.now())
+  const [sh, setSH] = useState(now.h)
+  const [sm, setSM] = useState(now.m)
+  const [sap, setSAp] = useState(now.ap)
+  const [wh, setWH] = useState('')
+  const [wm, setWM] = useState('')
+  const [wap, setWAp] = useState('AM')
+  const [, setTick] = useState(0)
+
+  useFocusEffect(useCallback(() => {
+    getSleep(userId).then(setSleep).catch(() => {})
+  }, [userId]))
+
+  // While asleep the "so far" figure keeps moving.
+  useEffect(() => {
+    if (!sleep.session) return
+    const id = setInterval(() => setTick(t => t + 1), 30000)
+    return () => clearInterval(id)
+  }, [sleep.session])
+
+  async function setSleepTime() {
+    const sMins = partsToMins(sh, sm, sap)
+    if (sMins === null) { Alert.alert('Check the time', 'Use hours 1 to 12 and minutes 0 to 59.'); return }
+    const d = new Date()
+    d.setHours(Math.floor(sMins / 60), sMins % 60, 0, 0)
+    let sleepAt = d.getTime()
+    // More than six hours ahead reads as "last night" (logging in the small
+    // hours); anything nearer is tonight, even a little in the future.
+    if (sleepAt > Date.now() + 6 * 3600000) sleepAt -= 86400000
+
+    let wakeGoalAt = null
+    if (wh.trim() || wm.trim()) {
+      const wMins = partsToMins(wh, wm.trim() ? wm : '0', wap)
+      if (wMins === null) { Alert.alert('Check the wake-up time', 'Use hours 1 to 12 and minutes 0 to 59, or leave it blank.'); return }
+      const w = new Date(sleepAt)
+      w.setHours(Math.floor(wMins / 60), wMins % 60, 0, 0)
+      wakeGoalAt = w.getTime()
+      if (wakeGoalAt <= sleepAt) wakeGoalAt += 86400000
+    }
+
+    setBusy(true)
+    try {
+      setSleep(await startSleep(userId, { sleepAt, wakeGoalAt }))
+    } catch (e) {
+      Alert.alert('Could not save', String(e?.message ?? e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function handleWake() {
+    try { setSleep(await wakeUp(userId)) } catch (e) { Alert.alert('Could not save', String(e?.message ?? e)) }
+  }
+  async function handleCancel() {
+    try { setSleep(await cancelSleep(userId)) } catch (e) { Alert.alert('Could not save', String(e?.message ?? e)) }
+  }
+
+  const session = sleep.session
+  const logs = sleep.logs ?? []
+  const last = logs[0]
+  const recent = logs.slice(0, 7)
+  const avgMins = recent.length ? Math.round(recent.reduce((s, l) => s + (l.minutes || 0), 0) / recent.length) : null
+  const asleepFor = session && Date.now() > session.sleepAt ? Date.now() - session.sleepAt : 0
+
+  return (
+    <View style={[wt.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+      <View style={wt.header}>
+        <Text style={[wt.title, { color: theme.text }]}>🌙  Sleep Tracker</Text>
+      </View>
+      <Text style={[wt.tip, { color: theme.subtext }]}>
+        Set the time you're going to sleep. Next time you open the app, the home page shows how long you slept and asks if you're up.
+      </Text>
+
+      {session ? (
+        <>
+          <View style={[wt.loggedRow, { backgroundColor: color + '12', borderColor: color + '28' }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[wt.loggedValue, { color, fontSize: 17 }]}>Sleeping since {clockLabel(session.sleepAt)}</Text>
+              <Text style={[wt.loggedLabel, { color: theme.subtext, marginTop: 2 }]}>
+                {session.wakeGoalAt ? `Wake-up at ${clockLabel(session.wakeGoalAt)}` : 'No wake-up time set'}
+                {asleepFor > 0 ? `  ·  ${sleepDurationShort(asleepFor)} so far` : ''}
+              </Text>
+            </View>
+          </View>
+          <View style={sl.actionRow}>
+            <Pressable style={[sl.actionBtn, { backgroundColor: SLEEP_BLUE }]} onPress={handleWake}>
+              <Text style={sl.actionText}>I woke up</Text>
+            </Pressable>
+            <Pressable style={[sl.actionBtn, { backgroundColor: '#ef4444' }]} onPress={handleCancel}>
+              <Text style={sl.actionText}>Cancel</Text>
+            </Pressable>
+          </View>
+        </>
+      ) : (
+        <View style={sl.form}>
+          <View style={sl.labelRow}>
+            <Text style={[sl.label, { color: theme.subtext }]}>GOING TO SLEEP AT</Text>
+            <Pressable onPress={() => { const p = timeParts(Date.now()); setSH(p.h); setSM(p.m); setSAp(p.ap) }} hitSlop={8}>
+              <Text style={[sl.link, { color }]}>Use now</Text>
+            </Pressable>
+          </View>
+          <SleepTimeField h={sh} m={sm} ap={sap} onH={setSH} onM={setSM} onAp={setSAp} theme={theme} color={color} />
+
+          <Text style={[sl.label, { color: theme.subtext, marginTop: 14 }]}>WAKE UP AT (optional)</Text>
+          <SleepTimeField h={wh} m={wm} ap={wap} onH={setWH} onM={setWM} onAp={setWAp} theme={theme} color={color} />
+          <Text style={[sl.hint, { color: theme.muted }]}>Set one and you'll get a notification at that time.</Text>
+
+          <Pressable
+            style={[sl.setBtn, { backgroundColor: color, opacity: busy ? 0.6 : 1 }]}
+            onPress={setSleepTime}
+            disabled={busy}
+          >
+            <Text style={sl.setBtnText}>{busy ? 'Saving…' : 'Set sleep time'}</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {(last || avgMins !== null) && (
+        <View style={[wt.goalRow, { borderTopColor: theme.divider }]}>
+          <Text style={[wt.goalLabel, { color: theme.subtext }]}>Last night</Text>
+          <Text style={[wt.goalValue, { color: theme.text }]}>
+            {last ? sleepDurationShort((last.minutes || 0) * 60000) : '—'}
+            {avgMins !== null && recent.length > 1
+              ? `  ·  ${sleepDurationShort(avgMins * 60000)} avg over ${recent.length} nights`
+              : ''}
+          </Text>
+        </View>
+      )}
+    </View>
+  )
+}
+
+const sl = StyleSheet.create({
+  form: { paddingHorizontal: 16, paddingBottom: 14 },
+  labelRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  label: { fontSize: 10, fontWeight: '800', letterSpacing: 1.3, marginBottom: 8 },
+  link: { fontSize: 12, fontWeight: '700', marginBottom: 8 },
+  hint: { fontSize: 11.5, fontWeight: '500', marginTop: 8, lineHeight: 16 },
+  timeField: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  timeInput: {
+    width: 54, borderRadius: 10, borderWidth: 1.5, paddingVertical: 8,
+    fontSize: 16, fontWeight: '700', textAlign: 'center',
+  },
+  timeColon: { fontSize: 18, fontWeight: '700' },
+  apToggle: { flexDirection: 'row', borderRadius: 10, padding: 3, marginLeft: 6 },
+  apBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  apText: { fontSize: 12, fontWeight: '800' },
+  setBtn: { borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginTop: 14 },
+  setBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
+  actionRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingBottom: 14 },
+  actionBtn: { flex: 1, borderRadius: 12, paddingVertical: 11, alignItems: 'center' },
+  actionText: { color: '#fff', fontWeight: '800', fontSize: 14 },
+})
 
 // ── Looks section ─────────────────────────────────────────────────────────
 
@@ -2841,6 +3051,11 @@ export default function RoutineScreen() {
               </View>
             )}
           </>
+        )}
+
+        {/* ── Night: sleep tracker (main routine only) ── */}
+        {isNight && !isAlt && (
+          <SleepTracker userId={user.id} theme={theme} color={card.color} />
         )}
 
       </ScrollView>
