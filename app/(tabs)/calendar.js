@@ -388,6 +388,11 @@ export default function CalendarScreen() {
   const [cFrom, setCFrom]         = useState('')
   const [cTo, setCTo]             = useState('')
   const [cType, setCType]         = useState('Lecture')
+  // Some slots are shared across weeks (week A in one room as a lecture, week
+  // B elsewhere as a tutorial): a second location and type ride in meta.
+  const [cMulti, setCMulti]       = useState(false)
+  const [cLoc2, setCLoc2]         = useState('')
+  const [cType2, setCType2]       = useState(null)
   const [cSaving, setCeSaving]    = useState(false)
 
   // Drag-down-to-dismiss for the class sheet. Tapping a class autofocuses the
@@ -627,7 +632,8 @@ export default function CalendarScreen() {
       const courseName = item.meta?.courseName && item.meta.courseName !== courseCode
         ? item.meta.courseName
         : item.title
-      const hay = [item.title, courseCode, courseName, type, item.location].filter(Boolean).join(' ').toLowerCase()
+      const hay = [item.title, courseCode, courseName, type, item.location, item.meta?.location2, item.meta?.type2]
+        .filter(Boolean).join(' ').toLowerCase()
       for (const dow of item.days) {
         const dayName = DAY_FULL[dow] ?? ''
         if (!hay.includes(q) && !dayName.toLowerCase().startsWith(q)) continue
@@ -762,6 +768,7 @@ export default function CalendarScreen() {
     setCEH('9'); setCEM('00'); setCEAp('AM')
     setCColor('#3b82f6'); setCFrom(''); setCTo('')
     setCType('Lecture')
+    setCMulti(false); setCLoc2(''); setCType2(null)
     classDragY.setValue(0)
     classAtTop.current = true
     setClassOpen(true)
@@ -775,6 +782,9 @@ export default function CalendarScreen() {
     setCEH(et.h); setCEM(et.m); setCEAp(et.ap)
     setCColor(item.color ?? '#3b82f6')
     setCType(CLASS_TYPES.includes(item.meta?.type) ? item.meta.type : (item.meta?.type ? 'Other' : 'Lecture'))
+    setCMulti(!!item.meta?.multiUse)
+    setCLoc2(item.meta?.location2 ?? '')
+    setCType2(CLASS_TYPES.includes(item.meta?.type2) ? item.meta.type2 : null)
     setCFrom(item.semesterStart ? fmtDateForInput(item.semesterStart) : '')
     setCTo(item.semesterEnd ? fmtDateForInput(item.semesterEnd) : '')
     classDragY.setValue(0)
@@ -911,7 +921,13 @@ export default function CalendarScreen() {
     }
     // The type lives in meta next to the scan's course code/name; only the
     // type changes here, the rest is kept.
-    item.meta = { ...(editingClass?.meta ?? {}), type: cType }
+    item.meta = {
+      ...(editingClass?.meta ?? {}),
+      type: cType,
+      multiUse: cMulti,
+      location2: cMulti ? (cLoc2.trim() || null) : null,
+      type2: cMulti ? cType2 : null,
+    }
     // A club meeting's card shows meta.courseCode, so a rename here has to
     // reach it too (the club itself is renamed from the Routines page).
     if (item.meta?.type === 'Club') {
@@ -1771,6 +1787,15 @@ export default function CalendarScreen() {
                     {!!r.location && (
                       <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {r.location}</Text>
                     )}
+                    {r.item.meta?.multiUse && (r.item.meta.location2 || r.item.meta.type2) ? (
+                      <>
+                        <Text style={[s.dayClassOr, { color: r.color }]}>OR</Text>
+                        <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>
+                          {r.item.meta.location2 ? `⌖ ${r.item.meta.location2}` : 'Same room'}
+                          {r.item.meta.type2 ? <Text style={{ color: theme.muted }}>  ·  {r.item.meta.type2}</Text> : null}
+                        </Text>
+                      </>
+                    ) : null}
                   </Pressable>
                 ))}
               </View>
@@ -1838,6 +1863,16 @@ export default function CalendarScreen() {
                       {!!ev.location && (
                         <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {ev.location}</Text>
                       )}
+                      {/* A slot used differently on other weeks: the second room and its type */}
+                      {ev.meta?.multiUse && (ev.meta.location2 || ev.meta.type2) ? (
+                        <>
+                          <Text style={[s.dayClassOr, { color: accent }]}>OR</Text>
+                          <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>
+                            {ev.meta.location2 ? `⌖ ${ev.meta.location2}` : 'Same room'}
+                            {ev.meta.type2 ? <Text style={{ color: theme.muted }}>  ·  {ev.meta.type2}</Text> : null}
+                          </Text>
+                        </>
+                      ) : null}
                       <Text style={[s.dayClassRange, { color: theme.muted }]}>
                         {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
                         {checked && <Text style={s.dayClassDone}>   ✓ Attended</Text>}
@@ -2133,7 +2168,7 @@ export default function CalendarScreen() {
                   value={cTitle} onChangeText={setCTitle} autoFocus returnKeyType="next"
                 />
   
-                <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION (optional)</Text>
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>{cMulti ? 'LOCATION 1 (optional)' : 'LOCATION (optional)'}</Text>
                 <TextInput
                   style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
                   placeholder='e.g. "McConnell Engineering B202"'
@@ -2157,7 +2192,7 @@ export default function CalendarScreen() {
                   })}
                 </View>
   
-                <Text style={[s.fieldLabel, { color: theme.muted }]}>TYPE</Text>
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>{cMulti ? 'LOCATION 1 TYPE' : 'TYPE'}</Text>
                 <View style={s.typeRow}>
                   {CLASS_TYPES.map(t => {
                     const on = cType === t
@@ -2172,6 +2207,50 @@ export default function CalendarScreen() {
                     )
                   })}
                 </View>
+
+                {/* A slot used differently on different weeks */}
+                <View style={[s.multiRow, { borderColor: theme.cardBorder, backgroundColor: theme.isDark ? '#ffffff06' : '#00000004' }]}>
+                  <Text style={[s.multiQuestion, { color: theme.text }]}>
+                    Does this timeslot have multiple uses throughout different weeks?
+                  </Text>
+                  <View style={[s.multiToggle, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
+                    {[['No', false], ['Yes', true]].map(([label, val]) => (
+                      <Pressable
+                        key={label}
+                        style={[s.multiBtn, cMulti === val && { backgroundColor: cColor }]}
+                        onPress={() => setCMulti(val)}
+                      >
+                        <Text style={[s.multiBtnText, { color: cMulti === val ? '#fff' : theme.subtext }]}>{label}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+                {cMulti && (
+                  <>
+                    <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION 2 (optional)</Text>
+                    <TextInput
+                      style={[s.titleInput, { backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                      placeholder='e.g. "DC 2568"'
+                      placeholderTextColor={theme.muted}
+                      value={cLoc2} onChangeText={setCLoc2} returnKeyType="done"
+                    />
+                    <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION 2 TYPE (optional)</Text>
+                    <View style={s.typeRow}>
+                      {CLASS_TYPES.map(t => {
+                        const on = cType2 === t
+                        return (
+                          <Pressable
+                            key={t}
+                            style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                            onPress={() => setCType2(on ? null : t)}
+                          >
+                            <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
+                          </Pressable>
+                        )
+                      })}
+                    </View>
+                  </>
+                )}
 
                 <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
                 <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
@@ -2561,6 +2640,12 @@ const s = StyleSheet.create({
   typeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 },
   typeChip: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
   typeChipText: { fontSize: 12.5, fontWeight: '700' },
+  multiRow: { borderRadius: 12, borderWidth: 1, padding: 12, marginBottom: 12, gap: 8 },
+  multiQuestion: { fontSize: 13, fontWeight: '600', lineHeight: 18 },
+  multiToggle: { flexDirection: 'row', borderRadius: 10, padding: 3, alignSelf: 'flex-start' },
+  multiBtn: { paddingHorizontal: 18, paddingVertical: 7, borderRadius: 8 },
+  multiBtnText: { fontSize: 12.5, fontWeight: '800' },
+  dayClassOr: { fontSize: 10.5, fontWeight: '900', letterSpacing: 1.2, marginTop: -3, marginBottom: -3 },
 
   classSearchRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
