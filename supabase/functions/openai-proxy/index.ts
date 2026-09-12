@@ -32,6 +32,17 @@ const FOOD_NUTRIENTS: Array<[string, string]> = [
 ]
 const FOOD_MODEL = 'gpt-5.6-luna'
 
+// Cheap text-only helpers (one small call each) share the 'light' daily cap.
+const MAX_LIGHT_PER_DAY = 40
+// Must match MUSCLE_OPTIONS in lib/customExercises.js: these are the names the
+// app's muscle map understands.
+const EXERCISE_MUSCLES = [
+  'Chest', 'Upper Back', 'Lats', 'Lower Back', 'Traps', 'Shoulders',
+  'Biceps', 'Triceps', 'Forearms',
+  'Abs', 'Obliques', 'Core',
+  'Hip Flexors', 'Adductors', 'Glutes', 'Quads', 'Hamstrings', 'Calves', 'Neck',
+]
+
 // Actions that consume the daily generative rate limit.
 // extract_workout has its own weekly cap (ai_workout_limits) instead.
 const GENERATIVE = new Set(['create_routine', 'advise_routine', 'analyze_looks'])
@@ -140,6 +151,15 @@ Deno.serve(async (req) => {
       if (!rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Daily limit of ${MAX_FOOD_PER_DAY / 2} AI food estimates reached. Try again tomorrow.` },
+          429,
+        )
+      }
+    } else if (action === 'exercise_muscles') {
+      const rl = await consumeLimit('light', MAX_LIGHT_PER_DAY)
+      if (!rl) return limitUnavailable()
+      if (!rl.allowed) {
+        return json(
+          { error: 'daily_limit', reason: `Daily limit of ${MAX_LIGHT_PER_DAY} AI helper uses reached. Try again tomorrow.` },
           429,
         )
       }
@@ -727,6 +747,54 @@ Deno.serve(async (req) => {
       else estimateId = row?.id ?? null
 
       return json({ estimateId, ...estimate })
+    }
+
+    // ── Which muscles does a custom exercise train? ─────────────────────────
+
+    if (action === 'exercise_muscles') {
+      const name = String(body.name ?? '').trim().slice(0, 120)
+      const description = String(body.description ?? '').trim().slice(0, 600)
+      if (!name) return json({ error: 'missing_name' }, 400)
+
+      const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+        input: [name, description].filter(Boolean).join('\n'),
+      })
+      if (mod.results?.[0]?.flagged) {
+        return json({ error: 'flagged', reason: 'That text could not be processed.' }, 422)
+      }
+
+      const prompt =
+        'An exercise in a workout app:\n' +
+        `Name: "${name}"\n` +
+        (description ? `Description: "${description}"\n` : '') +
+        '\nWhich muscles does it train? Choose ONLY from this list, using these exact spellings: ' +
+        `${EXERCISE_MUSCLES.join(', ')}.\n\n` +
+        'Return ONLY valid JSON: {"primary":["..."],"secondary":["..."],"note":"one short sentence on what the movement is, or an empty string"}\n' +
+        'primary: the 1 to 3 muscles doing most of the work. secondary: up to 4 that assist or stabilise. ' +
+        'If you cannot identify a real exercise from the name and description, return {"primary":[],"secondary":[],"note":"..."} and say briefly why. Never use em dashes.'
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: FOOD_MODEL,
+        reasoning_effort: 'low',
+        messages: [{ role: 'user', content: prompt }],
+        max_completion_tokens: 3000,
+        response_format: { type: 'json_object' },
+      })
+      const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}') as Record<string, unknown>
+      // Canonicalise to the app's spellings; anything else is dropped.
+      const canon = (v: unknown): string[] => {
+        const seen = new Set<string>()
+        const out: string[] = []
+        for (const x of Array.isArray(v) ? v : []) {
+          const hit = EXERCISE_MUSCLES.find(mu => mu.toLowerCase() === String(x ?? '').trim().toLowerCase())
+          if (hit && !seen.has(hit)) { seen.add(hit); out.push(hit) }
+        }
+        return out
+      }
+      const primary = canon(parsed.primary).slice(0, 3)
+      const secondary = canon(parsed.secondary).filter(mu => !primary.includes(mu)).slice(0, 4)
+      const note = noEmDash(String(parsed.note ?? '').trim()).slice(0, 200)
+      return json({ primary, secondary, note })
     }
 
     return json({ error: 'unknown_action' }, 400)

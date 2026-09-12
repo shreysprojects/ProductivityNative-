@@ -11,6 +11,8 @@ import { useAuth } from '../lib/AuthContext'
 import { supabase } from '../lib/supabase'
 import { getWorkoutPlan, saveWorkoutPlan, getWorkoutLog, today } from '../lib/storage'
 import { WGER_CATEGORIES, fetchExercisesByCategory, searchExercises } from '../lib/wgerApi'
+import { getCustomExercises, saveCustomExercise, deleteCustomExercise, toLibraryExercise } from '../lib/customExercises'
+import CustomExerciseModal from '../components/CustomExerciseModal'
 
 const COLOR = '#6366f1'
 
@@ -222,11 +224,22 @@ export default function WorkoutLibrary() {
   const [importing, setImporting] = useState(false)
   const [doneToday, setDoneToday] = useState(new Set())
   const searchTimer = useRef(null)
+  // The user's own exercises, already in library shape, and the create/edit
+  // sheet ({ initial?, lib? } while open).
+  const [customs, setCustoms] = useState([])
+  const [customModal, setCustomModal] = useState(null)
 
   useEffect(() => {
     if (!user || !muscleGroup) return
     getWorkoutPlan(user.id, muscleGroup).then(setPlan)
   }, [user, muscleGroup])
+
+  useEffect(() => {
+    if (!user) return
+    getCustomExercises(user.id)
+      .then(list => setCustoms(list.map(toLibraryExercise)))
+      .catch(() => {})
+  }, [user])
 
   useEffect(() => {
     if (!user) return
@@ -314,6 +327,40 @@ export default function WorkoutLibrary() {
 
   function handlePreview(exercise) {
     setPreview(prev => (prev?.id === exercise.id ? null : exercise))
+  }
+
+  // A new custom exercise goes straight into this workout; an edit refreshes
+  // the copy already in it (sets and reps kept).
+  async function handleSaveCustom(custom) {
+    setCustomModal(null)
+    try {
+      const saved = await saveCustomExercise(user.id, custom)
+      const lib = toLibraryExercise(saved)
+      const isNew = !customs.some(c => c.id === lib.id)
+      setCustoms(prev => (isNew ? [...prev, lib] : prev.map(c => (c.id === lib.id ? lib : c))))
+      setPlan(prev => {
+        const inPlan = prev.some(e => e.id === lib.id)
+        if (isNew) return inPlan ? prev : [...prev, { ...lib, sets: 3, reps: 10, restSeconds: 90 }]
+        return prev.map(e => (e.id === lib.id ? { ...e, ...lib, sets: e.sets, reps: e.reps, restSeconds: e.restSeconds } : e))
+      })
+    } catch (e) {
+      Alert.alert('Could not save', e?.message ?? 'Please try again.')
+    }
+  }
+
+  function handleDeleteCustom(lib) {
+    Alert.alert(`Delete "${lib.name}"?`, 'Workouts that already include it keep their copy.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive',
+        onPress: async () => {
+          setCustomModal(null)
+          setCustoms(prev => prev.filter(c => c.id !== lib.id))
+          try { await deleteCustomExercise(user.id, lib.customId) }
+          catch (e) { Alert.alert('Could not delete', e?.message ?? 'Please try again.') }
+        },
+      },
+    ])
   }
 
   async function handleSave() {
@@ -427,8 +474,16 @@ export default function WorkoutLibrary() {
     }
   }
 
-  const displayed = searchResults !== null ? searchResults : exercises
   const isSearching = search.trim().length > 0
+  // Searching also looks through the user's own exercises; they come first.
+  const searchWords = search.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  const customMatches = isSearching
+    ? customs.filter(c => {
+        const hay = [c.name, ...c.muscles.map(m => m.name), ...c.musclesSecondary.map(m => m.name)].join(' ').toLowerCase()
+        return searchWords.every(w => hay.includes(w))
+      })
+    : []
+  const displayed = searchResults !== null ? [...customMatches, ...searchResults] : exercises
 
   return (
     <View style={s.page}>
@@ -477,6 +532,14 @@ export default function WorkoutLibrary() {
           </View>
           {!importing && <Text style={{ color: COLOR, fontSize: 16, fontWeight: '600' }}>→</Text>}
         </Pressable>
+        <Pressable style={s.createBtn} onPress={() => setCustomModal({})}>
+          <Text style={{ fontSize: 15 }}>✚</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={s.importBtnTitle}>Create your own exercise</Text>
+            <Text style={s.importBtnSub}>Name it, pick the muscles (or ask AI), and it's added to this workout.</Text>
+          </View>
+          <Text style={{ color: COLOR, fontSize: 16, fontWeight: '600' }}>→</Text>
+        </Pressable>
       </View>
 
       {!isSearching && (
@@ -503,7 +566,9 @@ export default function WorkoutLibrary() {
         data={displayed}
         keyExtractor={item => String(item.id)}
         contentContainerStyle={s.list}
-        ListHeaderComponent={plan.length > 0 ? (
+        ListHeaderComponent={(
+          <>
+          {plan.length > 0 && (
           <View style={s.planSection}>
             <View style={s.planSectionHeader}>
               <Text style={s.planSectionTitle}>Your Workout</Text>
@@ -543,7 +608,42 @@ export default function WorkoutLibrary() {
               </View>
             ))}
           </View>
-        ) : null}
+          )}
+
+          {/* The user's own exercises, when browsing (search lists them inline) */}
+          {!isSearching && customs.length > 0 && (
+            <View style={s.customSection}>
+              <View style={s.planSectionHeader}>
+                <Text style={s.planSectionTitle}>Your exercises</Text>
+                <Text style={s.planSectionCount}>{customs.length}</Text>
+              </View>
+              {customs.map(c => (
+                <View key={c.id}>
+                  <ExerciseCard
+                    exercise={c}
+                    isIn={plan.some(e => e.id === c.id)}
+                    isPreviewing={preview?.id === c.id}
+                    onToggle={togglePlan}
+                    onPreview={handlePreview}
+                    isDoneToday={doneToday.has(c.id)}
+                  />
+                  {preview?.id === c.id && (
+                    <PreviewPanel exercise={c} onClose={() => setPreview(null)} />
+                  )}
+                  <View style={s.customActions}>
+                    <Pressable onPress={() => setCustomModal({ initial: c._custom, lib: c })} hitSlop={8}>
+                      <Text style={s.customActionText}>✎ Edit</Text>
+                    </Pressable>
+                    <Pressable onPress={() => handleDeleteCustom(c)} hitSlop={8}>
+                      <Text style={[s.customActionText, { color: '#ef4444' }]}>🗑 Delete</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
+          </>
+        )}
         onEndReached={loadMore}
         onEndReachedThreshold={0.5}
         ListEmptyComponent={
@@ -557,7 +657,9 @@ export default function WorkoutLibrary() {
             </View>
           ) : (
             <Text style={s.empty}>
-              {isSearching ? 'No exercises found.' : 'No exercises in this category.'}
+              {isSearching
+                ? 'No exercises found. Tap "Create your own exercise" above to add it yourself.'
+                : 'No exercises in this category.'}
             </Text>
           )
         }
@@ -582,6 +684,15 @@ export default function WorkoutLibrary() {
           </View>
         )}
       />
+
+      {customModal && (
+        <CustomExerciseModal
+          initial={customModal.initial ?? null}
+          onSave={handleSaveCustom}
+          onDelete={customModal.lib ? () => handleDeleteCustom(customModal.lib) : null}
+          onClose={() => setCustomModal(null)}
+        />
+      )}
     </View>
   )
 }
@@ -614,6 +725,14 @@ const s = StyleSheet.create({
   },
   importBtnTitle: { fontSize: 13, fontWeight: '700', color: COLOR },
   importBtnSub: { fontSize: 11, color: '#888', marginTop: 1 },
+  createBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    borderRadius: 12, borderWidth: 1.5, borderColor: COLOR + '55', backgroundColor: '#fff',
+    paddingHorizontal: 12, paddingVertical: 10, marginTop: 8,
+  },
+  customSection: { marginHorizontal: 12, marginBottom: 6, gap: 10 },
+  customActions: { flexDirection: 'row', gap: 18, paddingHorizontal: 8, paddingTop: 2, paddingBottom: 4 },
+  customActionText: { fontSize: 12, fontWeight: '700', color: COLOR },
 
   catScroll: { backgroundColor: '#fff', maxHeight: 56 },
   catRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 10, gap: 8, flexDirection: 'row' },
