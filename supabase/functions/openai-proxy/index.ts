@@ -13,6 +13,24 @@ const MAX_MOD_PER_DAY      = 60
 const MAX_EXTRACT_PER_WEEK = 10
 // Length of the base64 string, so ~1.5MB of decoded image.
 const MAX_IMAGE_B64        = 2_000_000
+// The food estimator charges one unit per call (clarify, then estimate), so
+// this is about 20 foods a day.
+const MAX_FOOD_PER_DAY     = 40
+
+// Every nutrient the Meals tab tracks, in the app's own key names and units.
+// Must match MACRO_GROUPS in components/AddMealModal.js.
+const FOOD_NUTRIENTS: Array<[string, string]> = [
+  ['calories', 'kcal'],
+  ['protein', 'g'], ['carbs', 'g'], ['fiber', 'g'], ['sugar', 'g'], ['addedSugar', 'g'],
+  ['fat', 'g'], ['saturatedFat', 'g'], ['transFat', 'g'], ['polyunsaturatedFat', 'g'], ['monounsaturatedFat', 'g'],
+  ['sodium', 'mg'], ['potassium', 'mg'], ['cholesterol', 'mg'], ['calcium', 'mg'], ['iron', 'mg'],
+  ['magnesium', 'mg'], ['zinc', 'mg'], ['phosphorus', 'mg'], ['selenium', 'mcg'], ['copper', 'mg'],
+  ['manganese', 'mg'], ['chromium', 'mcg'], ['iodine', 'mcg'],
+  ['vitaminA', 'mcg'], ['vitaminC', 'mg'], ['vitaminD', 'mcg'], ['vitaminE', 'mg'], ['vitaminK', 'mcg'],
+  ['vitaminB6', 'mg'], ['vitaminB12', 'mcg'], ['folate', 'mcg'], ['thiamin', 'mg'], ['riboflavin', 'mg'],
+  ['niacin', 'mg'], ['pantothenicAcid', 'mg'], ['biotin', 'mcg'],
+]
+const FOOD_MODEL = 'gpt-5.6-luna'
 
 // Actions that consume the daily generative rate limit.
 // extract_workout has its own weekly cap (ai_workout_limits) instead.
@@ -113,6 +131,15 @@ Deno.serve(async (req) => {
       if (!rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Weekly limit of ${MAX_EXTRACT_PER_WEEK} screenshot imports reached. It resets on Monday.` },
+          429,
+        )
+      }
+    } else if (action === 'food_clarify' || action === 'food_estimate') {
+      const rl = await consumeLimit('food', MAX_FOOD_PER_DAY)
+      if (!rl) return limitUnavailable()
+      if (!rl.allowed) {
+        return json(
+          { error: 'daily_limit', reason: `Daily limit of ${MAX_FOOD_PER_DAY / 2} AI food estimates reached. Try again tomorrow.` },
           429,
         )
       }
@@ -541,6 +568,165 @@ Deno.serve(async (req) => {
       }
       const parsed = JSON.parse(choice?.message?.content ?? '{}')
       return json(noEmDashDeep(parsed))
+    }
+
+    // ── Food estimator ("Ask AI" under the food search) ──────────────────────
+
+    if (action === 'food_clarify') {
+      const query = String(body.query ?? '').trim().slice(0, 200)
+      if (!query) return json({ error: 'missing_query' }, 400)
+
+      const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: query })
+      if (mod.results?.[0]?.flagged) {
+        return json({ error: 'flagged', reason: 'That text could not be processed.' }, 422)
+      }
+
+      const prompt =
+        `A user of a nutrition-tracking app wants to log this food: "${query}"\n\n` +
+        'Before its nutrition is estimated, ask ONLY the questions whose answers would materially change the numbers. ' +
+        'The usual gaps: the specific type or variety, the amount eaten (cups, grams, pieces, or a plate or bowl description), ' +
+        'how it was prepared or cooked, and any oil, sauce, sugar or toppings added. Skip anything the description already answers. ' +
+        'Ask at most 3 questions. If the description already pins down both the type and the amount, ask nothing.\n\n' +
+        'Return ONLY valid JSON: {"questions":[{"id":"q1","text":"short question","hint":"example answer"}]}\n' +
+        'Keep each question under 12 words and each hint under 8. Never use em dashes.'
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: FOOD_MODEL,
+        reasoning_effort: 'low',
+        messages: [{ role: 'user', content: prompt }],
+        max_completion_tokens: 3000,
+        response_format: { type: 'json_object' },
+      })
+      const parsed = JSON.parse(chat.choices?.[0]?.message?.content ?? '{}')
+      const raw: Array<{ text?: string; hint?: string }> = Array.isArray(parsed.questions) ? parsed.questions : []
+      const questions = raw
+        .map((q, i) => ({
+          id: `q${i + 1}`,
+          text: noEmDash(String(q.text ?? '').trim()).slice(0, 120),
+          hint: noEmDash(String(q.hint ?? '').trim()).slice(0, 60),
+        }))
+        .filter(q => q.text)
+        .slice(0, 3)
+      return json({ questions })
+    }
+
+    if (action === 'food_estimate') {
+      const query = String(body.query ?? '').trim().slice(0, 200)
+      if (!query) return json({ error: 'missing_query' }, 400)
+      const answers: Array<{ q: string; a: string }> = (Array.isArray(body.answers) ? body.answers : [])
+        .map((x: Record<string, unknown>) => ({
+          q: String(x?.q ?? '').trim().slice(0, 160),
+          a: String(x?.a ?? '').trim().slice(0, 300),
+        }))
+        .filter((x: { q: string; a: string }) => x.q && x.a)
+        .slice(0, 5)
+      const base64 = typeof body.base64 === 'string' ? body.base64 : ''
+      if (base64) {
+        const oversize = checkImageSize(base64)
+        if (oversize) return oversize
+      }
+
+      // Text and (if present) the photo go through moderation first. Like the
+      // other photo features this fails closed: no verdict, no estimate.
+      const text = [query, ...answers.map(x => x.a)].join('\n').slice(0, 3000)
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+          model: 'omni-moderation-latest',
+          input: [
+            { type: 'text', text },
+            ...(base64 ? [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } }] : []),
+          ],
+        })
+        if (mod.results?.[0]?.flagged === true) {
+          return json({ error: 'flagged', reason: 'That text or photo could not be processed.' }, 422)
+        }
+      } catch (e) {
+        console.error('food_estimate moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'We could not check that request right now. Please try again.' },
+          503,
+        )
+      }
+
+      const nutrientList = FOOD_NUTRIENTS.map(([k, u]) => `${k} (${u})`).join(', ')
+      const macroTemplate = FOOD_NUTRIENTS.map(([k]) => `"${k}":0`).join(',')
+      const qa = answers.map(x => `Q: ${x.q}\nA: ${x.a}`).join('\n')
+      const prompt =
+        'You estimate nutrition for a food-logging app, with the care of a registered dietitian using standard food-composition data (USDA-style values).\n\n' +
+        `Food as described by the user: "${query}"\n` +
+        (qa ? `Clarifying answers:\n${qa}\n` : '') +
+        (base64 ? 'A photo of the food is attached: use it to judge the type, the portion size and the preparation, and prefer what you can see over assumptions.\n' : '') +
+        '\nEstimate the nutrition for the WHOLE portion the user ate (not per 100 g). State the exact portion you assumed.\n\n' +
+        'Return ONLY valid JSON:\n' +
+        `{"name":"short food name","portion":"the amount you estimated for, e.g. 1 cup (170 g), cooked","contents":"one line on what is in it and how it was prepared","confidence":"low|medium|high","notes":"one short sentence on the biggest uncertainty, or an empty string","macros":{${macroTemplate}}}\n\n` +
+        'Rules:\n' +
+        `- macros must contain EVERY key above as a plain number, in these units: ${nutrientList}.\n` +
+        '- Use 0 only when a nutrient is genuinely negligible; otherwise give your best estimate, including trace vitamins and minerals.\n' +
+        '- No ranges and no text in numeric fields. Never use em dashes.'
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: FOOD_MODEL,
+        reasoning_effort: 'low',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            ...(base64 ? [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' } }] : []),
+          ],
+        }],
+        max_completion_tokens: 10000,
+        response_format: { type: 'json_object' },
+      })
+
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const parsed = JSON.parse(choice?.message?.content ?? '{}') as Record<string, unknown>
+      const rawMacros = (parsed.macros ?? {}) as Record<string, unknown>
+      const macros: Record<string, number> = {}
+      for (const [k] of FOOD_NUTRIENTS) {
+        const n = Number(rawMacros[k])
+        const safe = Number.isFinite(n) && n > 0 ? n : 0
+        macros[k] = k === 'calories' ? Math.round(safe) : Math.round(safe * 10) / 10
+      }
+      const str = (v: unknown, max: number) => noEmDash(String(v ?? '').trim()).slice(0, max)
+      const confidenceRaw = str(parsed.confidence, 10).toLowerCase()
+      const estimate = {
+        name: str(parsed.name, 80) || query,
+        portion: str(parsed.portion, 80) || null,
+        contents: str(parsed.contents, 200) || null,
+        confidence: ['low', 'medium', 'high'].includes(confidenceRaw) ? confidenceRaw : 'medium',
+        notes: str(parsed.notes, 200) || null,
+        macros,
+      }
+
+      // Record it so the food can be added to a real food list later without
+      // paying for another estimate. Clients cannot read this table; a failed
+      // insert is logged, not surfaced, because the user still needs their meal.
+      let estimateId: string | null = null
+      const { data: row, error: insErr } = await admin
+        .from('ai_food_estimates')
+        .insert({
+          user_id: user.id,
+          query,
+          answers,
+          had_photo: !!base64,
+          name: estimate.name,
+          portion: estimate.portion,
+          contents: estimate.contents,
+          confidence: estimate.confidence,
+          notes: estimate.notes,
+          macros,
+          model: FOOD_MODEL,
+          raw: parsed,
+        })
+        .select('id')
+        .single()
+      if (insErr) console.error('ai_food_estimates insert failed:', insErr)
+      else estimateId = row?.id ?? null
+
+      return json({ estimateId, ...estimate })
     }
 
     return json({ error: 'unknown_action' }, 400)

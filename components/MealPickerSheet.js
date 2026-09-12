@@ -11,7 +11,7 @@ const OPTIONS = [
     key: 'search',
     icon: '🔍',
     title: 'Search Food Database',
-    desc: 'Search millions of foods by name from Open Food Facts',
+    desc: 'Search millions of foods by name, or ask AI to estimate what you ate',
   },
   {
     key: 'history',
