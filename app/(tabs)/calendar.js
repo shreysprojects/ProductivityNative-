@@ -851,6 +851,11 @@ export default function CalendarScreen() {
       days: cDays, startTime, endTime, color: cColor,
       semesterStart, semesterEnd,
     }
+    // A club meeting's card shows meta.courseCode, so a rename here has to
+    // reach it too (the club itself is renamed from the Routines page).
+    if (item.meta?.type === 'Club') {
+      item.meta = { ...item.meta, courseCode: item.title, courseName: item.title }
+    }
     await saveScheduleItem(user.id, item)
     setScheduleItems(prev => editingClass
       ? prev.map(i => i.id === item.id ? item : i)
