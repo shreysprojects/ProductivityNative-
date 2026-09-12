@@ -74,6 +74,10 @@ const BUCKETS = [
 // buckets you put things in precisely because they have no clock on them.
 const DEADLINE_BUCKETS = ['today', 'week']
 
+// Class types offered in the editor; the scan and club meetings use the same
+// words, so the type pill on the day card reads the same whichever set it.
+const CLASS_TYPES = ['Lecture', 'Tutorial', 'Lab', 'Seminar', 'Club', 'Other']
+
 const WEEK_DAY_BTNS = [
   { label: 'M',  value: 1 },
   { label: 'T',  value: 2 },
@@ -383,6 +387,7 @@ export default function CalendarScreen() {
   const [cColor, setCColor]       = useState('#3b82f6')
   const [cFrom, setCFrom]         = useState('')
   const [cTo, setCTo]             = useState('')
+  const [cType, setCType]         = useState('Lecture')
   const [cSaving, setCeSaving]    = useState(false)
 
   // Drag-down-to-dismiss for the class sheet. Tapping a class autofocuses the
@@ -756,6 +761,7 @@ export default function CalendarScreen() {
     setCSH('8'); setCSM('00'); setCSAp('AM')
     setCEH('9'); setCEM('00'); setCEAp('AM')
     setCColor('#3b82f6'); setCFrom(''); setCTo('')
+    setCType('Lecture')
     classDragY.setValue(0)
     classAtTop.current = true
     setClassOpen(true)
@@ -768,6 +774,7 @@ export default function CalendarScreen() {
     setCSH(st.h); setCSM(st.m); setCSAp(st.ap)
     setCEH(et.h); setCEM(et.m); setCEAp(et.ap)
     setCColor(item.color ?? '#3b82f6')
+    setCType(CLASS_TYPES.includes(item.meta?.type) ? item.meta.type : (item.meta?.type ? 'Other' : 'Lecture'))
     setCFrom(item.semesterStart ? fmtDateForInput(item.semesterStart) : '')
     setCTo(item.semesterEnd ? fmtDateForInput(item.semesterEnd) : '')
     classDragY.setValue(0)
@@ -902,6 +909,9 @@ export default function CalendarScreen() {
       days: cDays, startTime, endTime, color: cColor,
       semesterStart, semesterEnd,
     }
+    // The type lives in meta next to the scan's course code/name; only the
+    // type changes here, the rest is kept.
+    item.meta = { ...(editingClass?.meta ?? {}), type: cType }
     // A club meeting's card shows meta.courseCode, so a rename here has to
     // reach it too (the club itself is renamed from the Routines page).
     if (item.meta?.type === 'Club') {
@@ -2147,6 +2157,22 @@ export default function CalendarScreen() {
                   })}
                 </View>
   
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>TYPE</Text>
+                <View style={s.typeRow}>
+                  {CLASS_TYPES.map(t => {
+                    const on = cType === t
+                    return (
+                      <Pressable
+                        key={t}
+                        style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                        onPress={() => setCType(t)}
+                      >
+                        <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
+                      </Pressable>
+                    )
+                  })}
+                </View>
+
                 <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
                 <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
   
@@ -2532,6 +2558,10 @@ const s = StyleSheet.create({
   dayCheckMark: { color: '#fff', fontWeight: '900', fontSize: 13, lineHeight: 15 },
 
   // Class search (Day section)
+  typeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 },
+  typeChip: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
+  typeChipText: { fontSize: 12.5, fontWeight: '700' },
+
   classSearchRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
     borderRadius: 14, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 2, marginBottom: 12,
