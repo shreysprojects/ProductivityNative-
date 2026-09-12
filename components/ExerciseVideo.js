@@ -9,24 +9,36 @@ import { WebView } from '@expo/dom-webview'
 // renders), and only builds the inline player when tapped.
 //
 // YouTube refuses an embed whose request has no Referer header: that is the
-// "Video player configuration error" (153). A webview loading YouTube's embed
-// URL directly sends none, and neither does a page served from a local file.
-// So the player loads a tiny page of ours on a real https origin (the
-// `player` edge function) that frames the video; the iframe request then
-// carries that origin as its referrer and YouTube plays it.
+// "Video player configuration error" (153). A webview loading the embed URL
+// directly sends none, a page served from a local file sends none, and
+// Supabase relabels any HTML it hosts as plain text, so there is no page of
+// ours to send one. The trick: the webview first loads a tiny youtube.com
+// page (robots.txt), and a script hops from there to the embed URL. A
+// navigation started by a page carries that page as its referrer, so the
+// embed arrives from youtube.com and plays.
 //
-// The page pings back once it has loaded; if no ping arrives the box says so
+// The embed page pings back once loaded; if no ping arrives the box says so
 // and offers YouTube instead of sitting black. The webview cannot open new
-// windows, so the player's own "Watch on YouTube" link is inert; the button
-// under the box is the way out. @expo/dom-webview ships with SDK 57, so none
-// of this needs a native rebuild.
+// windows, so links out of the player are caught and handed to the phone.
+// @expo/dom-webview ships with SDK 57, so none of this needs a native rebuild.
 
 const COLOR = '#6366f1'
-const LOAD_TIMEOUT_MS = 8000
-const PLAYER_PAGE = `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/player`
+const LOAD_TIMEOUT_MS = 10000
+const BOOTSTRAP_URL = 'https://www.youtube.com/robots.txt'
+const embedUrl = id => `https://www.youtube.com/embed/${id}?playsinline=1&rel=0&autoplay=1`
 
+// Runs before the bootstrap page renders: hop to the embed straight away.
+const hopScript = url => `
+(function () {
+  if (location.pathname === '/robots.txt') location.replace(${JSON.stringify(url)});
+})();
+true;
+`
+
+// Runs once the embed page has loaded: report in, and catch links out.
 const PAGE_SCRIPT = `
 (function () {
+  if (location.pathname === '/robots.txt') return;
   function send(msg) { try { window.ReactNativeWebView.postMessage(String(msg)) } catch (e) {} }
   window.open = function (url) { send(url); return null }
   document.addEventListener('click', function (e) {
@@ -83,12 +95,13 @@ export default function ExerciseVideo({ videoId, height = 210, style }) {
         ) : (
           <View style={v.fill}>
             <WebView
-              source={{ uri: `${PLAYER_PAGE}?v=${encodeURIComponent(videoId)}` }}
+              source={{ uri: BOOTSTRAP_URL }}
               style={v.web}
               allowsInlineMediaPlayback
               mediaPlaybackRequiresUserAction={false}
               scrollEnabled={false}
               bounces={false}
+              injectedJavaScriptBeforeContentLoaded={hopScript(embedUrl(videoId))}
               injectedJavaScript={PAGE_SCRIPT}
               onMessage={e => {
                 const data = e?.nativeEvent?.data
@@ -121,7 +134,7 @@ const v = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   playIcon: { color: '#fff', fontSize: 18, fontWeight: '800', marginLeft: 3 },
-  spinner: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
+  spinner: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', backgroundColor: '#000' },
   failWrap: { alignItems: 'center', justifyContent: 'center', gap: 10, padding: 16 },
   failText: { color: '#ddd', fontSize: 13, fontWeight: '600', textAlign: 'center' },
   failBtn: { backgroundColor: '#ff0000', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 },
