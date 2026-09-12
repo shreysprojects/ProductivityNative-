@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image, ActivityIndicator } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import * as ImagePicker from 'expo-image-picker'
 import {
@@ -13,6 +13,7 @@ import {
   addRoutine, getRoutineNames, getRoutineSettings, saveRoutineSettings,
   renameRoutine, shiftRoutinesAfter, RESERVED_ROUTINES, altRoutineName,
   getRoutineGroupMap, saveRoutineGroupMap, getTodayRun,
+  getRoutineTemplates, getHiddenDefaults,
 } from '../lib/storage'
 
 // Section identities — match the dashboard's Every day / Whenever headers
@@ -228,6 +229,11 @@ export default function SetupRoutine() {
   const [emojiTargetId,    setEmojiTargetId]    = useState(null)
   const [emojiQuery,       setEmojiQuery]       = useState('')
   const [runInProgress,    setRunInProgress]    = useState(false)
+  // "Copy to another routine": the task being copied, the routines it can go
+  // to (null while they load), and whether a copy is in flight.
+  const [copyTask,         setCopyTask]         = useState(null)
+  const [copyTargets,      setCopyTargets]      = useState(null)
+  const [copying,          setCopying]          = useState(false)
 
   // Whenever routines have no day/time schedule.
   const isWhenever = isNew ? newGroup === 'whenever' : routineGroup === 'whenever'
@@ -366,6 +372,60 @@ export default function SetupRoutine() {
       return prev.filter(t => t.id !== id)
     })
     setExpandedIds(prev => { const n = new Set(prev); n.delete(id); return n })
+  }
+
+  // ── Copy a task into another routine ──────────────────────────────────────
+  // The copy lands at the end of the chosen routine straight away; it does not
+  // wait for this editor's Save. Photos stay behind: each is stored once per
+  // account and deleted along with the task that owns it, so a shared
+  // reference would break the moment either copy was removed.
+  async function openCopySheet(task) {
+    setCopyTask(task)
+    setCopyTargets(null)
+    try {
+      const [names, hidden] = await Promise.all([getRoutineNames(user.id), getHiddenDefaults(user.id)])
+      const visible = names.filter(n => !hidden.includes(n))
+      // An alternative is offered only once it has tasks, so copying can't
+      // quietly bring an alt routine into existence.
+      const alts = await getRoutineTemplates(user.id, visible.map(altRoutineName))
+      const current = routineName ? (isAltVariant ? altRoutineName(routineName) : routineName) : null
+      const targets = []
+      for (const n of visible) {
+        const emoji = routineTheme(n).emoji ?? '📋'
+        if (n !== current) targets.push({ key: n, label: n, emoji })
+        const alt = altRoutineName(n)
+        if (alt !== current && (alts[alt]?.length ?? 0) > 0) targets.push({ key: alt, label: `Alt ${n}`, emoji })
+      }
+      setCopyTargets(targets)
+    } catch (e) {
+      setCopyTask(null)
+      Alert.alert('Could not load routines', e.message)
+    }
+  }
+
+  async function copyTaskTo(target) {
+    if (!copyTask || !user?.id) return
+    setCopying(true)
+    try {
+      const stamp = Date.now()
+      // Rebuilt field by field rather than spread, so the ids are fresh and
+      // nothing routine-specific (photos, integration markers) travels along.
+      const copy = {
+        id: stamp,
+        text: copyTask.text,
+        timeGoalSecs: copyTask.timeGoalSecs ?? (copyTask.timeGoalMins ?? 0) * 60,
+        subTasks: (copyTask.subTasks ?? []).map((st, i) => ({ id: stamp + 1 + i, text: st.text })),
+        ...(copyTask.emoji ? { emoji: copyTask.emoji } : {}),
+      }
+      const existing = await getRoutineTemplate(user.id, target.key)
+      await saveRoutineTemplate(user.id, target.key, [...existing, copy])
+      setCopyTask(null)
+      Alert.alert('Copied', `“${copy.text}” is now the last task in ${target.label}.`)
+    } catch (e) {
+      Alert.alert('Could not copy', e.message)
+    } finally {
+      setCopying(false)
+    }
   }
 
   // Shared by task photos and step photos: ask for permission, let the user
@@ -665,6 +725,11 @@ export default function SetupRoutine() {
                   <Text style={s.goalUnit}>s</Text>
                 </View>
               </View>
+
+              <Pressable style={s.copyRow} onPress={() => openCopySheet(task)} hitSlop={6}>
+                <Text style={[s.copyRowText, { color: accent.color }]}>⧉  Copy to another routine</Text>
+                <Text style={[s.copyRowChevron, { color: accent.color }]}>›</Text>
+              </Pressable>
 
               {/* Optional picture, shown full-width on the run card */}
               {task.image ? (
@@ -1096,6 +1161,47 @@ export default function SetupRoutine() {
         </KeyboardAvoidingView>
       </Modal>
 
+      {/* Pick which routine a task is copied into */}
+      <Modal
+        visible={!!copyTask}
+        transparent
+        animationType="slide"
+        onRequestClose={() => { if (!copying) setCopyTask(null) }}
+      >
+        <View style={s.emojiOverlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => { if (!copying) setCopyTask(null) }} />
+          <View style={s.emojiSheet}>
+            <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
+            <Text style={[s.emojiHeaderTitle, { marginBottom: 6 }]} numberOfLines={2}>
+              Copy “{copyTask?.text}” to…
+            </Text>
+            <Text style={s.copyHint}>
+              The task goes to the end of the routine you pick, with its icon, time goal and steps. Photos aren't copied.
+            </Text>
+            {copyTargets === null ? (
+              <ActivityIndicator color={accent.color} style={{ paddingVertical: 24 }} />
+            ) : copyTargets.length === 0 ? (
+              <Text style={s.emojiNoResults}>There's no other routine to copy into yet.</Text>
+            ) : (
+              <ScrollView style={{ maxHeight: 380 }} showsVerticalScrollIndicator={false}>
+                {copyTargets.map(t => (
+                  <Pressable
+                    key={t.key}
+                    style={[s.copyTarget, copying && { opacity: 0.5 }]}
+                    onPress={() => copyTaskTo(t)}
+                    disabled={copying}
+                  >
+                    <Text style={s.copyTargetEmoji}>{t.emoji}</Text>
+                    <Text style={s.copyTargetText}>{t.label}</Text>
+                    <Text style={[s.copyRowChevron, { color: accent.color }]}>›</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
+
       <ImageViewerModal uri={photoViewer} onClose={() => setPhotoViewer(null)} />
     </KeyboardAvoidingView>
   )
@@ -1328,6 +1434,21 @@ function makeStyles(theme) { return StyleSheet.create({
     backgroundColor: theme.input,
   },
   emojiItemText: { fontSize: 28 },
+
+  copyRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: theme.divider,
+  },
+  copyRowText: { fontSize: 13, fontWeight: '700' },
+  copyRowChevron: { fontSize: 18, fontWeight: '700', lineHeight: 20 },
+  copyHint: { fontSize: 13, color: theme.subtext, lineHeight: 18, marginBottom: 14 },
+  copyTarget: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingVertical: 12, paddingHorizontal: 12, borderRadius: 14,
+    backgroundColor: theme.input, marginBottom: 8,
+  },
+  copyTargetEmoji: { fontSize: 20 },
+  copyTargetText: { flex: 1, fontSize: 15, fontWeight: '600', color: theme.text },
   btn: { borderRadius: 16, padding: 18, alignItems: 'center' },
   btnFirst: {
     padding: 20,

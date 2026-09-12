@@ -1585,15 +1585,6 @@ const wcs = StyleSheet.create({
   closeBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 })
 
-function fmtRoutineDuration(tasks) {
-  const secs = tasks.reduce((s, t) => s + taskGoalSecs(t), 0)
-  if (secs === 0) return `${tasks.length} task${tasks.length !== 1 ? 's' : ''}`
-  const mins = Math.round(secs / 60)
-  if (mins >= 60) return `~${Math.floor(mins / 60)}h${mins % 60 ? ' ' + (mins % 60) + 'm' : ''}`
-  if (mins >= 1) return `~${mins} min`
-  return `~${secs}s`
-}
-
 // Single-field name prompt. `prompt` is { title, message, placeholder,
 // initialValue, onSubmit } or null when closed.
 function NamePromptModal({ prompt, theme, color, onClose }) {
@@ -1645,7 +1636,7 @@ function NamePromptModal({ prompt, theme, color, onClose }) {
 
 export default function RoutineScreen() {
   const { name } = useLocalSearchParams()
-  const { user, profile } = useAuth()
+  const { user } = useAuth()
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isFitness = name === 'Fitness'
@@ -1697,33 +1688,6 @@ export default function RoutineScreen() {
   // and Main/Alternative tab switches dim + restore instead of blanking.
   const contentFade   = useRef(new Animated.Value(0)).current
 
-  // Morning greeting chooser: shown once when opening Morning before anything
-  // has been started today. { mainTime, altTime } or null. While `chooserPending`
-  // the page renders nothing but background, so the greeting is the first thing
-  // seen — never the routine page behind it.
-  const [chooser, setChooser] = useState(null)
-  const [chooserPending, setChooserPending] = useState(name === 'Morning')
-  const chooserAnim = useRef(new Animated.Value(0)).current  // staggers the text/buttons in
-  const chooserBg   = useRef(new Animated.Value(1)).current  // full overlay fade on dismiss
-
-  useEffect(() => {
-    // Start the entrance only once the overlay is actually on screen
-    // (post-load), so the full stagger is visible.
-    if (chooser && !loading) {
-      chooserBg.setValue(1)
-      chooserAnim.setValue(0)
-      Animated.timing(chooserAnim, { toValue: 1, duration: 650, useNativeDriver: true }).start()
-    }
-  }, [chooser, loading])
-
-  function chooseVariant(v) {
-    if (v === 'alt') switchVariant('alt') // start loading behind the overlay
-    Animated.timing(chooserBg, { toValue: 0, duration: 260, useNativeDriver: true }).start(() => {
-      setChooser(null)
-      setChooserPending(false)
-    })
-  }
-
   const load = useCallback(async () => {
     if (!user || !name) return
     // Set when this pass hands off to a re-run under the other variant: the
@@ -1740,24 +1704,9 @@ export default function RoutineScreen() {
           getTodayRun(user.id, altRoutineName(name)),
         ])
         if (!mainRun && altRun) {
-          setChooserPending(false)
           setVariant('alt')
           handedOff = true
           return // variant change re-triggers load with the alt storage name
-        }
-        // Morning: greet + ask which version of the routine to do today,
-        // but only before anything has been started.
-        if (isMorning && !mainRun && !altRun) {
-          const [mainTmpl, altTmpl] = await Promise.all([
-            getRoutineTemplate(user.id, name),
-            getRoutineTemplate(user.id, altRoutineName(name)),
-          ])
-          setChooser({
-            mainTime: fmtRoutineDuration(mainTmpl),
-            altTime: altTmpl.length > 0 ? fmtRoutineDuration(altTmpl) : 'Not set up yet',
-          })
-        } else {
-          setChooserPending(false)
         }
       }
       const promises = [
@@ -2151,9 +2100,9 @@ export default function RoutineScreen() {
     )
   }
 
-  // Blank themed background while loading, and while deciding whether the
-  // morning chooser should show — the routine page must never flash first.
-  if (loading || (chooserPending && !chooser)) {
+  // Blank themed background while loading, so the page never flashes stale
+  // content before the first fade-in.
+  if (loading) {
     return <View style={[s.page, { backgroundColor: theme.bg }]} />
   }
 
@@ -2914,50 +2863,6 @@ export default function RoutineScreen() {
         onClose={() => setNamePrompt(null)}
       />
 
-      {/* ── Morning greeting + Main/Alternative chooser ── */}
-      {chooser && (
-        <Animated.View
-          style={[s.chooserOverlay, {
-            backgroundColor: theme.bg,
-            opacity: chooserBg,
-          }]}
-        >
-          <Animated.Text style={[s.chooserGreeting, {
-            color: theme.text,
-            opacity: chooserAnim.interpolate({ inputRange: [0.1, 0.45], outputRange: [0, 1], extrapolate: 'clamp' }),
-            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.1, 0.45], outputRange: [26, 0], extrapolate: 'clamp' }) }],
-          }]}>
-            ☀️ Good morning {(profile?.name?.trim() || 'there').split(' ')[0]}!
-          </Animated.Text>
-          <Animated.Text style={[s.chooserSub, {
-            color: theme.subtext,
-            opacity: chooserAnim.interpolate({ inputRange: [0.3, 0.65], outputRange: [0, 1], extrapolate: 'clamp' }),
-            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.3, 0.65], outputRange: [18, 0], extrapolate: 'clamp' }) }],
-          }]}>
-            How would you like to do your routine today?
-          </Animated.Text>
-          <Animated.View style={[s.chooserBtnRow, {
-            opacity: chooserAnim.interpolate({ inputRange: [0.5, 1], outputRange: [0, 1], extrapolate: 'clamp' }),
-            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.5, 1], outputRange: [22, 0], extrapolate: 'clamp' }) }],
-          }]}>
-            <Pressable
-              style={[s.chooserBtn, { backgroundColor: card.color, shadowColor: card.color }]}
-              onPress={() => chooseVariant('main')}
-            >
-              <Text style={s.chooserBtnLabel}>Main</Text>
-              <Text style={s.chooserBtnTime}>⏱ {chooser.mainTime}</Text>
-            </Pressable>
-            <Pressable
-              style={[s.chooserBtn, s.chooserBtnOutline, { borderColor: card.color, backgroundColor: theme.card }]}
-              onPress={() => chooseVariant('alt')}
-            >
-              <Text style={[s.chooserBtnLabel, { color: card.color }]}>Alternative</Text>
-              <Text style={[s.chooserBtnTime, { color: theme.subtext }]}>⏱ {chooser.altTime}</Text>
-            </Pressable>
-          </Animated.View>
-        </Animated.View>
-      )}
-
       <ImageViewerModal uri={photoViewer} onClose={() => setPhotoViewer(null)} />
     </View>
   )
@@ -3099,23 +3004,6 @@ const s = StyleSheet.create({
   },
   altEmptyBtnFill: { borderWidth: 0 },
   altEmptyBtnText: { fontSize: 13, fontWeight: '700' },
-
-  chooserOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: 28, zIndex: 20,
-  },
-  chooserGreeting: { fontSize: 30, fontWeight: '800', letterSpacing: -0.5, textAlign: 'center' },
-  chooserSub: { fontSize: 15, marginTop: 12, marginBottom: 30, textAlign: 'center', lineHeight: 21 },
-  chooserBtnRow: { flexDirection: 'row', gap: 12, alignSelf: 'stretch' },
-  chooserBtn: {
-    flex: 1, borderRadius: 18, paddingVertical: 18,
-    alignItems: 'center', gap: 4,
-    shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.25, shadowRadius: 12, elevation: 6,
-  },
-  chooserBtnOutline: { borderWidth: 2, shadowOpacity: 0 },
-  chooserBtnLabel: { fontSize: 17, fontWeight: '800', color: '#fff', letterSpacing: -0.2 },
-  chooserBtnTime: { fontSize: 12.5, fontWeight: '600', color: '#ffffffcc' },
 
   content: { padding: 16, paddingBottom: 64 },
 
