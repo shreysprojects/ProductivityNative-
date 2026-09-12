@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert } from 'react-native'
 import { Image } from 'expo-image'
+import ExerciseVideo from '../components/ExerciseVideo'
 import { router, useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import { useAuth } from '../lib/AuthContext'
@@ -467,6 +468,10 @@ export default function WorkoutRun() {
           {ex.category ? <Text style={s.exCategory}>{ex.category}</Text> : null}
           {ex.gifUrl && (
             <Image source={{ uri: ex.gifUrl }} style={s.exImage} contentFit="contain" autoplay />
+          )}
+          {/* Custom exercises carry a YouTube demo instead of a GIF */}
+          {!ex.gifUrl && !!ex.videoId && (
+            <ExerciseVideo videoId={ex.videoId} style={{ marginBottom: 4 }} />
           )}
         </View>
 

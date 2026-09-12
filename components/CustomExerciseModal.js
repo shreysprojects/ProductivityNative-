@@ -4,6 +4,7 @@ import {
   KeyboardAvoidingView, Platform, SafeAreaView, ActivityIndicator, Alert,
 } from 'react-native'
 import { MUSCLE_OPTIONS, suggestMuscles } from '../lib/customExercises'
+import ExerciseVideo from './ExerciseVideo'
 
 // Create (or edit) one of the user's own exercises: a name, an optional
 // description, and the muscles it trains. Tap a muscle once for "main",
@@ -26,6 +27,8 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
   })
   const [aiBusy, setAiBusy] = useState(false)
   const [aiNote, setAiNote] = useState(null)
+  // A YouTube demo the AI step found once it recognised the exercise.
+  const [video, setVideo] = useState(initial?.video ?? null)
 
   const primary = MUSCLE_OPTIONS.filter(n => picks[n] === 'primary')
   const secondary = MUSCLE_OPTIONS.filter(n => picks[n] === 'secondary')
@@ -59,6 +62,7 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
       for (const n of s) if (MUSCLE_OPTIONS.includes(n) && !m[n]) m[n] = 'secondary'
       setPicks(m)
       setAiNote(data?.note || 'Filled in by AI. Adjust anything that looks off.')
+      if (data?.video?.id) setVideo({ id: String(data.video.id), title: String(data.video.title ?? '') })
     } catch (e) {
       Alert.alert('Could not ask AI', String(e?.message ?? e))
     } finally {
@@ -75,6 +79,7 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
       description: description.trim(),
       primary,
       secondary,
+      video,
     })
   }
 
@@ -158,6 +163,20 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
               })}
             </View>
 
+            {!!video?.id && (
+              <View style={m.videoWrap}>
+                <View style={m.videoHeader}>
+                  <Text style={m.label}>DEMO VIDEO</Text>
+                  <Pressable onPress={() => setVideo(null)} hitSlop={8}>
+                    <Text style={m.videoRemove}>Remove</Text>
+                  </Pressable>
+                </View>
+                <ExerciseVideo videoId={video.id} />
+                {!!video.title && <Text style={m.videoTitle} numberOfLines={2}>{video.title}</Text>}
+                <Text style={m.videoHint}>Found on YouTube for this exercise. It stays with the exercise.</Text>
+              </View>
+            )}
+
             {(primary.length > 0 || secondary.length > 0) && (
               <View style={m.summary}>
                 {primary.length > 0 && (
@@ -218,6 +237,11 @@ const m = StyleSheet.create({
     paddingHorizontal: 12, paddingVertical: 8,
   },
   chipText: { fontSize: 13, fontWeight: '700', color: '#555' },
+  videoWrap: { marginTop: 16 },
+  videoHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  videoRemove: { fontSize: 12, fontWeight: '700', color: '#ef4444' },
+  videoTitle: { fontSize: 13, fontWeight: '600', color: '#333', marginTop: 8, lineHeight: 18 },
+  videoHint: { fontSize: 11.5, color: '#999', marginTop: 4 },
   summary: { marginTop: 14, backgroundColor: '#f6f7fb', borderRadius: 12, padding: 12, gap: 4 },
   summaryLine: { fontSize: 13, color: '#333', lineHeight: 18 },
   deleteBtn: { alignItems: 'center', paddingVertical: 14, marginTop: 20 },

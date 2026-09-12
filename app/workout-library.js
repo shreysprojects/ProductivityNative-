@@ -13,6 +13,7 @@ import { getWorkoutPlan, saveWorkoutPlan, getWorkoutLog, today } from '../lib/st
 import { WGER_CATEGORIES, fetchExercisesByCategory, searchExercises } from '../lib/wgerApi'
 import { getCustomExercises, saveCustomExercise, deleteCustomExercise, toLibraryExercise } from '../lib/customExercises'
 import CustomExerciseModal from '../components/CustomExerciseModal'
+import ExerciseVideo from '../components/ExerciseVideo'
 
 const COLOR = '#6366f1'
 
@@ -55,6 +56,11 @@ function PreviewPanel({ exercise, onClose }) {
           contentFit="contain"
           autoplay
         />
+      ) : exercise.videoId ? (
+        <View style={{ marginBottom: 14 }}>
+          <ExerciseVideo videoId={exercise.videoId} />
+          {!!exercise.videoTitle && <Text style={s.videoTitle} numberOfLines={2}>{exercise.videoTitle}</Text>}
+        </View>
       ) : (
         <View style={s.noVideoWrap}>
           <Text style={s.noVideoText}>No preview available</Text>
@@ -799,6 +805,7 @@ const s = StyleSheet.create({
     height: 60, alignItems: 'center', justifyContent: 'center', marginBottom: 14,
   },
   noVideoText: { fontSize: 13, color: '#bbb' },
+  videoTitle: { fontSize: 12.5, fontWeight: '600', color: '#555', marginTop: 8, lineHeight: 17 },
 
   instructions: { gap: 8, marginTop: 4 },
   instructionRow: { flexDirection: 'row', gap: 10, alignItems: 'flex-start' },
