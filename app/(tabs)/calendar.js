@@ -423,6 +423,8 @@ export default function CalendarScreen() {
   const [attendQueue, setAttendQueue] = useState([])
   // Classes ticked off on the Day section: { `${scheduleId}|${day}`: true }.
   const [classChecks, setClassChecks] = useState({})
+  // Search across every day's classes; non-empty swaps the day list for results.
+  const [classQuery, setClassQuery] = useState('')
   // "Ask me later" holds off until the next app launch, so dismissing doesn't
   // re-prompt every time this tab regains focus.
   const attendSnoozed = useRef(false)
@@ -603,6 +605,50 @@ export default function CalendarScreen() {
     if (!weekDays.some(busy)) return weekDays
     return weekDays.filter(d => busy(d) || d === logDay)
   }, [weekDays, logDay, weekEventsByDay])
+
+  // Class search: every schedule item (so clubs too) whose name, code, type,
+  // room or weekday matches the query. One result per meeting, so a class on
+  // three days is three cards, each with the next date it happens.
+  const classSearching = classQuery.trim().length > 0
+  const classSearchResults = useMemo(() => {
+    const q = classQuery.trim().toLowerCase()
+    if (!q) return []
+    const DAY_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+    const out = []
+    for (const item of scheduleItems) {
+      if (!Array.isArray(item?.days) || !item.startTime || !item.endTime) continue
+      const type = item.meta?.type || 'Class'
+      const courseCode = item.meta?.courseCode || item.title
+      const courseName = item.meta?.courseName && item.meta.courseName !== courseCode
+        ? item.meta.courseName
+        : item.title
+      const hay = [item.title, courseCode, courseName, type, item.location].filter(Boolean).join(' ').toLowerCase()
+      for (const dow of item.days) {
+        const dayName = DAY_FULL[dow] ?? ''
+        if (!hay.includes(q) && !dayName.toLowerCase().startsWith(q)) continue
+        // The next date this meeting happens, inside its semester if one is set.
+        let date = null
+        for (let i = 0; i < 7; i++) {
+          const d = addDays(today, i)
+          if (new Date(d + 'T12:00:00').getDay() !== dow) continue
+          if (item.semesterStart && d < item.semesterStart) break
+          if (item.semesterEnd && d > item.semesterEnd) break
+          date = d
+          break
+        }
+        out.push({
+          key: `${item.id}|${dow}`, item, dow, date,
+          color: item.color ?? theme.accent,
+          dayName: dayName.slice(0, 3),
+          dateLabel: date ? new Date(date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '',
+          startTime: item.startTime, endTime: item.endTime,
+          type, courseCode, courseName, location: item.location ?? null,
+        })
+      }
+    }
+    // Monday first, then by start time.
+    return out.sort((a, b) => (((a.dow + 6) % 7) - ((b.dow + 6) % 7)) || a.startTime.localeCompare(b.startTime))
+  }, [classQuery, scheduleItems, today, theme.accent])
 
   const upcomingEvents = useMemo(() => {
     const tomorrow = tomorrowStr()
@@ -1659,6 +1705,67 @@ export default function CalendarScreen() {
               </View>
             </View>
 
+            {/* Search across every day's classes */}
+            <View style={[s.classSearchRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+              <Text style={s.classSearchIcon}>🔍</Text>
+              <TextInput
+                style={[s.classSearchInput, { color: theme.text }]}
+                placeholder="Search classes, clubs, rooms, days…"
+                placeholderTextColor={theme.muted}
+                value={classQuery}
+                onChangeText={setClassQuery}
+                autoCapitalize="none"
+                autoCorrect={false}
+                returnKeyType="search"
+              />
+              {!!classQuery && (
+                <Pressable onPress={() => setClassQuery('')} hitSlop={10}>
+                  <Text style={[s.classSearchClear, { color: theme.muted }]}>✕</Text>
+                </Pressable>
+              )}
+            </View>
+
+            {classSearching ? (
+              <View style={s.dayScheduleList}>
+                <Text style={[s.classSearchCount, { color: theme.subtext }]}>
+                  {classSearchResults.length === 0
+                    ? `No classes match “${classQuery.trim()}”`
+                    : `${classSearchResults.length} match${classSearchResults.length === 1 ? '' : 'es'} across the week · tap one to jump to its day`}
+                </Text>
+                {classSearchResults.map(r => (
+                  <Pressable
+                    key={r.key}
+                    style={[s.searchCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, borderLeftColor: r.color }]}
+                    onPress={() => { if (r.date) setLogDay(r.date); setClassQuery('') }}
+                  >
+                    <View style={s.searchCardTop}>
+                      <Text style={[s.searchCardDay, { color: r.color }]}>
+                        {r.dayName}{r.dateLabel ? ` · ${r.dateLabel}` : ''}
+                      </Text>
+                      <Text style={[s.searchCardTime, { color: theme.subtext }]}>
+                        {fmtTime(r.startTime)} – {fmtTime(r.endTime)}
+                      </Text>
+                    </View>
+                    <View style={s.dayClassTopRow}>
+                      <View style={[s.dayCoursePill, { backgroundColor: r.color }]}>
+                        <Text style={s.dayCoursePillText} numberOfLines={1}>{r.courseCode}</Text>
+                      </View>
+                      <View style={[s.dayTypePill, { backgroundColor: r.color + '20' }]}>
+                        <Text style={[s.dayTypePillText, { color: r.color }]}>{r.type}</Text>
+                      </View>
+                      <Pressable style={s.searchEditBtn} onPress={() => openEditClass(r.item)} hitSlop={8}>
+                        <Text style={[s.searchEditText, { color: theme.accent }]}>Edit</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={[s.searchCardName, { color: theme.text }]} numberOfLines={2}>{r.courseName}</Text>
+                    {!!r.location && (
+                      <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {r.location}</Text>
+                    )}
+                  </Pressable>
+                ))}
+              </View>
+            ) : (
+            <>
             <View style={[s.dayPickerCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
               {renderDayPicker(true)}
             </View>
@@ -1730,6 +1837,8 @@ export default function CalendarScreen() {
                 )
               })}
             </View>
+            </>
+            )}
           </View>
 
           {/* ── To-do ── */}
@@ -2421,6 +2530,23 @@ const s = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   dayCheckMark: { color: '#fff', fontWeight: '900', fontSize: 13, lineHeight: 15 },
+
+  // Class search (Day section)
+  classSearchRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    borderRadius: 14, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 2, marginBottom: 12,
+  },
+  classSearchIcon: { fontSize: 13 },
+  classSearchInput: { flex: 1, fontSize: 14, paddingVertical: 10 },
+  classSearchClear: { fontSize: 14, fontWeight: '700', paddingHorizontal: 4 },
+  classSearchCount: { fontSize: 12.5, fontWeight: '600', marginBottom: 2 },
+  searchCard: { borderRadius: 16, borderWidth: 1, borderLeftWidth: 5, padding: 12, gap: 6 },
+  searchCardTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  searchCardDay: { fontSize: 12, fontWeight: '800', letterSpacing: 0.3 },
+  searchCardTime: { fontSize: 12, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  searchCardName: { fontSize: 15, fontWeight: '700', letterSpacing: -0.2 },
+  searchEditBtn: { marginLeft: 'auto', paddingHorizontal: 6, paddingVertical: 2 },
+  searchEditText: { fontSize: 12, fontWeight: '700' },
 
   // Modals
   modalKAV: { flex: 1, justifyContent: 'flex-end' },
