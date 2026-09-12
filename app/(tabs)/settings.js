@@ -33,6 +33,14 @@ import {
 const ACCENT = '#6366f1'
 const DAY_ABBR = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
 
+// The daily targets the Meals tab measures against.
+const GOAL_FIELDS = [
+  { key: 'calories', label: 'Calories', unit: 'kcal' },
+  { key: 'protein',  label: 'Protein',  unit: 'g' },
+  { key: 'carbs',    label: 'Carbs',    unit: 'g' },
+  { key: 'fat',      label: 'Fat',      unit: 'g' },
+]
+
 function SectionHeader({ title, theme }) {
   return (
     <Text style={[st.sectionHeader, { color: theme.muted }]}>{title}</Text>
@@ -293,6 +301,27 @@ export default function SettingsScreen() {
       setCustomFat(String(calculated?.fat ?? ''))
     }
     setIsCustom(v => !v)
+  }
+
+  // The Nutrition Goals card shows the calculated numbers until one is edited;
+  // the first edit takes over from the calculator, seeding the other three
+  // fields with their calculated values so only the touched one changes.
+  const goalSetters = { calories: setCustomCals, protein: setCustomProtein, carbs: setCustomCarbs, fat: setCustomFat }
+  const goalValues  = { calories: customCals, protein: customProtein, carbs: customCarbs, fat: customFat }
+  function goalFieldValue(key) {
+    if (isCustom) return goalValues[key]
+    const v = calculated?.[key]
+    return v == null ? '' : String(v)
+  }
+  function editGoalField(key, v) {
+    if (!isCustom) {
+      setCustomCals(String(calculated?.calories ?? ''))
+      setCustomProtein(String(calculated?.protein ?? ''))
+      setCustomCarbs(String(calculated?.carbs ?? ''))
+      setCustomFat(String(calculated?.fat ?? ''))
+      setIsCustom(true)
+    }
+    goalSetters[key](v)
   }
 
   function handleWorkoutDaysChange(d) {
@@ -869,68 +898,55 @@ export default function SettingsScreen() {
           )}
         </View>
 
-        {/* ── Nutrition Targets ── HIDDEN for now via `false &&` (not deleted) ── */}
-        {false && (<>
-        <SectionHeader title="NUTRITION TARGETS" theme={theme} />
+        {/* ── Nutrition Goals — the targets the Meals tab measures against ── */}
+        <SectionHeader title="NUTRITION GOALS" theme={theme} />
         <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-          {isCustom ? (
-            <>
-              <Text style={[st.customNote, { color: ACCENT }]}>Custom values</Text>
-              <View style={st.customGrid}>
-                {[
-                  { label: 'Calories', val: customCals,    set: setCustomCals,    unit: 'kcal' },
-                  { label: 'Protein',  val: customProtein, set: setCustomProtein, unit: 'g' },
-                  { label: 'Carbs',    val: customCarbs,   set: setCustomCarbs,   unit: 'g' },
-                  { label: 'Fat',      val: customFat,     set: setCustomFat,     unit: 'g' },
-                ].map(f => (
-                  <View key={f.label} style={st.customField}>
-                    <Text style={[st.customFieldLabel, { color: theme.subtext }]}>{f.label}</Text>
-                    <View style={st.customFieldRow}>
-                      <TextInput
-                        style={[st.customFieldInput, { color: theme.text, backgroundColor: theme.input, borderColor: theme.inputBorder }]}
-                        value={f.val}
-                        onChangeText={f.set}
-                        keyboardType="number-pad"
-                        selectTextOnFocus
-                      />
-                      <Text style={[st.customFieldUnit, { color: theme.muted }]}>{f.unit}</Text>
-                    </View>
-                  </View>
-                ))}
+          {GOAL_FIELDS.map((f, i) => (
+            <View key={f.key}>
+              {i > 0 && <View style={[st.tlDivider, { backgroundColor: theme.divider, marginVertical: 8 }]} />}
+              <View style={st.prefRow}>
+                <Text style={[st.prefLabel, { color: theme.text }]}>{f.label}</Text>
+                <View style={st.goalInputWrap}>
+                  <TextInput
+                    value={goalFieldValue(f.key)}
+                    onChangeText={v => editGoalField(f.key, v)}
+                    keyboardType="number-pad"
+                    placeholder="—"
+                    placeholderTextColor={theme.muted}
+                    selectTextOnFocus
+                    style={[st.goalInput, {
+                      backgroundColor: theme.input,
+                      borderColor: theme.inputBorder,
+                      color: theme.text,
+                    }]}
+                  />
+                  <Text style={[st.goalUnit, { color: theme.muted }]}>{f.unit}</Text>
+                </View>
               </View>
-            </>
-          ) : calculated ? (
-            <>
-              <View style={st.calRow}>
-                <Text style={[st.calNum, { color: theme.text }]}>{calculated.calories.toLocaleString()}</Text>
-                <Text style={[st.calUnit, { color: theme.subtext }]}>kcal / day</Text>
-              </View>
-              <View style={st.macroRow}>
-                {[
-                  { label: 'Protein', val: calculated.protein, color: '#ef4444' },
-                  { label: 'Carbs',   val: calculated.carbs,   color: '#f59e0b' },
-                  { label: 'Fat',     val: calculated.fat,     color: '#3b82f6' },
-                ].map(m => (
-                  <View key={m.label} style={st.macroBox}>
-                    <Text style={[st.macroVal, { color: m.color }]}>{m.val}g</Text>
-                    <Text style={[st.macroLabel, { color: theme.muted }]}>{m.label}</Text>
-                  </View>
-                ))}
-              </View>
-            </>
-          ) : (
-            <Text style={[st.noCalcNote, { color: theme.muted }]}>
-              Fill in your stats, goal, and activity level above to get auto-calculated targets.
-            </Text>
-          )}
+            </View>
+          ))}
 
-          <Pressable style={st.customToggle} onPress={enableCustom}>
-            <Text style={[st.customToggleText, { color: ACCENT }]}>
-              {isCustom ? '← Use calculated values' : 'Use my own numbers  →'}
-            </Text>
+          <Pressable
+            onPress={save}
+            disabled={saving}
+            style={[st.saveGoalsBtn, { backgroundColor: ACCENT }, saving && { opacity: 0.6 }]}
+          >
+            <Text style={st.saveGoalsText}>{saving ? 'Saving…' : 'Save Goals'}</Text>
           </Pressable>
+
+          <Text style={[st.tlFootnote, { color: theme.muted, marginTop: 10 }]}>
+            {isCustom
+              ? 'Your own numbers. Leave everything blank to track meals without targets.'
+              : calculated
+                ? 'Calculated from your stats above. Edit any number to set your own.'
+                : 'Fill in your stats above for calculated targets, or type your own numbers.'}
+          </Text>
+          {isCustom && calculated && (
+            <Pressable style={st.customToggle} onPress={enableCustom}>
+              <Text style={[st.customToggleText, { color: ACCENT }]}>← Use calculated values</Text>
+            </Pressable>
+          )}
         </View>
-        </>)}
 
         {/* ── Time Logging ──────────────────────────────────────────── */}
         <SectionHeader title="TIME LOGGING" theme={theme} />
@@ -1048,7 +1064,7 @@ export default function SettingsScreen() {
 
           <Text style={[st.prefGroupLabel, { color: theme.muted }]}>BOTTOM TABS</Text>
           {[
-            ['tabMeals', '🍽️', 'Nutrition'],
+            ['tabMeals', '🍽️', 'Meals'],
             ['tabCalendar', '📅', 'Calendar'],
             ['tabExplore', '🧭', 'Explore'],
           ].map(([key, icon, label]) => (
@@ -1308,6 +1324,17 @@ const st = StyleSheet.create({
   customFieldUnit: { fontSize: 12, fontWeight: '600' },
   customToggle: { alignItems: 'center', paddingTop: 12 },
   customToggleText: { fontSize: 13, fontWeight: '700' },
+
+  // Nutrition Goals card (same layout as HabitLog's editor)
+  goalInputWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  goalInput: {
+    minWidth: 84, borderWidth: 1, borderRadius: 10,
+    paddingHorizontal: 10, paddingVertical: 7,
+    fontSize: 14, fontWeight: '600', textAlign: 'right',
+  },
+  goalUnit: { fontSize: 12, fontWeight: '600', width: 30 },
+  saveGoalsBtn: { borderRadius: 12, paddingVertical: 11, alignItems: 'center', marginTop: 14 },
+  saveGoalsText: { color: '#ffffff', fontWeight: '700', fontSize: 14 },
 
   prefRow: {
     flexDirection: 'row', alignItems: 'center',

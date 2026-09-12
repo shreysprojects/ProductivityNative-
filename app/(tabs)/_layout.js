@@ -9,8 +9,10 @@ import { getSections, onSectionsChange, DEFAULT_SECTIONS } from '../../lib/secti
 
 const TABS = [
   { name: 'index',    label: 'Routines',  icon: 'today-outline',       iconActive: 'today' },
+  // Meals is always shown: the BOTTOM TABS toggle group in Settings is hidden,
+  // so no sectionKey here — a stale `tabMeals: false` can't make it vanish.
+  { name: 'meals',    label: 'Meals',     icon: 'restaurant-outline',  iconActive: 'restaurant' },
   // HIDDEN for now (not deleted) — restore by uncommenting:
-  // { name: 'meals',    label: 'Nutrition', icon: 'restaurant-outline',  iconActive: 'restaurant', sectionKey: 'tabMeals' },
   // { name: 'explore',  label: 'Explore',   icon: 'compass-outline',     iconActive: 'compass',    sectionKey: 'tabExplore' },
   { name: 'calendar', label: 'Calendar',  icon: 'calendar-outline',    iconActive: 'calendar',   sectionKey: 'tabCalendar' },
   { name: 'settings', label: 'Settings',  icon: 'settings-outline',    iconActive: 'settings' },
@@ -110,7 +112,7 @@ export default function TabsLayout() {
       }}
     >
       <Tabs.Screen name="index"    options={{ title: 'My Routines' }} />
-      <Tabs.Screen name="meals"    options={{ title: 'Nutrition' }} />
+      <Tabs.Screen name="meals"    options={{ title: 'Meals' }} />
       <Tabs.Screen name="calendar" options={{ title: 'Calendar' }} />
       <Tabs.Screen name="settings" options={{ title: 'Settings' }} />
       <Tabs.Screen name="explore"  options={{ title: 'Explore Routines' }} />
