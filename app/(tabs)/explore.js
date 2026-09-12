@@ -2,8 +2,9 @@ import { useState, useCallback, useLayoutEffect, useEffect, useMemo, useRef } fr
 import {
   View, Text, Pressable, StyleSheet, FlatList, Modal,
   Alert, ActivityIndicator, ScrollView, TextInput, Switch, Share,
-  KeyboardAvoidingView, Platform,
+  KeyboardAvoidingView, Platform, Animated,
 } from 'react-native'
+import { useSheetDrag } from '../../lib/useSheetDrag'
 import { Image } from 'expo-image'
 import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
@@ -711,13 +712,18 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
 
   const SECTION_LABELS = { routine: 'CHOOSE ROUTINE', workout: 'CHOOSE WORKOUT', meal_day: 'CHOOSE MEAL DAY' }
 
+  const drag = useSheetDrag(onClose, { visible })
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={drag.close}>
       <KeyboardAvoidingView style={ec.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <Pressable style={ec.overlayBg} onPress={onClose} />
-        <View style={[ec.sheet, { backgroundColor: theme.card }]}>
-          <View style={[ec.handle, { backgroundColor: theme.divider }]} />
-          <Text style={[ec.sheetTitle, { color: theme.text }]}>Post to Community</Text>
+        <Animated.View pointerEvents="none" style={[ec.overlayBg, { opacity: drag.backdrop }]} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} />
+        <Animated.View style={[ec.sheet, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={[ec.handle, { backgroundColor: theme.divider }]} />
+            <Text style={[ec.sheetTitle, { color: theme.text }]}>Post to Community</Text>
+          </View>
 
           {/* Tab bar */}
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={ec.tabBar} contentContainerStyle={ec.tabBarContent}>
@@ -774,7 +780,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
               <Text style={{ color: theme.subtext, fontWeight: '600', fontSize: 15 }}>Cancel</Text>
             </Pressable>
           </ScrollView>
-        </View>
+        </Animated.View>
       </KeyboardAvoidingView>
     </Modal>
   )

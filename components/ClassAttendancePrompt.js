@@ -1,5 +1,6 @@
-import { View, Text, Pressable, Modal, StyleSheet } from 'react-native'
+import { View, Text, Pressable, Modal, StyleSheet, Animated } from 'react-native'
 import { useTheme } from '../lib/ThemeContext'
+import { useSheetDrag } from '../lib/useSheetDrag'
 
 // Asks whether a class that has already finished was actually attended. A yes
 // writes it onto the time log; a no is remembered so the same class is never
@@ -15,19 +16,22 @@ export default function ClassAttendancePrompt({
   item, index = 0, total = 1, onAttended, onSkipped, onClose,
 }) {
   const { theme } = useTheme()
+  // Pulling the sheet down means "ask me later", like tapping outside it.
+  const drag = useSheetDrag(onClose)
   if (!item) return null
 
   return (
-    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible transparent animationType="slide" onRequestClose={drag.close}>
       <View style={ap.wrap}>
-        <Pressable style={StyleSheet.absoluteFillObject} onPress={onClose} />
-        <View style={[ap.sheet, { backgroundColor: theme.card }]}>
-          <View style={[ap.handle, { backgroundColor: theme.divider }]} />
-
-          <Text style={[ap.title, { color: theme.text }]}>Did you attend this class?</Text>
-          {total > 1 && (
-            <Text style={[ap.counter, { color: theme.muted }]}>{index + 1} of {total}</Text>
-          )}
+        <Pressable style={StyleSheet.absoluteFillObject} onPress={drag.close} />
+        <Animated.View style={[ap.sheet, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={[ap.handle, { backgroundColor: theme.divider }]} />
+            <Text style={[ap.title, { color: theme.text }]}>Did you attend this class?</Text>
+            {total > 1 && (
+              <Text style={[ap.counter, { color: theme.muted }]}>{index + 1} of {total}</Text>
+            )}
+          </View>
 
           <View style={[ap.card, {
             backgroundColor: (item.color ?? theme.accent) + (theme.isDark ? '24' : '14'),
@@ -52,10 +56,10 @@ export default function ClassAttendancePrompt({
             <Text style={[ap.noText, { color: theme.subtext }]}>No, I missed it</Text>
           </Pressable>
 
-          <Pressable onPress={onClose} hitSlop={8} style={ap.laterBtn}>
+          <Pressable onPress={drag.close} hitSlop={8} style={ap.laterBtn}>
             <Text style={[ap.laterText, { color: theme.muted }]}>Ask me later</Text>
           </Pressable>
-        </View>
+        </Animated.View>
       </View>
     </Modal>
   )
