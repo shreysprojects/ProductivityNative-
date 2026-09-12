@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView, FlatList,
   Alert, TextInput, Modal, Animated, ActivityIndicator, Dimensions,
-  Linking, Platform,
+  Linking, Platform, PanResponder,
 } from 'react-native'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import Svg, { Polyline, Circle, Line as SvgLine } from 'react-native-svg'
@@ -1892,6 +1892,36 @@ export default function RoutineScreen() {
   const [previewExDetail, setPreviewExDetail] = useState(null)
   const [viewMode, setViewMode] = useState('steps')
 
+  // Pull-down-to-dismiss for the workout preview sheet: the handle strip and
+  // the title header are grab areas; a long pull or a quick flick closes the
+  // whole sheet (detail view included), a short one snaps back.
+  const previewDragY = useRef(new Animated.Value(0)).current
+  const previewBackdrop = useRef(previewDragY.interpolate({
+    inputRange: [0, 260], outputRange: [1, 0], extrapolate: 'clamp',
+  })).current
+  const closePreview = () => {
+    Animated.timing(previewDragY, {
+      toValue: Dimensions.get('window').height, duration: 180, useNativeDriver: true,
+    }).start(() => {
+      setPreviewRoutine(null)
+      setPreviewExDetail(null)
+      previewDragY.setValue(0)
+    })
+  }
+  const previewHandlePan = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderMove: (_, g) => { previewDragY.setValue(Math.max(0, g.dy)) },
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderRelease: (_, g) => {
+      if (g.dy > 120 || (g.dy > 40 && g.vy > 0.6)) closePreview()
+      else Animated.spring(previewDragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+    onPanResponderTerminate: () => {
+      Animated.spring(previewDragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+  })).current
+
   const startBtnScale = useRef(new Animated.Value(1)).current
   const doneAnim      = useRef(new Animated.Value(0)).current
   // Content cross-fade: starts hidden so the first load fades in smoothly,
@@ -2223,6 +2253,7 @@ export default function RoutineScreen() {
 
   async function openRoutinePreview(routine) {
     setPreviewExDetail(null)
+    previewDragY.setValue(0)
     setPreviewRoutine(routine)
     setPreviewExercises([])
     setLoadingPreview(true)
@@ -2740,9 +2771,12 @@ export default function RoutineScreen() {
               onRequestClose={() => { if (previewExDetail) setPreviewExDetail(null); else setPreviewRoutine(null) }}
             >
               <View style={s.previewOverlay}>
-                <Pressable style={s.previewBg} onPress={() => { if (previewExDetail) setPreviewExDetail(null); else setPreviewRoutine(null) }} />
-                <View style={[s.previewSheet, { backgroundColor: theme.card }]}>
-                  <View style={[s.previewHandle, { backgroundColor: theme.divider }]} />
+                <Animated.View pointerEvents="none" style={[s.previewBg, { opacity: previewBackdrop }]} />
+                <Pressable style={StyleSheet.absoluteFill} onPress={() => { if (previewExDetail) setPreviewExDetail(null); else closePreview() }} />
+                <Animated.View style={[s.previewSheet, { backgroundColor: theme.card, transform: [{ translateY: previewDragY }] }]}>
+                  <View {...previewHandlePan.panHandlers} style={s.previewGrabArea}>
+                    <View style={[s.previewHandle, { backgroundColor: theme.divider }]} />
+                  </View>
 
                   {/* ── Exercise detail view ── */}
                   {previewExDetail ? (
@@ -2800,7 +2834,7 @@ export default function RoutineScreen() {
                     <>
                       {previewRoutine && (
                         <>
-                          <View style={s.previewSheetHeader}>
+                          <View {...previewHandlePan.panHandlers} style={s.previewSheetHeader}>
                             <View style={{ flex: 1 }}>
                               <Text style={[s.previewSheetTitle, { color: theme.text }]}>{previewRoutine.name}</Text>
                               <Text style={[s.previewSheetMeta, { color: theme.subtext }]}>
@@ -2870,7 +2904,7 @@ export default function RoutineScreen() {
                       </View>
                     </>
                   )}
-                </View>
+                </Animated.View>
               </View>
             </Modal>
           </View>
@@ -3422,7 +3456,9 @@ const s = StyleSheet.create({
     shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
     shadowOpacity: 0.12, shadowRadius: 16, elevation: 16,
   },
-  previewHandle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 18 },
+  // Full-width strip around the handle so it is a real grab target.
+  previewGrabArea: { marginHorizontal: -20, paddingHorizontal: 20, paddingTop: 4, paddingBottom: 14 },
+  previewHandle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center' },
   previewSheetHeader: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 14, gap: 10 },
   previewSheetTitle: { fontSize: 20, fontWeight: '800' },
   previewSheetMeta: { fontSize: 13, marginTop: 3 },
