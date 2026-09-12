@@ -19,6 +19,7 @@ import {
   getRoutineNames, getRoutineSettings, getHiddenDefaults, getRoutineGroupMap,
 } from '../../lib/storage'
 import { readingStats } from '../../lib/textStats'
+import { getClassChecks, setClassCheck, classCheckKey } from '../../lib/classChecks'
 import DayLogTimeline from '../../components/DayLogTimeline'
 import ScanScheduleModal from '../../components/ScanScheduleModal'
 import ClassAttendancePrompt from '../../components/ClassAttendancePrompt'
@@ -420,6 +421,8 @@ export default function CalendarScreen() {
 
   // Classes that finished today and haven't been answered for yet.
   const [attendQueue, setAttendQueue] = useState([])
+  // Classes ticked off on the Day section: { `${scheduleId}|${day}`: true }.
+  const [classChecks, setClassChecks] = useState({})
   // "Ask me later" holds off until the next app launch, so dismissing doesn't
   // re-prompt every time this tab regains focus.
   const attendSnoozed = useRef(false)
@@ -458,7 +461,7 @@ export default function CalendarScreen() {
   const load = useCallback(async () => {
     if (!user) return
     try {
-      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs, dueByWeekday] = await Promise.all([
+      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs, dueByWeekday, checks] = await Promise.all([
         getHistory(user.id), getStreak(user.id),
         getCalendarEvents(user.id), getScheduleItems(user.id),
         getTasks(user.id), getJournalEntries(user.id),
@@ -466,7 +469,9 @@ export default function CalendarScreen() {
         // Never let the time-log sync take the whole calendar down with it.
         getAllTimeLogs(user.id).catch(() => ({})),
         loadDueByWeekday(user.id),
+        getClassChecks(user.id).catch(() => ({})),
       ])
+      setClassChecks(checks)
       setLogSettings(lSettings)
       const counts = {}
       for (const [d, slots] of Object.entries(allLogs)) counts[d] = Object.keys(slots).length
@@ -958,25 +963,59 @@ export default function CalendarScreen() {
     return () => { cancelled = true }
   }, [user, scheduleItems, logSettings.enabled])
 
+  // Write an attended class onto the time log (once per class per day; the
+  // marker is claimed even when logging is off, so the prompt won't re-ask).
+  async function logAttendedClass(scheduleId, day, title, startTime, endTime) {
+    const start = timeToMins(startTime)
+    if (start === null) return
+    const end = timeToMins(endTime)
+    const written = await autoLogSpan(user.id, `class:${scheduleId}:${day}`, {
+      day,
+      startMins: start,
+      durationMins: Math.max(0, (end ?? start) - start),
+      text: title,
+      kind: 'class',
+    }).catch(() => 0)
+    if (written > 0) {
+      setLogCounts(prev => ({ ...prev, [day]: (prev[day] ?? 0) + written }))
+      setLogRefresh(n => n + 1)
+    }
+  }
+
   async function answerAttendance(attended) {
     const item = attendQueue[0]
     if (!item) return
     setAttendQueue(q => q.slice(1))
     const marker = `class:${item.id}:${item.day}`
-    const start = timeToMins(item.startTime)
-    if (!attended || start === null) { dismissAutoLog(user.id, marker).catch(() => {}); return }
+    if (!attended || timeToMins(item.startTime) === null) {
+      dismissAutoLog(user.id, marker).catch(() => {})
+      return
+    }
+    // Attended: the class turns green on the Day section as well.
+    const key = classCheckKey(item.id, item.day)
+    setClassChecks(prev => ({ ...prev, [key]: true }))
+    setClassCheck(user.id, key, true).catch(() => {})
+    await logAttendedClass(item.id, item.day, item.title, item.startTime, item.endTime)
+  }
 
-    const end = timeToMins(item.endTime)
-    const written = await autoLogSpan(user.id, marker, {
-      day: item.day,
-      startMins: start,
-      durationMins: Math.max(0, (end ?? start) - start),
-      text: item.title,
-      kind: 'class',
-    }).catch(() => 0)
-    if (written > 0) {
-      setLogCounts(prev => ({ ...prev, [item.day]: (prev[item.day] ?? 0) + written }))
-      setLogRefresh(n => n + 1)
+  // Tick a class off for the day shown. A tick also counts as attended: it
+  // goes on the time log (if logging is on) and the after-class prompt won't
+  // ask about it. An untick only clears the tick.
+  async function toggleClassCheck(ev) {
+    const day = logDay
+    const key = classCheckKey(ev._scheduleId, day)
+    const on = !classChecks[key]
+    setClassChecks(prev => ({ ...prev, [key]: on }))
+    try {
+      await setClassCheck(user.id, key, on)
+    } catch (e) {
+      setClassChecks(prev => ({ ...prev, [key]: !on }))
+      Alert.alert('Could not save', String(e?.message ?? e))
+      return
+    }
+    if (on) {
+      setAttendQueue(q => q.filter(i => !(i.id === ev._scheduleId && i.day === day)))
+      await logAttendedClass(ev._scheduleId, day, ev.title, ev.startTime, ev.endTime)
     }
   }
 
@@ -1637,6 +1676,11 @@ export default function CalendarScreen() {
                 const courseName = ev.meta?.courseName && ev.meta.courseName !== courseCode
                   ? ev.meta.courseName
                   : ev.title
+                // A ticked class goes green. Only classes (not one-off events)
+                // can be ticked, and only for today or earlier.
+                const canCheck = ev.kind === 'class' && logDay <= today
+                const checked = canCheck && !!classChecks[classCheckKey(ev._scheduleId, logDay)]
+                const accent = checked ? '#10b981' : ev.color
                 return (
                   <View key={ev.id} style={s.dayClassRow}>
                     <View style={s.dayClassTimeCol}>
@@ -1647,19 +1691,31 @@ export default function CalendarScreen() {
                     <Pressable
                       onPress={() => handleWeekEventPress(ev)}
                       style={[s.dayClassCard, {
-                        backgroundColor: ev.color + (theme.isDark ? '24' : '16'),
-                        borderLeftColor: ev.color,
-                        borderColor: ev.color + '40',
+                        backgroundColor: accent + (theme.isDark ? '24' : '16'),
+                        borderLeftColor: accent,
+                        borderColor: accent + '40',
                       }]}
                     >
                       <View style={s.dayClassTopRow}>
-                        <View style={[s.dayCoursePill, { backgroundColor: ev.color }]}>
+                        <View style={[s.dayCoursePill, { backgroundColor: accent }]}>
                           <Text style={s.dayCoursePillText} numberOfLines={1}>{courseCode}</Text>
                         </View>
-                        <View style={[s.dayTypePill, { backgroundColor: ev.color + '20' }]}>
-                          <Text style={[s.dayTypePillText, { color: ev.color }]}>{classType}</Text>
+                        <View style={[s.dayTypePill, { backgroundColor: accent + '20' }]}>
+                          <Text style={[s.dayTypePillText, { color: accent }]}>{classType}</Text>
                         </View>
-                        <Text style={[s.dayDuration, { color: ev.color }]}>{formatDuration(ev.startTime, ev.endTime)}</Text>
+                        <Text style={[s.dayDuration, { color: accent }]}>{formatDuration(ev.startTime, ev.endTime)}</Text>
+                        {canCheck && (
+                          <Pressable
+                            onPress={() => toggleClassCheck(ev)}
+                            hitSlop={10}
+                            style={[s.dayCheck, {
+                              borderColor: checked ? '#10b981' : ev.color + '80',
+                              backgroundColor: checked ? '#10b981' : 'transparent',
+                            }]}
+                          >
+                            {checked && <Text style={s.dayCheckMark}>✓</Text>}
+                          </Pressable>
+                        )}
                       </View>
                       <Text style={[s.dayClassName, { color: theme.text }]} numberOfLines={2}>{courseName}</Text>
                       {!!ev.location && (
@@ -1667,6 +1723,7 @@ export default function CalendarScreen() {
                       )}
                       <Text style={[s.dayClassRange, { color: theme.muted }]}>
                         {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
+                        {checked && <Text style={s.dayClassDone}>   ✓ Attended</Text>}
                       </Text>
                     </Pressable>
                   </View>
@@ -2358,6 +2415,12 @@ const s = StyleSheet.create({
   dayClassName: { fontSize: 17, lineHeight: 21, fontWeight: '800', letterSpacing: -0.25 },
   dayClassLocation: { fontSize: 13, lineHeight: 18, fontWeight: '600' },
   dayClassRange: { fontSize: 11.5, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  dayClassDone: { color: '#10b981', fontWeight: '800' },
+  dayCheck: {
+    width: 26, height: 26, borderRadius: 13, borderWidth: 2, marginLeft: 8,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  dayCheckMark: { color: '#fff', fontWeight: '900', fontSize: 13, lineHeight: 15 },
 
   // Modals
   modalKAV: { flex: 1, justifyContent: 'flex-end' },
