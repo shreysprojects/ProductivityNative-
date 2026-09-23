@@ -177,7 +177,7 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
             <Text style={bc.frameHint}>Point at a product barcode</Text>
             {onSearchInstead && (
               <Pressable style={bc.searchInstead} onPress={onSearchInstead}>
-                <Text style={bc.searchInsteadText}>🔍  Search by name instead</Text>
+                <Text style={bc.searchInsteadText}>✨  Describe it to AI instead</Text>
               </Pressable>
             )}
           </View>
@@ -200,7 +200,7 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
             </Pressable>
             {onSearchInstead && (
               <Pressable onPress={onSearchInstead} style={{ marginTop: 12, alignItems: 'center' }}>
-                <Text style={bc.link}>Search by name instead</Text>
+                <Text style={bc.link}>Describe it to AI instead</Text>
               </Pressable>
             )}
             <Pressable onPress={onClose} style={{ marginTop: 10, alignItems: 'center' }}>

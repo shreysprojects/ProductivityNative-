@@ -5,6 +5,19 @@ import {
 } from 'react-native'
 import { mapNutriments } from './BarcodeScanner'
 import AIFoodEstimate from './AIFoodEstimate'
+import { rankCommonFoods, unshout, dedupeProducts, interleave } from '../lib/foodSearch'
+
+// Two sources, two groups. USDA FoodData Central's generic data (Foundation,
+// SR Legacy and the FNDDS survey foods, which are named as eaten: "Chicken
+// breast, grilled") answers "what is in a banana"; its Branded data and Open
+// Food Facts answer "what is in this product". Mixing them in one list let
+// all-caps store products bury the plain food, so they are shown apart.
+//
+// The USDA key is free (https://fdc.nal.usda.gov/api-key-signup.html) and
+// allows 1,000 requests an hour per device; the demo key it falls back to
+// allows about 30, which a few searches use up.
+const USDA_KEY = process.env.EXPO_PUBLIC_USDA_API_KEY || 'DEMO_KEY'
+const USDA_COMMON_TYPES = 'Foundation,SR Legacy,Survey (FNDDS)'
 
 // ── USDA FoodData Central normalization ────────────────────────────────────
 function normalizeUSDA(food) {
@@ -16,14 +29,18 @@ function normalizeUSDA(food) {
     return match.value || 0
   }
   const kcal = food.foodNutrients?.find(n => n.nutrientName === 'Energy' && n.unitName === 'KCAL')?.value || 0
-  const servingQty = food.servingSize || 100
+  const branded = food.dataType === 'Branded'
+  // Generic entries are per 100 g with no serving of their own.
+  const servingQty = (branded && food.servingSize) || 100
+  const brand = branded ? unshout(food.brandName || food.brandOwner || '') : ''
   return {
     code: `usda_${food.fdcId}`,
-    product_name: food.description,
-    brands: food.brandName || food.brandOwner || null,
-    serving_size: servingQty ? `${Math.round(servingQty)}${food.servingSizeUnit || 'g'}` : null,
+    product_name: branded ? unshout(food.description) : food.description,
+    brands: brand || null,
+    serving_size: servingQty ? `${Math.round(servingQty)}${(branded && food.servingSizeUnit) || 'g'}` : null,
     serving_quantity: servingQty,
     source: 'USDA',
+    group: branded ? 'product' : 'common',
     nutriments: {
       'energy-kcal_100g': kcal,
       'proteins_100g': getN('Protein'),
@@ -49,18 +66,43 @@ function timedFetch(url, ms = 10000) {
   return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(tid))
 }
 
+// Open Food Facts' legacy search.pl is gone (it answers 503 pages); this is
+// its Elasticsearch replacement, which also ranks by relevance.
 async function searchOFF(query) {
-  const url = `https://world.openfoodfacts.org/cgi/search.pl?action=process&search_terms=${encodeURIComponent(query)}&search_simple=1&json=1&page_size=20`
+  const url = `https://search.openfoodfacts.org/search?q=${encodeURIComponent(query)}&page_size=12&fields=code,product_name,product_name_en,brands,nutriments,serving_size,serving_quantity`
   const res = await timedFetch(url)
+  if (!res.ok) throw new Error(`OFF HTTP ${res.status}`)
   const json = await res.json()
-  return (json.products || [])
+  return (json.hits || [])
     .filter(p => (p.product_name || p.product_name_en)?.trim())
-    .map(p => ({ ...p, product_name: p.product_name || p.product_name_en, source: 'OFF' }))
+    .map(p => {
+      // The search index rarely carries a serving. Without one, show the
+      // product per 100 g and drop any per-serving values so the label and
+      // the numbers agree.
+      const qty = parseFloat(p.serving_quantity)
+      const hasServing = Number.isFinite(qty) && qty > 0
+      const nutriments = hasServing
+        ? (p.nutriments || {})
+        : Object.fromEntries(Object.entries(p.nutriments || {}).filter(([k]) => !k.endsWith('_serving')))
+      return {
+        ...p,
+        product_name: p.product_name || p.product_name_en,
+        nutriments,
+        serving_quantity: hasServing ? qty : 100,
+        serving_size: hasServing ? (p.serving_size || `${qty}g`) : '100g',
+        source: 'OFF',
+        group: 'product',
+      }
+    })
 }
 
-async function searchUSDA(query) {
-  const url = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${encodeURIComponent(query)}&api_key=DEMO_KEY&pageSize=20&dataType=Branded,Foundation,SR%20Legacy`
+// A USDA search for one family of data types; the demo key's hourly cap
+// surfaces as 'rate_limited' so the screen can say so instead of "no results".
+async function searchUSDA(query, dataTypes) {
+  const url = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${encodeURIComponent(query)}&api_key=${encodeURIComponent(USDA_KEY)}&pageSize=15&dataType=${encodeURIComponent(dataTypes)}`
   const res = await timedFetch(url)
+  if (res.status === 429) throw new Error('rate_limited')
+  if (!res.ok) throw new Error(`USDA HTTP ${res.status}`)
   const json = await res.json()
   return (json.foods || []).filter(f => f.description?.trim()).map(normalizeUSDA)
 }
@@ -162,11 +204,13 @@ function ProductDetail({ product, baseMacros, servings, setServings, sectionLabe
 // ── Main export ────────────────────────────────────────────────────────────
 export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd, onClose }) {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
+  const [common, setCommon] = useState([])      // USDA generic foods, re-ranked
+  const [products, setProducts] = useState([])  // USDA Branded + Open Food Facts
   const [loading, setLoading] = useState(false)
   const [searched, setSearched] = useState(false)
   const [offFailed, setOffFailed] = useState(false)
   const [usdaFailed, setUsdaFailed] = useState(false)
+  const [usdaLimited, setUsdaLimited] = useState(false)
   const [selected, setSelected] = useState(null)
   const [baseMacros, setBaseMacros] = useState(null)
   const [servings, setServings] = useState('1')
@@ -175,34 +219,38 @@ export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd,
   const [aiMode, setAiMode] = useState(false)
 
   const search = async () => {
-    if (!query.trim()) return
+    const q = query.trim()
+    if (!q) return
     setLoading(true)
     setSearched(true)
-    setResults([])
+    setCommon([])
+    setProducts([])
     setOffFailed(false)
     setUsdaFailed(false)
+    setUsdaLimited(false)
 
-    const [offResult, usdaResult] = await Promise.allSettled([
-      searchOFF(query.trim()),
-      searchUSDA(query.trim()),
+    const [genericRes, brandedRes, offRes] = await Promise.allSettled([
+      searchUSDA(q, USDA_COMMON_TYPES),
+      searchUSDA(q, 'Branded'),
+      searchOFF(q),
     ])
+    const value = r => (r.status === 'fulfilled' ? r.value : [])
+    const limited = r => r.status === 'rejected' && r.reason?.message === 'rate_limited'
 
-    const off = offResult.status === 'fulfilled' ? offResult.value : []
-    const usda = usdaResult.status === 'fulfilled' ? usdaResult.value : []
+    setUsdaFailed(genericRes.status === 'rejected' && brandedRes.status === 'rejected')
+    setUsdaLimited(limited(genericRes) || limited(brandedRes))
+    setOffFailed(offRes.status === 'rejected')
 
-    if (offResult.status === 'rejected') setOffFailed(true)
-    if (usdaResult.status === 'rejected') setUsdaFailed(true)
-
-    // Interleave: OFF and USDA side-by-side for variety
-    const combined = []
-    const max = Math.max(off.length, usda.length)
-    for (let i = 0; i < max; i++) {
-      if (i < off.length) combined.push(off[i])
-      if (i < usda.length) combined.push(usda[i])
-    }
-    setResults(combined)
+    setCommon(rankCommonFoods(q, value(genericRes)).slice(0, 10))
+    setProducts(dedupeProducts(interleave(value(brandedRes), value(offRes))).slice(0, 16))
     setLoading(false)
   }
+
+  const results = [...common, ...products]
+  const groups = [
+    { key: 'common', title: 'COMMON FOODS', items: common },
+    { key: 'products', title: 'PRODUCTS', items: products },
+  ]
 
   const selectProduct = (product) => {
     const mapped = mapNutriments(product.nutriments || {}, product.serving_quantity)
@@ -309,22 +357,26 @@ export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd,
               {loading && (
                 <View style={fs.centered}>
                   <ActivityIndicator size="large" color={sectionColor} />
-                  <Text style={fs.loadingText}>Searching Open Food Facts + USDA…</Text>
+                  <Text style={fs.loadingText}>Searching USDA + Open Food Facts…</Text>
                 </View>
               )}
 
               {!loading && searched && results.length === 0 && (
                 <View style={fs.centered}>
                   <Text style={fs.emptyEmoji}>{offFailed && usdaFailed ? '⚠️' : '🔍'}</Text>
-                  <Text style={fs.emptyTitle}>{offFailed && usdaFailed ? 'Connection error' : 'No results found'}</Text>
-                  <Text style={fs.emptyDesc}>
-                    {offFailed && usdaFailed
-                      ? 'Could not reach food databases. Check your internet connection and try again.'
-                      : 'Try different keywords or scan the product barcode instead.'}
+                  <Text style={fs.emptyTitle}>
+                    {usdaLimited && offFailed ? 'Search limit reached' : offFailed && usdaFailed ? 'Connection error' : 'No results found'}
                   </Text>
-                  {(offFailed || usdaFailed) && results.length === 0 && (
+                  <Text style={fs.emptyDesc}>
+                    {usdaLimited && offFailed
+                      ? 'The USDA database allows a limited number of searches an hour. Try again later, or ask the AI above to estimate it.'
+                      : offFailed && usdaFailed
+                        ? 'Could not reach food databases. Check your internet connection and try again.'
+                        : 'Try different keywords, ask the AI above, or scan the product barcode instead.'}
+                  </Text>
+                  {(offFailed || usdaFailed) && (
                     <Text style={fs.failedApis}>
-                      {[offFailed && 'Open Food Facts', usdaFailed && 'USDA'].filter(Boolean).join(' & ')} unavailable
+                      {[usdaFailed && (usdaLimited ? 'USDA (hourly limit)' : 'USDA'), offFailed && 'Open Food Facts'].filter(Boolean).join(' & ')} unavailable
                     </Text>
                   )}
                 </View>
@@ -334,36 +386,41 @@ export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd,
                 <View style={fs.centered}>
                   <Text style={fs.emptyEmoji}>🥗</Text>
                   <Text style={fs.emptyTitle}>Search any food</Text>
-                  <Text style={fs.emptyDesc}>Searches Open Food Facts and USDA FoodData Central — packaged foods, whole foods, restaurant items and more.</Text>
+                  <Text style={fs.emptyDesc}>Common foods as eaten come from USDA FoodData Central; packaged products from USDA and Open Food Facts.</Text>
                 </View>
               )}
 
-              {!loading && (offFailed || usdaFailed) && results.length > 0 && (
+              {!loading && (offFailed || usdaFailed || usdaLimited) && results.length > 0 && (
                 <Text style={fs.partialNotice}>
-                  {offFailed ? 'Open Food Facts' : 'USDA'} unavailable — showing partial results
+                  {usdaLimited ? 'USDA hourly search limit reached' : usdaFailed ? 'USDA unavailable' : 'Open Food Facts unavailable'} — showing partial results
                 </Text>
               )}
 
-              {!loading && results.map((product, i) => {
-                const macros = mapNutriments(product.nutriments || {}, product.serving_quantity)
-                return (
-                  <Pressable key={product.code || i} style={fs.resultCard} onPress={() => selectProduct(product)}>
-                    <View style={{ flex: 1 }}>
-                      <View style={fs.resultTopRow}>
-                        <Text style={fs.resultName} numberOfLines={2}>{product.product_name}</Text>
-                        {product.source === 'USDA' && <Text style={fs.usdaBadge}>USDA</Text>}
-                      </View>
-                      {!!product.brands && <Text style={fs.resultBrand}>{product.brands}</Text>}
-                      {!!product.serving_size && <Text style={fs.resultServing}>{product.serving_size}</Text>}
-                    </View>
-                    <View style={fs.resultMacros}>
-                      {macros.calories > 0 && <Text style={fs.resultCal}>{macros.calories} kcal</Text>}
-                      {macros.protein > 0 && <Text style={fs.resultProt}>{macros.protein}g P</Text>}
-                      {macros.carbs > 0 && <Text style={fs.resultCarbs}>{macros.carbs}g C</Text>}
-                    </View>
-                  </Pressable>
-                )
-              })}
+              {!loading && groups.map(group => group.items.length > 0 && (
+                <View key={group.key}>
+                  <Text style={fs.groupTitle}>{group.title}</Text>
+                  {group.items.map((product, i) => {
+                    const macros = mapNutriments(product.nutriments || {}, product.serving_quantity)
+                    return (
+                      <Pressable key={product.code || `${group.key}-${i}`} style={fs.resultCard} onPress={() => selectProduct(product)}>
+                        <View style={{ flex: 1 }}>
+                          <View style={fs.resultTopRow}>
+                            <Text style={fs.resultName} numberOfLines={2}>{product.product_name}</Text>
+                            {product.source === 'USDA' && <Text style={fs.usdaBadge}>USDA</Text>}
+                          </View>
+                          {!!product.brands && <Text style={fs.resultBrand}>{product.brands}</Text>}
+                          {!!product.serving_size && <Text style={fs.resultServing}>per {product.serving_size}</Text>}
+                        </View>
+                        <View style={fs.resultMacros}>
+                          {macros.calories > 0 && <Text style={fs.resultCal}>{macros.calories} kcal</Text>}
+                          {macros.protein > 0 && <Text style={fs.resultProt}>{macros.protein}g P</Text>}
+                          {macros.carbs > 0 && <Text style={fs.resultCarbs}>{macros.carbs}g C</Text>}
+                        </View>
+                      </Pressable>
+                    )
+                  })}
+                </View>
+              ))}
 
               <View style={{ height: 40 }} />
             </ScrollView>
@@ -408,6 +465,7 @@ const fs = StyleSheet.create({
   partialNotice: { fontSize: 12, color: '#f59e0b', textAlign: 'center', marginBottom: 10, fontWeight: '600' },
   failedApis: { fontSize: 11, color: '#ef4444', marginTop: 8, fontWeight: '600' },
 
+  groupTitle: { fontSize: 11, fontWeight: '800', color: '#aaa', letterSpacing: 1.2, marginTop: 8, marginBottom: 8, marginLeft: 2 },
   resultCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#fff', borderRadius: 14, padding: 14, marginBottom: 8, borderWidth: 1, borderColor: '#f0f0f3', shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.04, shadowRadius: 4, elevation: 1 },
   resultTopRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 6, marginBottom: 2 },
   resultName: { fontSize: 15, fontWeight: '700', color: '#111', flex: 1 },

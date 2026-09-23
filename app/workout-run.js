@@ -1,16 +1,32 @@
 import { useState, useEffect, useRef } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert, AppState } from 'react-native'
 import { Image } from 'expo-image'
+import * as Notifications from 'expo-notifications'
+import ReanimatedSwipeable from 'react-native-gesture-handler/ReanimatedSwipeable'
 import ExerciseVideo from '../components/ExerciseVideo'
 import { router, useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
-import { getWorkoutPlan, getLastWorkoutLog, saveWorkoutLog, today } from '../lib/storage'
+import { getWorkoutPlan, getLastSetsByExercise, saveWorkoutLog, today } from '../lib/storage'
 import { saveFitPhoto } from '../lib/photoStorage'
 
 const COLOR_DEFAULT = '#2b7fff'
-const COL = { set: 40, prev: 76, check: 46 }
+const COL = { set: 44, prev: 64, check: 44 }
+
+// Set types. Warm-ups and drop sets are labelled W and D instead of a
+// number; the number counts working sets only.
+const SET_TYPES = {
+  normal: { label: 'Normal',   badge: null, color: null },
+  warmup: { label: 'Warm-up',  badge: 'W',  color: '#f59e0b' },
+  drop:   { label: 'Drop set', badge: 'D',  color: '#8b5cf6' },
+}
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7)
+
+// One rest-over notification at a time: rescheduled on every rest, cancelled
+// on skip, finish, exit and unmount.
+const REST_NOTIF_ID = 'workout-rest-over'
 
 function fmtElapsed(ms) {
   const s = Math.floor(ms / 1000)
@@ -22,9 +38,8 @@ function fmtElapsed(ms) {
 }
 
 // The 1-second workout clock lives in its own component so each tick
-// re-renders only the timer pill, not the whole screen (exercise GIF, set
-// table, modals). Elapsed derives from the start timestamp on every tick, so
-// unmounting during rests / on finish loses nothing and needs no parent state.
+// re-renders only the timer pill, not the whole screen. Elapsed derives from
+// the start timestamp on every tick, so unmounting loses nothing.
 function ElapsedTimer({ startedAt, styles: s }) {
   const [elapsedMs, setElapsedMs] = useState(0)
 
@@ -43,6 +58,18 @@ function ElapsedTimer({ startedAt, styles: s }) {
   )
 }
 
+// Labels for one exercise's rows: W / D for warm-ups and drop sets, a running
+// number for working sets.
+function setLabels(rows) {
+  let n = 0
+  return rows.map(r => {
+    const t = SET_TYPES[r.type] ?? SET_TYPES.normal
+    if (t.badge) return t.badge
+    n += 1
+    return String(n)
+  })
+}
+
 export default function WorkoutRun() {
   const { muscleGroup } = useLocalSearchParams()
   const { user } = useAuth()
@@ -53,36 +80,39 @@ export default function WorkoutRun() {
   const [exercises,    setExercises]    = useState([])
   const [prevData,     setPrevData]     = useState({})
   const [loadingPlan,  setLoadingPlan]  = useState(true)
-  const [phase,        setPhase]        = useState('ready')
-  const [exerciseIdx,  setExerciseIdx]  = useState(0)
-  const [setIdx,       setSetIdx]       = useState(0)
-  const [weight,       setWeight]       = useState('')
-  const [reps,         setReps]         = useState('')
-  const [restLeft,     setRestLeft]     = useState(90)
+  const [phase,        setPhase]        = useState('ready')   // ready | active | done
+  // rows[exerciseIdx] = [{ id, type, weight, reps, done }]: every set of every
+  // exercise, all on one page, editable in any order.
+  const [rows,         setRows]         = useState([])
+  const [skipped,      setSkipped]      = useState({})
+  // Rest is a wall-clock deadline, not a counter: the seconds shown are
+  // re-derived from it on every tick and again when the app comes back to
+  // the foreground, so time spent with the phone locked still counts.
+  const [restEndsAt,   setRestEndsAt]   = useState(null)      // ms timestamp; null = not resting
+  const [restLeft,     setRestLeft]     = useState(0)         // seconds shown; 0 = not resting
+  const [restFor,      setRestFor]      = useState(null)
+  const notifPermRef = useRef(null)     // null = not asked yet, then true/false
   const [log,          setLog]          = useState([])
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const [editSets,     setEditSets]     = useState(3)
+  const [settingsFor,  setSettingsFor]  = useState(null)      // exercise index whose rest is being edited
   const [editRest,     setEditRest]     = useState(90)
-  const [overviewOpen, setOverviewOpen] = useState(false)
-  const [timeModes,    setTimeModes]    = useState({}) // exerciseIdx → true=time, false=weight
+  const [timeModes,    setTimeModes]    = useState({})        // exerciseIdx → true=time, false=weight
+  const [mediaOpen,    setMediaOpen]    = useState({})        // exerciseIdx → full GIF / video shown
   const [progressPhoto, setProgressPhoto] = useState(null)
 
-  const intervalRef  = useRef(null)
   const startTimeRef = useRef(null)
 
   useEffect(() => {
     if (!user || !muscleGroup) return
     Promise.all([
       getWorkoutPlan(user.id, muscleGroup),
-      getLastWorkoutLog(user.id, muscleGroup),
-    ]).then(([plan, prevLog]) => {
-      const prev = {}
-      if (prevLog?.exercises) {
-        for (const ex of prevLog.exercises) prev[ex.name] = ex.sets ?? []
-      }
+      // Last sets per exercise, from any workout; keyed by lowercase name.
+      getLastSetsByExercise(user.id),
+    ]).then(([plan, prev]) => {
       setPrevData(prev)
       setExercises(plan)
-      setLog(plan.map(ex => ({ exerciseId: ex.id, name: ex.name, inputType: ex.inputType ?? 'reps', gifUrl: ex.gifUrl ?? null, sets: [], skipped: false })))
+      // Every set starts filled in from last time, so a repeat of last
+      // session is a row of ticks.
+      setRows(plan.map(ex => Array.from({ length: ex.sets ?? 3 }, (_, k) => makeRow(prevSets(prev, ex.name)[k]))))
       const modes = {}
       plan.forEach((ex, i) => { modes[i] = ex.inputType === 'time' })
       setTimeModes(modes)
@@ -90,160 +120,197 @@ export default function WorkoutRun() {
     })
   }, [user, muscleGroup])
 
-  // Rest countdown
-  useEffect(() => {
-    clearInterval(intervalRef.current)
-    if (phase !== 'rest') return
-    intervalRef.current = setInterval(() => {
-      setRestLeft(prev => {
-        if (prev <= 1) { clearInterval(intervalRef.current); setPhase('exercise'); return 0 }
-        return prev - 1
-      })
-    }, 1000)
-    return () => clearInterval(intervalRef.current)
-  }, [phase])
-
-  // ElapsedTimer clears its own interval when it unmounts; only the rest
-  // countdown still needs clearing here.
-  useEffect(() => () => {
-    clearInterval(intervalRef.current)
-  }, [])
-
-  function prefillForSet(exName, setIndex) {
-    const prev = prevData[exName]?.[setIndex]
-    if (prev) { setWeight(String(prev.weight)); setReps(String(prev.reps)) }
-    else { setWeight(''); setReps('') }
+  function makeRow(prev) {
+    return {
+      id: uid(),
+      type: SET_TYPES[prev?.type] ? prev.type : 'normal',
+      weight: prev && prev.weight ? String(prev.weight) : '',
+      reps: prev && prev.reps ? String(prev.reps) : '',
+      done: false,
+    }
   }
+
+  const prevSets = (map, name) => map[String(name ?? '').trim().toLowerCase()] ?? []
+
+  // Leaving mid-workout throws the session away unless it is finished first.
+  function confirmExit() {
+    Alert.alert(
+      'Exit workout?',
+      'Sets from this session are only saved when you finish.',
+      [
+        { text: 'Keep going', style: 'cancel' },
+        { text: 'Exit without saving', style: 'destructive', onPress: () => { stopRest(); router.back() } },
+        { text: 'Finish & save', onPress: requestFinish },
+      ],
+    )
+  }
+
+  // Rest countdown. iOS pauses JS timers in the background, so a counter
+  // would freeze while the phone is locked; deriving from the deadline on
+  // every tick, and once more the moment the app is active again, means the
+  // rest keeps counting however the phone was used in between.
+  useEffect(() => {
+    if (!restEndsAt) { setRestLeft(0); return }
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((restEndsAt - Date.now()) / 1000))
+      setRestLeft(left)
+      if (left <= 0) setRestEndsAt(null)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    const sub = AppState.addEventListener('change', state => { if (state === 'active') tick() })
+    return () => { clearInterval(id); sub.remove() }
+  }, [restEndsAt])
+
+  // A locked phone cannot show the countdown, so the end of the rest is a
+  // local notification scheduled for the deadline. Permission is asked once
+  // per session; without it the countdown still works, just silently.
+  async function scheduleRestNotification(seconds, exerciseName) {
+    try {
+      if (notifPermRef.current === null) {
+        const perm = await Notifications.requestPermissionsAsync()
+        const S = Notifications.IosAuthorizationStatus
+        notifPermRef.current = perm.granted ||
+          [S.AUTHORIZED, S.PROVISIONAL, S.EPHEMERAL].includes(perm.ios?.status)
+      }
+      if (!notifPermRef.current) return
+      await Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID).catch(() => {})
+      await Notifications.scheduleNotificationAsync({
+        identifier: REST_NOTIF_ID,
+        content: {
+          title: 'Rest over',
+          body: exerciseName ? `Back to ${exerciseName}.` : 'Time for the next set.',
+          sound: true,
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+          seconds: Math.max(1, Math.round(seconds)),
+        },
+      })
+    } catch {}
+  }
+
+  function cancelRestNotification() {
+    Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID).catch(() => {})
+  }
+
+  function startRest(seconds, exerciseName) {
+    const secs = Math.max(0, Math.round(seconds))
+    setRestEndsAt(Date.now() + secs * 1000)
+    setRestLeft(secs)   // shown at once; the effect keeps it current from here
+    setRestFor(exerciseName)
+    scheduleRestNotification(secs, exerciseName)
+  }
+
+  function stopRest() {
+    setRestEndsAt(null)
+    setRestLeft(0)
+    cancelRestNotification()
+  }
+
+  // Leaving the screen any other way must not leave a stray "Rest over".
+  useEffect(() => () => { cancelRestNotification() }, [])
 
   function startWorkout() {
     startTimeRef.current = Date.now()
-    const ex = exercises[0]
-    prefillForSet(ex.name, 0)
-    setExerciseIdx(0)
-    setSetIdx(0)
-    setPhase('exercise')
+    setPhase('active')
   }
 
-  function completeSet() {
-    const ex        = exercises[exerciseIdx]
-    const totalSets = ex.sets ?? 3
-    const isLastSet = setIdx >= totalSets - 1
-    const isLastEx  = exerciseIdx >= exercises.length - 1
+  // ── Row edits ─────────────────────────────────────────────────────────────
 
-    // In time mode the weight column holds seconds, so both fields read from it
-    const isTime    = timeModes[exerciseIdx] ?? false
-    const amount    = parseFloat(weight) || 0
+  const updateRows = (exIdx, fn) => setRows(prev => prev.map((list, i) => (i === exIdx ? fn(list) : list)))
 
-    const newLog = log.map((entry, i) =>
-      i === exerciseIdx
-        ? {
-            ...entry,
-            sets: [...entry.sets, {
-              reps: parseInt(reps, 10) || 0,
-              weight: amount,
-              time: isTime ? amount : 0,
-              unit,
-              isTime,
-            }],
-          }
-        : entry
-    )
-    setLog(newLog)
-
-    if (isLastSet && isLastEx) { finishWorkout(newLog); return }
-
-    if (isLastSet) {
-      const nextIdx = exerciseIdx + 1
-      setExerciseIdx(nextIdx)
-      setSetIdx(0)
-      prefillForSet(exercises[nextIdx].name, 0)
-    } else {
-      setSetIdx(setIdx + 1)
-    }
-
-    setRestLeft(ex.restSeconds ?? 90)
-    setPhase('rest')
+  function updateRow(exIdx, rowId, patch) {
+    updateRows(exIdx, list => list.map(r => (r.id === rowId ? { ...r, ...patch } : r)))
   }
 
-  function skipExercise() {
-    const newLog = log.map((entry, i) =>
-      i === exerciseIdx ? { ...entry, skipped: true } : entry
-    )
-    setLog(newLog)
-    const isLastEx = exerciseIdx >= exercises.length - 1
-    if (isLastEx) { finishWorkout(newLog); return }
-    const nextIdx = exerciseIdx + 1
-    setExerciseIdx(nextIdx)
-    setSetIdx(0)
-    prefillForSet(exercises[nextIdx].name, 0)
-    setPhase('exercise')
+  function toggleDone(exIdx, rowId) {
+    const row = rows[exIdx]?.find(r => r.id === rowId)
+    if (!row) return
+    const nowDone = !row.done
+    updateRow(exIdx, rowId, { done: nowDone })
+    if (nowDone) startRest(exercises[exIdx]?.restSeconds ?? 90, exercises[exIdx]?.name ?? null)
   }
 
-  function skipRest() { clearInterval(intervalRef.current); setPhase('exercise') }
+  function skipRest() { stopRest() }
 
-  function toggleTimeMode() {
-    setTimeModes(prev => ({ ...prev, [exerciseIdx]: !(prev[exerciseIdx] ?? false) }))
+  // A new set starts from the values of the one above it.
+  function addRow(exIdx) {
+    updateRows(exIdx, list => {
+      const last = list[list.length - 1]
+      return [...list, { id: uid(), type: 'normal', weight: last?.weight ?? '', reps: last?.reps ?? '', done: false }]
+    })
   }
 
-  function navigateTo(targetIdx) {
-    clearInterval(intervalRef.current)
-    setPhase('exercise')
-    setExerciseIdx(targetIdx)
-    const loggedCount = log[targetIdx]?.sets?.length ?? 0
-    const totalForEx  = exercises[targetIdx]?.sets ?? 3
-    setSetIdx(loggedCount)
-    if (loggedCount < totalForEx) {
-      prefillForSet(exercises[targetIdx].name, loggedCount)
-    } else {
-      setWeight(''); setReps('')
-    }
+  function deleteRow(exIdx, rowId) {
+    updateRows(exIdx, list => list.filter(r => r.id !== rowId))
   }
 
-  function goBack() {
-    if (exerciseIdx === 0) return
-    navigateTo(exerciseIdx - 1)
+  // Tap the set number to choose its type.
+  function pickType(exIdx, row) {
+    const choose = type => updateRow(exIdx, row.id, { type })
+    Alert.alert('Set type', 'What kind of set is this?', [
+      { text: 'Warm-up', onPress: () => choose('warmup') },
+      { text: 'Drop set', onPress: () => choose('drop') },
+      { text: 'Normal', onPress: () => choose('normal') },
+      { text: 'Cancel', style: 'cancel' },
+    ])
   }
 
-  function moveForward() {
-    if (exerciseIdx >= exercises.length - 1) { finishWorkout(log); return }
-    navigateTo(exerciseIdx + 1)
+  function toggleSkip(exIdx) {
+    setSkipped(prev => ({ ...prev, [exIdx]: !prev[exIdx] }))
   }
 
-  function uncheckSet(rowIndex) {
-    const removedSet = log[exerciseIdx]?.sets?.[rowIndex]
-    const newSets = (log[exerciseIdx]?.sets ?? []).slice(0, rowIndex)
-    setLog(prev => prev.map((entry, i) =>
-      i === exerciseIdx ? { ...entry, sets: newSets } : entry
-    ))
-    setSetIdx(rowIndex)
-    if (removedSet) {
-      setWeight(removedSet.weight ? String(removedSet.weight) : '')
-      setReps(removedSet.reps ? String(removedSet.reps) : '')
-    }
+  function toggleTimeMode(exIdx) {
+    setTimeModes(prev => ({ ...prev, [exIdx]: !(prev[exIdx] ?? false) }))
   }
 
-  function addSet() {
-    setExercises(prev => prev.map((ex, i) =>
-      i === exerciseIdx ? { ...ex, sets: (ex.sets ?? 3) + 1 } : ex
-    ))
-  }
-
-  function openSettings() {
-    const ex = exercises[exerciseIdx]
-    setEditSets(ex.sets ?? 3)
-    setEditRest(ex.restSeconds ?? 90)
-    setSettingsOpen(true)
+  function openSettings(exIdx) {
+    setEditRest(exercises[exIdx]?.restSeconds ?? 90)
+    setSettingsFor(exIdx)
   }
 
   function applySettings() {
-    setExercises(prev => prev.map((ex, i) =>
-      i === exerciseIdx ? { ...ex, sets: editSets, restSeconds: editRest } : ex
-    ))
-    setSettingsOpen(false)
+    setExercises(prev => prev.map((ex, i) => (i === settingsFor ? { ...ex, restSeconds: editRest } : ex)))
+    setSettingsFor(null)
+  }
+
+  // ── Finish ────────────────────────────────────────────────────────────────
+
+  // Every set with a weight or reps is saved, ticked or not, so it shows as
+  // "previous" next time; the tick is recorded with it.
+  function buildLog() {
+    return exercises.map((ex, i) => {
+      const isTime = timeModes[i] ?? false
+      return {
+        exerciseId: ex.id,
+        name: ex.name,
+        inputType: ex.inputType ?? 'reps',
+        gifUrl: ex.gifUrl ?? null,
+        skipped: !!skipped[i],
+        sets: (rows[i] ?? [])
+          .filter(r => r.done || (parseFloat(r.weight) || 0) > 0 || (parseInt(r.reps, 10) || 0) > 0)
+          .map(r => {
+            const amount = parseFloat(r.weight) || 0
+            return { reps: parseInt(r.reps, 10) || 0, weight: amount, time: isTime ? amount : 0, unit, isTime, type: r.type, done: !!r.done }
+          }),
+      }
+    })
+  }
+
+  function requestFinish() {
+    const pending = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i] ?? []).filter(r => !r.done).length), 0)
+    const go = () => { const finalLog = buildLog(); setLog(finalLog); finishWorkout(finalLog) }
+    if (pending === 0) { go(); return }
+    Alert.alert(
+      'Finish workout?',
+      `${pending} set${pending === 1 ? ' is' : 's are'} not ticked off. Sets with a weight or reps are saved either way.`,
+      [{ text: 'Keep going', style: 'cancel' }, { text: 'Finish', onPress: go }],
+    )
   }
 
   async function finishWorkout(finalLog) {
-    clearInterval(intervalRef.current)
+    stopRest()
     setPhase('done')
     if (user) {
       await saveWorkoutLog(user.id, today(), {
@@ -346,6 +413,7 @@ export default function WorkoutRun() {
       const real = (e.sets ?? []).filter(st => st.reps > 0 || st.weight > 0)
       return sum + (real.length > 0 ? real.length : (e.sets ?? []).length)
     }, 0)
+    const typeMark = st => (st.type === 'warmup' ? 'W ' : st.type === 'drop' ? 'D ' : '')
     return (
       <View style={s.page}>
         <ScrollView contentContainerStyle={s.doneContent} showsVerticalScrollIndicator={false}>
@@ -357,8 +425,6 @@ export default function WorkoutRun() {
           {log.map((entry, i) => {
             const allSets = entry.sets ?? []
             const realSets = allSets.filter(st => st.reps > 0 || st.weight > 0)
-            // Explicitly skipped: only treat as skipped if no real sets (ignore accidental 0-value logs)
-            // Not skipped: treat as skipped only if no sets were logged at all
             const effectivelySkipped = entry.skipped ? realSets.length === 0 : allSets.length === 0
             const displaySets = realSets.length > 0 ? realSets : allSets
             return (
@@ -373,9 +439,9 @@ export default function WorkoutRun() {
                   ) : displaySets.length > 0 ? (
                     <Text style={s.doneSummaryMeta}>
                       {displaySets.map(st =>
-                        (timeModes[i] ?? false)
+                        typeMark(st) + ((timeModes[i] ?? false)
                           ? `${st.weight}s`
-                          : st.weight > 0 ? `${st.weight}${unit}×${st.reps}` : String(st.reps)
+                          : st.weight > 0 ? `${st.weight}${unit}×${st.reps}` : String(st.reps))
                       ).join('  ')}
                     </Text>
                   ) : null}
@@ -407,21 +473,19 @@ export default function WorkoutRun() {
     )
   }
 
-  // ── Exercise + inline rest ────────────────────────────────────────────────
-  const ex        = exercises[exerciseIdx]
-  const totalSets = ex.sets ?? 3
-  const pct       = Math.round((exerciseIdx / exercises.length) * 100)
-  const logged          = log[exerciseIdx]?.sets ?? []
-  const isResting       = phase === 'rest'
-  const isTimedExercise = timeModes[exerciseIdx] ?? false
+  // ── Active: every exercise on one page ───────────────────────────────────
+  const totalRows = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i]?.length ?? 0)), 0)
+  const doneRows  = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i] ?? []).filter(r => r.done).length), 0)
+  const pct       = totalRows ? Math.round((doneRows / totalRows) * 100) : 0
+  const isResting = restLeft > 0
 
   return (
     <KeyboardAvoidingView style={s.page} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={s.exContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
-        {/* Top row: exit | timer/rest | settings */}
+        {/* Top row: exit | timer or rest | sets done */}
         <View style={s.topRow}>
-          <Pressable style={s.topSide} onPress={() => { clearInterval(intervalRef.current); router.back() }}>
+          <Pressable style={s.topSide} onPress={confirmExit}>
             <Text style={s.backText}>← Exit</Text>
           </Pressable>
 
@@ -436,260 +500,171 @@ export default function WorkoutRun() {
           )}
 
           <View style={[s.topSide, { alignItems: 'flex-end' }]}>
-            <Pressable onPress={openSettings} style={s.settingsBtn}>
-              <Text style={s.settingsBtnText}>⚙ Sets & Rest</Text>
-            </Pressable>
+            <Text style={s.setsDoneText}>{doneRows}/{totalRows} sets</Text>
           </View>
         </View>
 
-        {/* View all exercises */}
-        <Pressable style={s.viewAllBtn} onPress={() => setOverviewOpen(true)}>
-          <Text style={s.viewAllText}>All exercises ({exercises.length})  ↓</Text>
-        </Pressable>
-
         {/* Progress */}
-        <View style={s.progressRow}>
-          <Text style={s.progressText}>Exercise {exerciseIdx + 1} of {exercises.length}</Text>
-          <Text style={s.progressPct}>{pct}%</Text>
-        </View>
         <View style={s.progressTrack}>
           <View style={[s.progressFill, { width: `${pct}%` }]} />
         </View>
 
-        {exerciseIdx > 0 && (
-          <Pressable style={s.prevExBtn} onPress={goBack}>
-            <Text style={s.prevExText}>← {exercises[exerciseIdx - 1].name}</Text>
-          </Pressable>
+        {isResting && (
+          <View style={s.restBanner}>
+            <View style={s.restDot} />
+            <Text style={s.restBannerText} numberOfLines={1}>
+              Resting{restFor ? ` after ${restFor}` : ''} · {restLeft}s
+            </Text>
+            <Pressable onPress={skipRest} hitSlop={8}>
+              <Text style={s.restBannerSkip}>Skip</Text>
+            </Pressable>
+          </View>
         )}
 
-        {/* Exercise card */}
-        <View style={s.exCard}>
-          <Text style={s.exName}>{ex.name}</Text>
-          {ex.category ? <Text style={s.exCategory}>{ex.category}</Text> : null}
-          {ex.gifUrl && (
-            <Image source={{ uri: ex.gifUrl }} style={s.exImage} contentFit="contain" autoplay />
-          )}
-          {/* Custom exercises carry a YouTube demo instead of a GIF */}
-          {!ex.gifUrl && !!ex.videoId && (
-            <ExerciseVideo videoId={ex.videoId} style={{ marginBottom: 4 }} />
-          )}
-        </View>
+        <Text style={s.hint}>Tick a set when it's done. Tap a set number for warm-up or drop set. Swipe a set left to remove it.</Text>
 
-        {/* Set table */}
-        <View style={s.setTable}>
-          <View style={s.tableHead}>
-            <Text style={[s.th, { width: COL.set }]}>SET</Text>
-            <Text style={[s.th, { width: COL.prev }]}>PREV</Text>
-            <Pressable style={s.thToggle} onPress={toggleTimeMode} hitSlop={10}>
-              <Text style={s.th}>{isTimedExercise ? 'SECS' : unit.toUpperCase()}</Text>
-              <Text style={s.thToggleIcon}>⇄</Text>
-            </Pressable>
-            <Text style={[s.th, { flex: 1 }]}>REPS</Text>
-            <View style={{ width: COL.check }} />
-          </View>
-
-          {Array.from({ length: totalSets }).map((_, i) => {
-            const isDone    = i < setIdx
-            const isActive  = i === setIdx
-            const prev      = prevData[ex.name]?.[i]
-            const loggedSet = logged[i]
-
-            return (
-              <View key={i} style={[s.tableRow, isDone && s.tableRowDone, isActive && s.tableRowActive]}>
-                <Text style={[s.setNum, { width: COL.set }, isDone && { color: COLOR }]}>{i + 1}</Text>
-
-                <View style={[s.prevCell, { width: COL.prev }]}>
-                  <Text style={s.prevText} numberOfLines={1}>
-                    {prev
-                      ? isTimedExercise ? `${prev.weight}s` : `${prev.weight}×${prev.reps}`
-                      : '—'}
+        {exercises.map((ex, i) => {
+          const exRows = rows[i] ?? []
+          const labels = setLabels(exRows)
+          const isTimed = timeModes[i] ?? false
+          const isSkipped = !!skipped[i]
+          const exDone = exRows.length > 0 && exRows.every(r => r.done)
+          return (
+            <View key={ex.id} style={[s.exBlock, exDone && !isSkipped && s.exBlockDone, isSkipped && s.exBlockSkipped]}>
+              {/* Header: thumbnail (tap for the demo), name, rest, actions */}
+              <View style={s.exHead}>
+                <Pressable onPress={() => setMediaOpen(m => ({ ...m, [i]: !m[i] }))} hitSlop={4}>
+                  {ex.gifUrl ? (
+                    <Image source={{ uri: ex.gifUrl }} style={s.exThumb} contentFit="cover" autoplay={false} />
+                  ) : (
+                    <View style={[s.exThumb, s.exThumbEmpty]}><Text style={{ fontSize: 18 }}>🏋️</Text></View>
+                  )}
+                </Pressable>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.exBlockName} numberOfLines={2}>{i + 1}. {ex.name}</Text>
+                  <Text style={s.exBlockMeta}>
+                    {ex.category ? `${ex.category} · ` : ''}rest {ex.restSeconds ?? 90}s
+                    {isSkipped ? ' · skipped' : ''}
                   </Text>
                 </View>
-
-                <View style={{ flex: 1, alignItems: 'center' }}>
-                  {isDone ? (
-                    <Text style={[s.cellText, { color: COLOR }]}>
-                      {isTimedExercise
-                        ? loggedSet?.weight != null ? `${loggedSet.weight}s` : '—'
-                        : loggedSet?.weight || '—'}
-                    </Text>
-                  ) : isActive ? (
-                    <TextInput
-                      style={s.cellInput}
-                      value={weight}
-                      onChangeText={setWeight}
-                      keyboardType="decimal-pad"
-                      placeholder="—"
-                      placeholderTextColor="#ccc"
-                      selectTextOnFocus
-                      textAlign="center"
-                    />
-                  ) : (
-                    <Text style={s.cellMuted}>—</Text>
-                  )}
-                </View>
-
-                <View style={{ flex: 1, alignItems: 'center' }}>
-                  {isDone ? (
-                    <Text style={[s.cellText, { color: COLOR }]}>{loggedSet?.reps || '—'}</Text>
-                  ) : isActive ? (
-                    <TextInput
-                      style={s.cellInput}
-                      value={reps}
-                      onChangeText={setReps}
-                      keyboardType="number-pad"
-                      placeholder="—"
-                      placeholderTextColor="#ccc"
-                      selectTextOnFocus
-                      textAlign="center"
-                    />
-                  ) : (
-                    <Text style={s.cellMuted}>—</Text>
-                  )}
-                </View>
-
-                <View style={{ width: COL.check, alignItems: 'center' }}>
-                  {isDone ? (
-                    <Pressable style={s.checkDone} onPress={() => uncheckSet(i)}>
-                      <Text style={s.checkMark}>✓</Text>
-                    </Pressable>
-                  ) : isActive ? (
-                    <Pressable style={s.checkActive} onPress={isResting ? () => {} : completeSet}>
-                      <Text style={s.checkMark}> </Text>
-                    </Pressable>
-                  ) : (
-                    <View style={s.checkEmpty} />
-                  )}
-                </View>
+                <Pressable onPress={() => openSettings(i)} style={s.exHeadBtn} hitSlop={6}>
+                  <Text style={s.exHeadBtnText}>⚙</Text>
+                </Pressable>
+                <Pressable onPress={() => toggleSkip(i)} style={s.exHeadBtn} hitSlop={6}>
+                  <Text style={[s.exHeadBtnText, { color: isSkipped ? COLOR : theme.muted }]}>{isSkipped ? 'Undo' : 'Skip'}</Text>
+                </Pressable>
               </View>
-            )
-          })}
 
-          <Pressable style={s.addSetRow} onPress={addSet}>
-            <Text style={s.addSetText}>+ ADD SET</Text>
-          </Pressable>
-        </View>
+              {mediaOpen[i] && (
+                ex.gifUrl ? (
+                  <Image source={{ uri: ex.gifUrl }} style={s.exImage} contentFit="contain" autoplay />
+                ) : ex.videoId ? (
+                  <ExerciseVideo videoId={ex.videoId} style={{ marginBottom: 8 }} />
+                ) : null
+              )}
 
-        {/* Actions */}
-        {isResting ? (
-          <View style={s.restActions}>
-            <View style={s.restBanner}>
-              <View style={s.restDot} />
-              <Text style={s.restBannerText}>Resting · {restLeft}s remaining</Text>
+              {!isSkipped && (
+                <View style={s.setTable}>
+                  <View style={s.tableHead}>
+                    <Text style={[s.th, { width: COL.set }]}>SET</Text>
+                    <Text style={[s.th, { width: COL.prev }]}>PREV</Text>
+                    <Pressable style={s.thToggle} onPress={() => toggleTimeMode(i)} hitSlop={10}>
+                      <Text style={s.th}>{isTimed ? 'SECS' : unit.toUpperCase()}</Text>
+                      <Text style={s.thToggleIcon}>⇄</Text>
+                    </Pressable>
+                    <Text style={[s.th, { flex: 1 }]}>REPS</Text>
+                    <View style={{ width: COL.check }} />
+                  </View>
+
+                  {exRows.map((row, k) => {
+                    const prev = prevSets(prevData, ex.name)[k]
+                    const type = SET_TYPES[row.type] ?? SET_TYPES.normal
+                    return (
+                      <ReanimatedSwipeable
+                        key={row.id}
+                        friction={2}
+                        rightThreshold={36}
+                        overshootRight={false}
+                        renderRightActions={() => (
+                          <Pressable style={s.swipeDelete} onPress={() => deleteRow(i, row.id)}>
+                            <Text style={s.swipeDeleteIcon}>🗑</Text>
+                          </Pressable>
+                        )}
+                      >
+                        <View style={[s.tableRow, row.done && s.tableRowDone]}>
+                          <Pressable onPress={() => pickType(i, row)} hitSlop={6} style={{ width: COL.set, alignItems: 'center' }}>
+                            <View style={[s.setBadge, type.color && { backgroundColor: type.color + '22' }]}>
+                              <Text style={[s.setNum, type.color && { color: type.color }, row.done && !type.color && { color: COLOR }]}>
+                                {labels[k]}
+                              </Text>
+                            </View>
+                          </Pressable>
+
+                          <View style={[s.prevCell, { width: COL.prev }]}>
+                            <Text style={s.prevText} numberOfLines={1}>
+                              {prev
+                                ? isTimed ? `${prev.weight}s` : `${prev.weight}×${prev.reps}`
+                                : '—'}
+                            </Text>
+                          </View>
+
+                          <View style={{ flex: 1, alignItems: 'center' }}>
+                            <TextInput
+                              style={[s.cellInput, row.done && s.cellInputDone]}
+                              value={row.weight}
+                              onChangeText={v => updateRow(i, row.id, { weight: v })}
+                              keyboardType="decimal-pad"
+                              placeholder="—"
+                              placeholderTextColor="#ccc"
+                              selectTextOnFocus
+                              textAlign="center"
+                            />
+                          </View>
+
+                          <View style={{ flex: 1, alignItems: 'center' }}>
+                            <TextInput
+                              style={[s.cellInput, row.done && s.cellInputDone]}
+                              value={row.reps}
+                              onChangeText={v => updateRow(i, row.id, { reps: v })}
+                              keyboardType="number-pad"
+                              placeholder="—"
+                              placeholderTextColor="#ccc"
+                              selectTextOnFocus
+                              textAlign="center"
+                            />
+                          </View>
+
+                          <View style={{ width: COL.check, alignItems: 'center' }}>
+                            <Pressable style={row.done ? s.checkDone : s.checkActive} onPress={() => toggleDone(i, row.id)} hitSlop={6}>
+                              <Text style={s.checkMark}>{row.done ? '✓' : ' '}</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                      </ReanimatedSwipeable>
+                    )
+                  })}
+
+                  <Pressable style={s.addSetRow} onPress={() => addRow(i)}>
+                    <Text style={s.addSetText}>+ ADD SET</Text>
+                  </Pressable>
+                </View>
+              )}
             </View>
-            <Pressable style={s.skipRestInlineBtn} onPress={skipRest}>
-              <Text style={s.skipRestInlineText}>Skip Rest  →</Text>
-            </Pressable>
-            <Pressable style={s.finishEarlyBtn} onPress={() => finishWorkout(log)}>
-              <Text style={s.finishEarlyText}>Finish Workout  ✓</Text>
-            </Pressable>
-          </View>
-        ) : setIdx >= totalSets ? (
-          <View style={s.actions}>
-            <Pressable style={s.logBtn} onPress={moveForward}>
-              <Text style={s.logBtnText}>
-                {exerciseIdx < exercises.length - 1 ? 'Next Exercise  →' : 'Finish Workout  ✓'}
-              </Text>
-            </Pressable>
-          </View>
-        ) : (
-          <View style={s.actions}>
-            <Pressable style={s.logBtn} onPress={completeSet}>
-              <Text style={s.logBtnText}>Log Set {setIdx + 1}  ✓</Text>
-            </Pressable>
-            <Pressable style={s.skipExBtn} onPress={skipExercise}>
-              <Text style={s.skipExText}>Skip Exercise  →</Text>
-            </Pressable>
-            <Pressable style={s.finishEarlyBtn} onPress={() => finishWorkout(log)}>
-              <Text style={s.finishEarlyText}>Finish Workout  ✓</Text>
-            </Pressable>
-          </View>
-        )}
+          )
+        })}
+
+        <Pressable style={s.logBtn} onPress={requestFinish}>
+          <Text style={s.logBtnText}>Finish Workout  ✓</Text>
+        </Pressable>
       </ScrollView>
 
-      {/* Overview modal */}
-      <Modal visible={overviewOpen} transparent animationType="slide" onRequestClose={() => setOverviewOpen(false)}>
-        <View style={s.ovOverlay}>
-          <Pressable style={s.ovBg} onPress={() => setOverviewOpen(false)} />
-          <View style={s.ovSheet}>
-            <View style={s.ovHandle} />
-            <Text style={s.ovTitle}>All Exercises</Text>
-            <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 420 }}>
-              {exercises.map((exItem, i) => {
-                const entry      = log[i]
-                const setsLogged = entry?.sets?.length ?? 0
-                const total      = exItem.sets ?? 3
-                const isPast     = i < exerciseIdx
-                const isActiveEx = i === exerciseIdx
-
-                return (
-                  <Pressable
-                    key={exItem.id}
-                    style={[s.ovItem, isActiveEx && s.ovItemActive]}
-                    onPress={() => { setOverviewOpen(false); navigateTo(i) }}
-                  >
-                    <View style={s.ovThumbWrap}>
-                      {exItem.gifUrl ? (
-                        <Image source={{ uri: exItem.gifUrl }} style={s.ovThumb} contentFit="cover" autoplay={false} />
-                      ) : (
-                        <View style={[s.ovThumb, s.ovThumbEmpty]}>
-                          <Text style={{ fontSize: 18 }}>🏋️</Text>
-                        </View>
-                      )}
-                      {isPast && (
-                        <View style={s.ovThumbOverlay}>
-                          <Text style={s.ovThumbCheckText}>✓</Text>
-                        </View>
-                      )}
-                      {isActiveEx && <View style={s.ovThumbBorder} />}
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={s.ovName}>{exItem.name}</Text>
-                      {entry?.skipped ? (
-                        <Text style={s.ovSub}>Skipped</Text>
-                      ) : setsLogged > 0 ? (
-                        <Text style={s.ovSub} numberOfLines={1}>
-                          {entry.sets.map(st =>
-                            (timeModes[i] ?? false)
-                              ? `${st.weight}s`
-                              : st.weight > 0 ? `${st.weight}×${st.reps}` : String(st.reps)
-                          ).join('  ')}
-                          {setsLogged < total ? `  ·  ${setsLogged}/${total} sets` : ''}
-                        </Text>
-                      ) : (
-                        <Text style={s.ovSub}>{total} sets</Text>
-                      )}
-                    </View>
-                    {isActiveEx ? <View style={s.ovActiveDot} /> : <Text style={s.ovChevron}>›</Text>}
-                  </Pressable>
-                )
-              })}
-            </ScrollView>
-            <Pressable style={s.ovCloseBtn} onPress={() => setOverviewOpen(false)}>
-              <Text style={s.ovCloseText}>Close</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
-
-      {/* Settings modal */}
-      <Modal visible={settingsOpen} transparent animationType="fade">
+      {/* Rest settings, per exercise */}
+      <Modal visible={settingsFor !== null} transparent animationType="fade" onRequestClose={() => setSettingsFor(null)}>
         <View style={s.modalOverlay}>
-          <Pressable style={s.modalBackdrop} onPress={() => setSettingsOpen(false)} />
+          <Pressable style={s.modalBackdrop} onPress={() => setSettingsFor(null)} />
           <View style={s.modalBox}>
-            <Text style={s.modalTitle}>{ex.name}</Text>
-            <Text style={s.modalSubtitle}>Adjust for this session</Text>
-
-            <Text style={s.modalLabel}>SETS</Text>
-            <View style={s.modalStepper}>
-              <Pressable style={s.modalStepBtn} onPress={() => setEditSets(n => Math.max(1, n - 1))}>
-                <Text style={s.modalStepText}>−</Text>
-              </Pressable>
-              <Text style={s.modalStepValue}>{editSets}</Text>
-              <Pressable style={s.modalStepBtn} onPress={() => setEditSets(n => n + 1)}>
-                <Text style={s.modalStepText}>+</Text>
-              </Pressable>
-            </View>
+            <Text style={s.modalTitle}>{exercises[settingsFor]?.name ?? ''}</Text>
+            <Text style={s.modalSubtitle}>Rest between sets, for this session</Text>
 
             <Text style={s.modalLabel}>REST (seconds)</Text>
             <View style={s.modalStepper}>
@@ -760,21 +735,18 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
   },
   beginBtnText: { color: '#fff', fontWeight: '800', fontSize: 17 },
 
-  // Exercise phase
+  // Active
   exContent: { padding: 20, paddingTop: 56, paddingBottom: 40 },
-  topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
+  topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
   topSide: { flex: 1 },
-  settingsBtn: { backgroundColor: theme.input, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6 },
-  settingsBtnText: { color: theme.subtext, fontSize: 13, fontWeight: '600' },
+  setsDoneText: { fontSize: 13, fontWeight: '700', color: theme.subtext, fontVariant: ['tabular-nums'] },
 
-  // Elapsed timer pill
   timerPill: {
     backgroundColor: theme.input, borderRadius: 20,
     paddingHorizontal: 14, paddingVertical: 6,
   },
   timerText: { fontSize: 13, fontWeight: '700', color: theme.subtext },
 
-  // Rest pill (replaces timer during rest)
   restPill: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
     backgroundColor: '#fff7ed', borderRadius: 20,
@@ -785,43 +757,44 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
   restPillTime: { fontSize: 14, fontWeight: '800', color: '#ea580c' },
   restPillSkip: { fontSize: 11, fontWeight: '600', color: '#fb923c' },
 
-  // View all button
-  viewAllBtn: {
-    alignSelf: 'flex-start', marginBottom: 14,
-    paddingVertical: 4, paddingHorizontal: 2,
-  },
-  viewAllText: { fontSize: 12, fontWeight: '700', color: COLOR + 'cc', letterSpacing: 0.2 },
-
-  prevExBtn: { alignSelf: 'flex-start', paddingVertical: 5, marginBottom: 10 },
-  prevExText: { fontSize: 12, fontWeight: '600', color: '#aaa' },
-
-  progressRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
-  progressText: { fontSize: 13, color: '#aaa', fontWeight: '500' },
-  progressPct: { fontSize: 13, fontWeight: '700', color: COLOR },
-  progressTrack: { height: 7, backgroundColor: theme.input, borderRadius: 4, marginBottom: 20, overflow: 'hidden' },
+  progressTrack: { height: 7, backgroundColor: theme.input, borderRadius: 4, marginBottom: 14, overflow: 'hidden' },
   progressFill: { height: 7, borderRadius: 4, backgroundColor: COLOR },
 
-  exCard: {
-    backgroundColor: theme.card, borderRadius: 20, padding: 20,
-    borderWidth: 1.5, borderColor: COLOR + '33', alignItems: 'center', marginBottom: 16,
-    shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
-    shadowOffset: { width: 4, height: 5 }, shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  restBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#fff7ed', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10,
+    borderWidth: 1, borderColor: '#fed7aa', marginBottom: 12,
   },
-  exName: { fontSize: 22, fontWeight: '800', color: theme.text, textAlign: 'center', marginBottom: 2 },
-  exCategory: { fontSize: 12, color: theme.subtext, marginBottom: 14 },
-  exImage: { width: '100%', aspectRatio: 1, borderRadius: 14, marginBottom: 4, backgroundColor: theme.input },
+  restDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#f97316' },
+  restBannerText: { flex: 1, fontSize: 13.5, fontWeight: '700', color: '#c2410c' },
+  restBannerSkip: { fontSize: 13, fontWeight: '800', color: '#f97316' },
 
-  // Set table
-  setTable: {
-    backgroundColor: theme.card, borderRadius: 20,
-    borderWidth: 1, borderColor: theme.divider,
-    marginBottom: 16, overflow: 'hidden',
+  hint: { fontSize: 12, color: theme.muted, fontWeight: '500', lineHeight: 17, marginBottom: 14 },
+
+  exBlock: {
+    backgroundColor: theme.card, borderRadius: 20, padding: 14, marginBottom: 14,
+    borderWidth: 1.5, borderColor: theme.divider,
     shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
     shadowOffset: { width: 4, height: 5 }, shadowOpacity: 0.18, shadowRadius: 0, elevation: 4,
   },
+  exBlockDone: { borderColor: COLOR + '66' },
+  exBlockSkipped: { opacity: 0.6 },
+  exHead: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  exThumb: { width: 48, height: 48, borderRadius: 10, backgroundColor: theme.input },
+  exThumbEmpty: { alignItems: 'center', justifyContent: 'center', backgroundColor: COLOR + '18' },
+  exBlockName: { fontSize: 16, fontWeight: '800', color: theme.text, lineHeight: 20 },
+  exBlockMeta: { fontSize: 12, color: theme.subtext, marginTop: 2 },
+  exHeadBtn: { paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10, backgroundColor: theme.input },
+  exHeadBtnText: { fontSize: 13, fontWeight: '700', color: theme.subtext },
+  exImage: { width: '100%', aspectRatio: 1, borderRadius: 14, marginBottom: 10, backgroundColor: theme.input },
+
+  // Set table
+  setTable: {
+    borderRadius: 14, borderWidth: 1, borderColor: theme.divider, overflow: 'hidden',
+  },
   tableHead: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 12, paddingVertical: 10,
+    paddingHorizontal: 10, paddingVertical: 8,
     borderBottomWidth: 1, borderBottomColor: theme.divider,
     backgroundColor: theme.input,
   },
@@ -833,31 +806,30 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
     paddingHorizontal: 5, paddingVertical: 1, overflow: 'hidden',
   },
 
+  // Rows sit over the swipe action, so they need their own opaque background.
   tableRow: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 12, paddingVertical: 11,
+    paddingHorizontal: 10, paddingVertical: 8,
     borderBottomWidth: 1, borderBottomColor: theme.divider,
+    backgroundColor: theme.card,
   },
-  tableRowDone: { backgroundColor: theme.accent + '18' },
-  tableRowActive: { backgroundColor: theme.accent + '10' },
-
-  setNum: { fontSize: 15, fontWeight: '700', color: theme.muted, textAlign: 'center' },
+  tableRowDone: { backgroundColor: theme.isDark ? '#1f3f8a' : '#eaf3ff' },
+  setBadge: { minWidth: 28, height: 28, borderRadius: 8, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  setNum: { fontSize: 14, fontWeight: '800', color: theme.muted, textAlign: 'center' },
 
   prevCell: {
     backgroundColor: theme.input, borderRadius: 8,
     paddingVertical: 6, paddingHorizontal: 4, alignItems: 'center',
   },
-  prevText: { fontSize: 12, color: theme.muted, textAlign: 'center' },
-
-  cellText: { fontSize: 16, fontWeight: '700', textAlign: 'center', color: theme.text },
-  cellMuted: { fontSize: 15, color: theme.muted, textAlign: 'center' },
+  prevText: { fontSize: 11.5, color: theme.muted, textAlign: 'center' },
 
   cellInput: {
-    width: 60, height: 36,
+    width: 58, height: 36,
     backgroundColor: theme.input, borderRadius: 10,
     fontSize: 16, fontWeight: '600', color: theme.text,
-    textAlign: 'center', borderWidth: 1.5, borderColor: COLOR + '55',
+    textAlign: 'center', borderWidth: 1.5, borderColor: COLOR + '40',
   },
+  cellInputDone: { borderColor: COLOR, color: COLOR },
 
   checkDone: {
     width: 32, height: 32, borderRadius: 16,
@@ -868,40 +840,25 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
     borderWidth: 2, borderColor: COLOR + '66',
     alignItems: 'center', justifyContent: 'center',
   },
-  checkEmpty: { width: 32, height: 32, borderRadius: 16, borderWidth: 2, borderColor: theme.cardBorder },
   checkMark: { color: '#fff', fontWeight: '800', fontSize: 13 },
 
+  swipeDelete: {
+    width: 76, backgroundColor: '#ef4444', alignItems: 'center', justifyContent: 'center',
+  },
+  swipeDeleteIcon: { fontSize: 22 },
+
   addSetRow: {
-    paddingVertical: 13, alignItems: 'center',
-    borderTopWidth: 1, borderTopColor: theme.divider,
+    paddingVertical: 11, alignItems: 'center',
+    backgroundColor: theme.card,
   },
   addSetText: { fontSize: 12, fontWeight: '800', color: theme.muted, letterSpacing: 1.5 },
 
-  // Actions — normal
-  actions: { gap: 10 },
   logBtn: {
-    backgroundColor: COLOR, borderRadius: 18, padding: 18, alignItems: 'center',
+    backgroundColor: COLOR, borderRadius: 18, padding: 18, alignItems: 'center', marginTop: 6,
     shadowColor: '#000', shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.15, shadowRadius: 8, elevation: 4,
   },
   logBtnText: { color: '#fff', fontWeight: '800', fontSize: 17 },
-  skipExBtn: { alignItems: 'center', padding: 10 },
-  skipExText: { color: theme.muted, fontSize: 14, fontWeight: '600' },
-
-  // Actions — rest state
-  restActions: { gap: 10 },
-  restBanner: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: '#fff7ed', borderRadius: 16, padding: 16,
-    borderWidth: 1, borderColor: '#fed7aa',
-    justifyContent: 'center',
-  },
-  restDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#f97316' },
-  restBannerText: { fontSize: 15, fontWeight: '700', color: '#c2410c' },
-  skipRestInlineBtn: { alignItems: 'center', padding: 10 },
-  skipRestInlineText: { color: '#f97316', fontSize: 14, fontWeight: '700' },
-  finishEarlyBtn: { alignItems: 'center', paddingVertical: 6 },
-  finishEarlyText: { color: '#10b981', fontSize: 13, fontWeight: '600' },
 
   // Done
   doneContent: { padding: 24, paddingTop: 60, alignItems: 'center' },
@@ -938,60 +895,6 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
   photoPreview: { width: '100%', height: 260, borderRadius: 16 },
   photoRetake: { paddingVertical: 10 },
   photoRetakeText: { color: COLOR, fontWeight: '700', fontSize: 13 },
-
-  // Overview bottom sheet
-  ovOverlay: { flex: 1, justifyContent: 'flex-end' },
-  ovBg: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
-  ovSheet: {
-    backgroundColor: theme.card, borderTopLeftRadius: 28, borderTopRightRadius: 28,
-    paddingTop: 10, paddingHorizontal: 20, paddingBottom: 36,
-    shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.12, shadowRadius: 16, elevation: 16,
-  },
-  ovHandle: {
-    width: 40, height: 4, borderRadius: 2, backgroundColor: theme.divider,
-    alignSelf: 'center', marginBottom: 16,
-  },
-  ovTitle: { fontSize: 18, fontWeight: '800', color: theme.text, marginBottom: 14 },
-  ovItem: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: theme.divider,
-  },
-  ovItemActive: { backgroundColor: COLOR + '08', borderRadius: 12, paddingHorizontal: 8, marginHorizontal: -8 },
-  ovNum: {
-    width: 30, height: 30, borderRadius: 9, backgroundColor: theme.input,
-    alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-  },
-  ovNumDone: { backgroundColor: '#10b981' },
-  ovNumCurrent: { backgroundColor: COLOR },
-  ovNumText: { fontSize: 13, fontWeight: '800', color: theme.muted },
-  ovName: { fontSize: 15, fontWeight: '600', color: theme.text },
-  ovSub: { fontSize: 12, color: theme.muted, marginTop: 1 },
-  ovActiveDot: {
-    width: 8, height: 8, borderRadius: 4, backgroundColor: COLOR, flexShrink: 0,
-  },
-  ovChevron: { fontSize: 20, color: theme.muted, flexShrink: 0 },
-  ovThumbWrap: {
-    width: 44, height: 44, borderRadius: 10, overflow: 'hidden',
-    flexShrink: 0,
-  },
-  ovThumb: { width: 44, height: 44, backgroundColor: theme.input },
-  ovThumbEmpty: { alignItems: 'center', justifyContent: 'center', backgroundColor: theme.accent + '18' },
-  ovThumbOverlay: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: 'rgba(16, 185, 129, 0.75)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  ovThumbCheckText: { color: '#fff', fontWeight: '800', fontSize: 16 },
-  ovThumbBorder: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-    borderRadius: 10, borderWidth: 2.5, borderColor: COLOR,
-  },
-  ovCloseBtn: {
-    backgroundColor: theme.input, borderRadius: 14, padding: 14,
-    alignItems: 'center', marginTop: 14,
-  },
-  ovCloseText: { fontWeight: '700', fontSize: 15, color: theme.subtext },
 
   // Settings modal
   modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center' },
