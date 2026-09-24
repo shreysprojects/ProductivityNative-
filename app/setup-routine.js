@@ -192,10 +192,13 @@ export default function SetupRoutine() {
   const { user } = useAuth()
   const { theme } = useTheme()
   const s = useMemo(() => makeStyles(theme), [theme])
-  const { name: nameParam, variant: variantParam } = useLocalSearchParams()
+  const { name: nameParam, variant: variantParam, create: createParam } = useLocalSearchParams()
 
-  const isNew = nameParam === 'new'
-  const isFirstTime = !nameParam
+  // A new routine opens with create=1. It used to be the name "new", which
+  // left a routine actually called "new" impossible to edit: opening it
+  // started a blank routine instead.
+  const isNew = createParam === '1'
+  const isFirstTime = !isNew && !nameParam
   const routineName = isNew || isFirstTime ? null : nameParam
   // variant=alt edits the routine's alternative version: tasks only — the
   // name, description, and schedule belong to the routine and stay shared.

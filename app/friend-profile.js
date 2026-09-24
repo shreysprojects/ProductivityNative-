@@ -626,7 +626,7 @@ export default function FriendProfileScreen() {
       let i = 2
       while (taken(newName)) { newName = `${base} (${i})`; i++ }
       // The friend's name goes through the same rules as one typed here. A
-      // name like "Morning::alt" or "new" means something else to the app.
+      // name like "Morning::alt" or "Looks" means something else to the app.
       const problem = validateRoutineName(newName, existing)
       if (problem) {
         Alert.alert("Can't copy this routine", problem)
