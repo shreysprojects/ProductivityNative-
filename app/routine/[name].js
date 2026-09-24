@@ -8,14 +8,14 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import Svg, { Polyline, Circle, Line as SvgLine } from 'react-native-svg'
 import { Image } from 'expo-image'
 import * as ImagePicker from 'expo-image-picker'
-import { router, useLocalSearchParams, useFocusEffect } from 'expo-router'
+import { router, useLocalSearchParams, useFocusEffect, Redirect } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import RunRoutine from '../../components/RunRoutine'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, DAY_LABELS, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
 import {
-  getRoutineTemplate, saveRoutineTemplate, getTodayRun, startRun, advanceRun, completeRun,
+  getRoutineTemplate, loadRoutineTemplate, saveRoutineTemplate, getTodayRun, getRoutineRunsForDate,
   saveRun, resetTodayRun, getGymSplit, getWorkoutRoutineList, deleteWorkoutPlan, renameWorkoutPlan, getWorkoutPlan,
   getDayTodos, saveDayTodos, getWorkoutLogsRange, getAllWorkoutLogs, deleteWorkoutLog, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
@@ -23,20 +23,23 @@ import {
   setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine, taskGoalSecs,
   stepImageUnlocked, subStepImageUnlocked, runWithAdjustedStart,
   recordRunCompletion, skipRunStep, reopenRunStep, toggleLaterItem, withoutPendingLater,
-  laterItems, pendingLater,
+  laterItems, pendingLater, runFullyDone,
 } from '../../lib/storage'
+import { advanceRunStep, finishRun, checklistTaskMs, timedRunFrom } from '../../lib/runSteps'
+import { trySync, pendingUpsert, pendingDeleteIds } from '../../lib/syncQueue'
+import { collectPhotoUris } from '../../lib/photoPaths'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import ImageViewerModal from '../../components/ImageViewerModal'
 import MuscleMap from '../../components/MuscleMap'
 import ExerciseVideo from '../../components/ExerciseVideo'
 import { useSheetDrag } from '../../lib/useSheetDrag'
 import { supabase } from '../../lib/supabase'
-import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
+import { getFitPhotos, getPhotoPasscode, setPhotoPasscode, deleteFitPhoto, deleteStepImage } from '../../lib/photoStorage'
 import { autoLogSpan } from '../../lib/timeLogging'
 import { maybePromptReview } from '../../lib/review'
 import { getRoutinePrefs, saveRoutinePrefs } from '../../lib/routinePrefs'
 import {
-  getSleep, startSleep, cancelSleep, wakeUp, sleepDurationShort, clockLabel,
+  getSleep, startSleep, cancelSleep, wakeUp, sleepDurationShort, clockLabel, nightlyLogs,
 } from '../../lib/sleepStorage'
 
 const CELL_W = Math.floor((Dimensions.get('window').width - 20 - 24) / 7)
@@ -293,6 +296,11 @@ function WeightSparkline({ logs, color, theme }) {
   )
 }
 
+// Many keyboards type a decimal comma ("72,5"), which parseFloat reads as 72.
+function parseDecimal(text) {
+  return parseFloat(String(text ?? '').trim().replace(',', '.'))
+}
+
 const WEIGHT_GOALS = ['lose', 'maintain', 'gain']
 const WEIGHT_GOAL_LABELS = { lose: 'Lose weight', maintain: 'Maintain', gain: 'Gain / Build' }
 
@@ -316,7 +324,7 @@ function WeightTracker({ userId, theme, color, morningSettings, onUpdateSettings
   const showInput = !todayLog || isEditing
 
   async function logWeight() {
-    const w = parseFloat(inputWeight)
+    const w = parseDecimal(inputWeight)
     if (!w || w <= 0 || w > 999) return
     await saveWeightLog(userId, todayStr, w)
     setInputWeight('')
@@ -325,10 +333,11 @@ function WeightTracker({ userId, theme, color, morningSettings, onUpdateSettings
   }
 
   async function saveGoal() {
+    const target = parseDecimal(editTarget)
     const ns = {
       ...morningSettings,
       weightGoal: editGoal,
-      targetWeight: editTarget ? parseFloat(editTarget) : null,
+      targetWeight: target > 0 ? target : null,
     }
     await saveMorningSettings(userId, ns)
     onUpdateSettings(ns)
@@ -527,12 +536,17 @@ function SleepTracker({ userId, theme, color }) {
   async function setSleepTime() {
     const sMins = partsToMins(sh, sm, sap)
     if (sMins === null) { Alert.alert('Check the time', 'Use hours 1 to 12 and minutes 0 to 59.'); return }
-    const d = new Date()
+    const now = Date.now()
+    const d = new Date(now)
     d.setHours(Math.floor(sMins / 60), sMins % 60, 0, 0)
-    let sleepAt = d.getTime()
     // More than six hours ahead reads as "last night" (logging in the small
-    // hours); anything nearer is tonight, even a little in the future.
-    if (sleepAt > Date.now() + 6 * 3600000) sleepAt -= 86400000
+    // hours); anything nearer is tonight, even a little in the future. More
+    // than twelve hours behind is tonight after midnight (12:30 AM set at
+    // 11 PM). Days move by the calendar, not by 24 hours, so a night that
+    // changes the clocks still lands on the time typed.
+    if (d.getTime() > now + 6 * 3600000) d.setDate(d.getDate() - 1)
+    else if (d.getTime() < now - 12 * 3600000) d.setDate(d.getDate() + 1)
+    const sleepAt = d.getTime()
 
     let wakeGoalAt = null
     if (wh.trim() || wm.trim()) {
@@ -540,13 +554,24 @@ function SleepTracker({ userId, theme, color }) {
       if (wMins === null) { Alert.alert('Check the wake-up time', 'Use hours 1 to 12 and minutes 0 to 59, or leave it blank.'); return }
       const w = new Date(sleepAt)
       w.setHours(Math.floor(wMins / 60), wMins % 60, 0, 0)
+      if (w.getTime() <= sleepAt) w.setDate(w.getDate() + 1)
       wakeGoalAt = w.getTime()
-      if (wakeGoalAt <= sleepAt) wakeGoalAt += 86400000
     }
 
     setBusy(true)
     try {
-      setSleep(await startSleep(userId, { sleepAt, wakeGoalAt }))
+      const saved = await startSleep(userId, { sleepAt, wakeGoalAt })
+      setSleep(saved)
+      // The sleep is saved either way, but someone counting on the alarm
+      // needs to know it isn't coming.
+      if (wakeGoalAt && !saved?.session?.notifId) {
+        Alert.alert(
+          'No wake-up alarm',
+          wakeGoalAt <= Date.now()
+            ? `${clockLabel(wakeGoalAt)} has already passed, so there's no alarm for it. Your sleep time is saved.`
+            : 'Your sleep time is saved, but the alarm couldn’t be set. Check that notifications are allowed for LifeLayer in Settings.',
+        )
+      }
     } catch (e) {
       Alert.alert('Could not save', String(e?.message ?? e))
     } finally {
@@ -562,7 +587,9 @@ function SleepTracker({ userId, theme, color }) {
   }
 
   const session = sleep.session
-  const logs = sleep.logs ?? []
+  // A nap is logged beside the night it follows; "last night" and the
+  // average read one night per day.
+  const logs = nightlyLogs(sleep.logs)
   const last = logs[0]
   const recent = logs.slice(0, 7)
   const avgMins = recent.length ? Math.round(recent.reduce((s, l) => s + (l.minutes || 0), 0) / recent.length) : null
@@ -661,6 +688,31 @@ const sl = StyleSheet.create({
 // ── Looks section ─────────────────────────────────────────────────────────
 
 const LOOKS_COLOR = '#ec4899'
+
+// Looks data is largely model output, so every field is made plain text and
+// anything off-shape is dropped before it is shown or saved: one number or
+// object where a string belongs crashed the Morning screen on every open.
+// `limits` caps the lengths of fresh AI suggestions; saved data keeps
+// whatever the user typed.
+const NO_LIMITS = { name: Infinity, product: Infinity, explanation: Infinity }
+
+function cleanLooksCategories(list, limits = NO_LIMITS) {
+  const text = (v, max) => (typeof v === 'string' || typeof v === 'number' ? String(v).trim().slice(0, max) : '')
+  return (Array.isArray(list) ? list : [])
+    .filter(c => c && typeof c === 'object')
+    .map(c => ({
+      ...c,
+      name: text(c.name, limits.name) || 'Skin Care',
+      steps: (Array.isArray(c.steps) ? c.steps : [])
+        .filter(st => st && typeof st === 'object' && text(st.name, limits.name))
+        .map(st => ({
+          ...st,
+          name: text(st.name, limits.name),
+          product: text(st.product, limits.product) || null,
+          explanation: text(st.explanation, limits.explanation) || null,
+        })),
+    }))
+}
 
 // ── Phone Downtime (iOS Shortcuts) ──────────────────────────────────────────
 // iOS doesn't let an app toggle Screen Time / Downtime directly, but it CAN run
@@ -803,13 +855,29 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
     })
   }
 
+  // The latest data, for an update that lands after a wait (the analysis
+  // takes seconds) and must not undo a change made in the meantime.
+  const looksRef = useRef(looksData)
+
   useFocusEffect(useCallback(() => {
-    getLooksData(userId).then(d => setLooksData({ hideExplanations: false, ...d }))
+    getLooksData(userId).then(d => {
+      const next = {
+        hideExplanations: false,
+        ...d,
+        categories: cleanLooksCategories(d?.categories),
+        skinNote: typeof d?.skinNote === 'string' ? d.skinNote : null,
+      }
+      looksRef.current = next
+      setLooksData(next)
+    })
   }, [userId]))
 
+  // Takes the new data, or a function from the latest data to the new data.
   async function update(next) {
-    setLooksData(next)
-    await saveLooksData(userId, next)
+    const value = typeof next === 'function' ? next(looksRef.current) : next
+    looksRef.current = value
+    setLooksData(value)
+    await saveLooksData(userId, value)
   }
 
   function addCategory() {
@@ -889,12 +957,9 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
     }
   }
 
+  // The system photo picker needs no library permission (only the camera
+  // does), so asking for one only turned away people who had declined it.
   async function pickFromLibrary() {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Photo library access is required.')
-      return
-    }
     const result = await ImagePicker.launchImageLibraryAsync({
       base64: true,
       quality: 0.6,
@@ -939,7 +1004,7 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
         Alert.alert('Daily limit reached', data.reason)
         return
       }
-      const parsed = data
+      const parsed = data ?? {}
       if (parsed.error === 'inappropriate') {
         Alert.alert('Inappropriate Image', 'Please only upload appropriate photos for skin analysis.')
         return
@@ -950,17 +1015,23 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
       }
       if (!Array.isArray(parsed.categories)) throw new Error('Unexpected response shape')
       const ts = Date.now()
-      const categories = parsed.categories.map((cat, ci) => ({
-        id: String(ts + ci),
-        name: cat.name ?? 'Skin Care',
-        steps: (cat.steps ?? []).map((step, si) => ({
-          id: String(ts + ci * 100 + si + 1),
-          name: step.name ?? '',
-          product: (step.product && !/^(n\/a|none|-)$/i.test(step.product.trim())) ? step.product : null,
-          explanation: step.explanation || null,
+      const categories = cleanLooksCategories(
+        parsed.categories.slice(0, 10).map((cat, ci) => ({
+          id: String(ts + ci),
+          name: cat?.name,
+          steps: (Array.isArray(cat?.steps) ? cat.steps.slice(0, 20) : []).map((step, si) => ({
+            id: String(ts + ci * 100 + si + 1),
+            name: step?.name,
+            product: /^(n\/a|none|-)$/i.test(String(step?.product ?? '').trim()) ? null : step?.product,
+            explanation: step?.explanation,
+          })),
         })),
-      }))
-      await update({ ...looksData, categories, skinNote: parsed.skinNote || null })
+        { name: 80, product: 120, explanation: 400 },
+      ).filter(cat => cat.steps.length > 0)
+      if (categories.length === 0) throw new Error('No suggestions came back. Please try again.')
+      const skinNote = typeof parsed.skinNote === 'string' ? parsed.skinNote.trim().slice(0, 400) || null : null
+      // Built on the data as it is now, not as it was when the photo was sent.
+      await update(prev => ({ ...prev, categories, skinNote }))
     } catch (e) {
       Alert.alert('Analysis failed', e.message ?? 'Something went wrong. Please try again.')
     } finally {
@@ -1248,6 +1319,32 @@ function MonthCalendar({ year, month, logMap, accentColor, theme, onDayPress, mu
 
 // ── Progress photo viewer (optionally passcode-protected) ──────────────────
 
+// Wrong passcode guesses are counted on the device, so closing the sheet
+// doesn't reset them: after a few misses, each further try waits longer.
+const PASS_FAILS_KEY = uid => `@fitpass_fails_${uid}`
+const FREE_PASS_TRIES = 3
+
+async function readPassFails(userId) {
+  try {
+    const v = JSON.parse((await AsyncStorage.getItem(PASS_FAILS_KEY(userId))) ?? 'null')
+    return { count: v?.count ?? 0, until: v?.until ?? 0 }
+  } catch {
+    return { count: 0, until: 0 }
+  }
+}
+
+function writePassFails(userId, fails) {
+  return (fails
+    ? AsyncStorage.setItem(PASS_FAILS_KEY(userId), JSON.stringify(fails))
+    : AsyncStorage.removeItem(PASS_FAILS_KEY(userId))
+  ).catch(() => {})
+}
+
+function waitLabel(until) {
+  const secs = Math.max(1, Math.ceil((until - Date.now()) / 1000))
+  return secs >= 60 ? `${Math.ceil(secs / 60)} min` : `${secs} sec`
+}
+
 function FitPhotoSection({ userId, date, theme, accentColor }) {
   const [photoUri, setPhotoUri] = useState(null)
   const [hasPass, setHasPass] = useState(false)
@@ -1255,32 +1352,102 @@ function FitPhotoSection({ userId, date, theme, accentColor }) {
   const [codeInput, setCodeInput] = useState('')
   const [settingCode, setSettingCode] = useState(false)
   const [newCode, setNewCode] = useState('')
+  // The first entry of a new passcode while it is being repeated.
+  const [firstCode, setFirstCode] = useState(null)
+  // When the next unlock try is allowed after too many wrong ones (0: now).
+  const [waitUntil, setWaitUntil] = useState(0)
 
   useEffect(() => {
     let active = true
-    Promise.all([getFitPhotos(userId), getPhotoPasscode(userId)]).then(([map, pass]) => {
+    Promise.all([getFitPhotos(userId), getPhotoPasscode(userId), readPassFails(userId)]).then(([map, pass, fails]) => {
       if (!active) return
       setPhotoUri(map[date] ?? null)
       setHasPass(!!pass)
       setLocked(!!pass && !!map[date])
-      setCodeInput(''); setSettingCode(false); setNewCode('')
+      setCodeInput(''); setSettingCode(false); setNewCode(''); setFirstCode(null)
+      setWaitUntil(fails.until > Date.now() ? fails.until : 0)
     })
     return () => { active = false }
   }, [userId, date])
 
+  useEffect(() => {
+    if (!waitUntil) return
+    const id = setTimeout(() => setWaitUntil(0), Math.max(0, waitUntil - Date.now()))
+    return () => clearTimeout(id)
+  }, [waitUntil])
+
   if (!photoUri) return null
 
   async function tryUnlock() {
+    const fails = await readPassFails(userId)
+    if (fails.until > Date.now()) { setWaitUntil(fails.until); setCodeInput(''); return }
     const pass = await getPhotoPasscode(userId)
-    if (codeInput === pass) { setLocked(false); setCodeInput('') }
-    else { setCodeInput(''); Alert.alert('Wrong passcode', 'Please try again.') }
+    const guess = codeInput
+    setCodeInput('')
+    if (guess === pass) {
+      await writePassFails(userId, null)
+      setLocked(false)
+      return
+    }
+    const count = fails.count + 1
+    const until = count >= FREE_PASS_TRIES
+      ? Date.now() + Math.min(30000 * 2 ** (count - FREE_PASS_TRIES), 60 * 60 * 1000)
+      : 0
+    await writePassFails(userId, { count, until })
+    setWaitUntil(until)
+    Alert.alert('Wrong passcode', until ? `Too many tries. Try again in ${waitLabel(until)}.` : 'Please try again.')
   }
 
+  // Asked for twice: a mistyped code nobody knows would lock the photos away.
   async function saveNewCode() {
     if (newCode.length !== 4) return
+    if (firstCode === null) { setFirstCode(newCode); setNewCode(''); return }
+    if (newCode !== firstCode) {
+      setFirstCode(null); setNewCode('')
+      Alert.alert('Passcodes don’t match', 'Choose a passcode and enter the same one twice.')
+      return
+    }
     await setPhotoPasscode(userId, newCode)
-    setHasPass(true); setSettingCode(false); setNewCode('')
+    await writePassFails(userId, null)
+    setHasPass(true); setSettingCode(false); setNewCode(''); setFirstCode(null)
     Alert.alert('Passcode set 🔒', 'Your progress photos are now protected.')
+  }
+
+  // There is no recovering a forgotten passcode: resetting it also deletes
+  // the photos it protects, so it can't be used to get around it.
+  function confirmResetPass() {
+    Alert.alert(
+      'Forgot your passcode?',
+      'Resetting removes the passcode and permanently deletes all of your progress photos on this device. This can’t be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete photos & reset', style: 'destructive', onPress: async () => {
+          try {
+            const map = await getFitPhotos(userId)
+            for (const d of Object.keys(map)) await deleteFitPhoto(userId, d)
+            await setPhotoPasscode(userId, null)
+            await writePassFails(userId, null)
+            setHasPass(false); setLocked(false); setWaitUntil(0); setPhotoUri(null)
+          } catch {
+            Alert.alert('Could not reset', 'Please try again.')
+          }
+        } },
+      ],
+    )
+  }
+
+  function confirmDeletePhoto() {
+    Alert.alert('Delete this photo?', 'This progress photo will be permanently deleted from this device.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        try {
+          await deleteFitPhoto(userId, date)
+          setPhotoUri(null)
+        } catch {
+          Alert.alert('Could not delete', 'Please try again.')
+        }
+      } },
+    ])
   }
 
   async function removePass() {
@@ -1294,7 +1461,9 @@ function FitPhotoSection({ userId, date, theme, accentColor }) {
       {locked ? (
         <View style={[fp.lockBox, { borderColor: theme.cardBorder, backgroundColor: theme.isDark ? '#ffffff06' : '#00000004' }]}>
           <Text style={{ fontSize: 26 }}>🔒</Text>
-          <Text style={[fp.lockText, { color: theme.subtext }]}>Enter your passcode to view</Text>
+          <Text style={[fp.lockText, { color: theme.subtext }]}>
+            {waitUntil ? `Too many tries. Try again in ${waitLabel(waitUntil)}.` : 'Enter your passcode to view'}
+          </Text>
           <View style={fp.codeRow}>
             <TextInput
               style={[fp.codeInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
@@ -1303,31 +1472,42 @@ function FitPhotoSection({ userId, date, theme, accentColor }) {
               placeholder="••••" placeholderTextColor={theme.muted}
             />
             <Pressable
-              style={[fp.codeBtn, { backgroundColor: accentColor, opacity: codeInput.length === 4 ? 1 : 0.4 }]}
-              onPress={tryUnlock} disabled={codeInput.length !== 4}
+              style={[fp.codeBtn, { backgroundColor: accentColor, opacity: codeInput.length === 4 && !waitUntil ? 1 : 0.4 }]}
+              onPress={tryUnlock} disabled={codeInput.length !== 4 || !!waitUntil}
             >
               <Text style={fp.codeBtnText}>Unlock</Text>
             </Pressable>
           </View>
+          <Pressable onPress={confirmResetPass} hitSlop={8}>
+            <Text style={[fp.forgotText, { color: theme.muted }]}>Forgot passcode?</Text>
+          </Pressable>
         </View>
       ) : (
         <>
           <Image source={{ uri: photoUri }} style={fp.photo} contentFit="cover" />
           {settingCode ? (
-            <View style={[fp.codeRow, { marginTop: 10 }]}>
-              <TextInput
-                style={[fp.codeInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
-                value={newCode} onChangeText={setNewCode}
-                keyboardType="number-pad" maxLength={4} secureTextEntry
-                placeholder="4-digit code" placeholderTextColor={theme.muted}
-                autoFocus
-              />
-              <Pressable
-                style={[fp.codeBtn, { backgroundColor: accentColor, opacity: newCode.length === 4 ? 1 : 0.4 }]}
-                onPress={saveNewCode} disabled={newCode.length !== 4}
-              >
-                <Text style={fp.codeBtnText}>Set</Text>
-              </Pressable>
+            <View style={{ marginTop: 10 }}>
+              <Text style={[fp.hint, { color: theme.subtext }]}>
+                {firstCode === null
+                  ? 'Choose a 4-digit passcode. If you ever forget it, resetting it deletes your progress photos.'
+                  : 'Enter the same passcode again.'}
+              </Text>
+              <View style={fp.codeRow}>
+                <TextInput
+                  key={firstCode === null ? 'choose' : 'repeat'}
+                  style={[fp.codeInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+                  value={newCode} onChangeText={setNewCode}
+                  keyboardType="number-pad" maxLength={4} secureTextEntry
+                  placeholder={firstCode === null ? '4-digit code' : 'Repeat code'} placeholderTextColor={theme.muted}
+                  autoFocus
+                />
+                <Pressable
+                  style={[fp.codeBtn, { backgroundColor: accentColor, opacity: newCode.length === 4 ? 1 : 0.4 }]}
+                  onPress={saveNewCode} disabled={newCode.length !== 4}
+                >
+                  <Text style={fp.codeBtnText}>{firstCode === null ? 'Next' : 'Set'}</Text>
+                </Pressable>
+              </View>
             </View>
           ) : (
             <View style={fp.actionsRow}>
@@ -1340,6 +1520,9 @@ function FitPhotoSection({ userId, date, theme, accentColor }) {
                   <Text style={[fp.actionText, { color: accentColor }]}>🔒 Protect with passcode</Text>
                 </Pressable>
               )}
+              <Pressable onPress={confirmDeletePhoto} hitSlop={8}>
+                <Text style={[fp.actionText, { color: '#ef4444' }]}>🗑 Delete photo</Text>
+              </Pressable>
             </View>
           )}
         </>
@@ -1364,11 +1547,45 @@ const fp = StyleSheet.create({
   },
   codeBtn: { paddingHorizontal: 16, paddingVertical: 11, borderRadius: 12 },
   codeBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
-  actionsRow: { flexDirection: 'row', justifyContent: 'center', paddingTop: 10 },
+  actionsRow: { flexDirection: 'row', justifyContent: 'center', gap: 18, paddingTop: 10 },
   actionText: { fontSize: 13, fontWeight: '700' },
+  hint: { fontSize: 12, fontWeight: '600', lineHeight: 17, textAlign: 'center', marginBottom: 8, paddingHorizontal: 8 },
+  forgotText: { fontSize: 12.5, fontWeight: '700', marginTop: 2 },
 })
 
-function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
+// Removing a day's workout also offers to remove that day's progress photo,
+// which would otherwise stay on the phone with nothing left that shows it.
+async function confirmDeleteWorkout(userId, log, dateLabel, onDeleted) {
+  let hasPhoto = false
+  try { hasPhoto = !!(await getFitPhotos(userId))[log.date] } catch {}
+  const remove = async withPhoto => {
+    try {
+      await deleteWorkoutLog(userId, log.date)
+    } catch {
+      Alert.alert('Could not delete', 'Please check your connection and try again.')
+      return
+    }
+    if (withPhoto) await deleteFitPhoto(userId, log.date).catch(() => {})
+    onDeleted()
+  }
+  const what = `${log.muscleGroup || 'This workout'} on ${dateLabel} will be removed from your history.`
+  Alert.alert(
+    'Delete this workout?',
+    hasPhoto ? `${what} That day also has a progress photo.` : what,
+    hasPhoto
+      ? [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Delete workout only', onPress: () => remove(false) },
+          { text: 'Delete workout and photo', style: 'destructive', onPress: () => remove(true) },
+        ]
+      : [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Delete', style: 'destructive', onPress: () => remove(false) },
+        ],
+  )
+}
+
+function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme, onDeleted }) {
   const { unit } = useTheme()
   const [logMap, setLogMap] = useState({})
   const [musclesByGroup, setMusclesByGroup] = useState({})
@@ -1379,25 +1596,15 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
   const [monthCount, setMonthCount] = useState(12)
 
   // Remove the workout shown in the detail sheet from that day's history.
+  // The week strip behind this modal is told too, or it keeps showing it.
   function confirmDeleteDetail() {
     const log = detailLog
     if (!log?.date) return
-    Alert.alert(
-      'Delete this workout?',
-      `${log.muscleGroup || 'This workout'} on ${fmtDate(log.date)} will be removed from your history.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: async () => {
-          try {
-            await deleteWorkoutLog(userId, log.date)
-            setLogMap(prev => { const next = { ...prev }; delete next[log.date]; return next })
-            setDetailLog(null)
-          } catch {
-            Alert.alert('Could not delete', 'Please check your connection and try again.')
-          }
-        } },
-      ],
-    )
+    confirmDeleteWorkout(userId, log, fmtDate(log.date), () => {
+      setLogMap(prev => { const next = { ...prev }; delete next[log.date]; return next })
+      setDetailLog(null)
+      onDeleted?.(log.date)
+    })
   }
 
   useEffect(() => {
@@ -1599,22 +1806,15 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
   function confirmDeleteDetail() {
     const log = detailLog
     if (!log?.date) return
-    Alert.alert(
-      'Delete this workout?',
-      `${log.muscleGroup || 'This workout'} on ${fmtDetailDate(log.date)} will be removed from your history.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: async () => {
-          try {
-            await deleteWorkoutLog(userId, log.date)
-            setWeekLogs(prev => prev.map(d => d.date === log.date ? { ...d, log: null } : d))
-            setDetailLog(null)
-          } catch {
-            Alert.alert('Could not delete', 'Please check your connection and try again.')
-          }
-        } },
-      ],
-    )
+    confirmDeleteWorkout(userId, log, fmtDetailDate(log.date), () => {
+      clearWeekDay(log.date)
+      setDetailLog(null)
+    })
+  }
+
+  // A workout deleted here or from "View all" leaves the strip at once.
+  function clearWeekDay(date) {
+    setWeekLogs(prev => prev.map(d => d.date === date ? { ...d, log: null } : d))
   }
 
   useEffect(() => {
@@ -1825,6 +2025,7 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
         userId={userId}
         accentColor={accentColor}
         theme={theme}
+        onDeleted={clearWeekDay}
       />
     </View>
   )
@@ -1955,9 +2156,65 @@ function NamePromptModal({ prompt, theme, color, onClose }) {
   )
 }
 
+// ── Last night's run ───────────────────────────────────────────────────────
+// A routine begun late in the evening often ends after midnight, but storage
+// reads only today's run, so at 12:00 an unfinished one simply vanished.
+// Until LATE_RUN_UNTIL_HOUR the screen also looks for last night's run and
+// keeps offering it while it is unfinished. It is saved, and its completion
+// recorded, under its own date.
+const LATE_RUN_UNTIL_HOUR = 5
+
+function localDateStr(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+async function getLateRun(userId, routineName) {
+  const now = new Date()
+  if (now.getHours() >= LATE_RUN_UNTIL_HOUR) return null
+  const y = new Date(now)
+  y.setDate(y.getDate() - 1)
+  const date = localDateStr(y)
+  try {
+    // A save still waiting in the queue (made offline) is newer than the row.
+    const queued = await pendingUpsert('routine_runs', { user_id: userId, routine_name: routineName, date })
+    let run = queued?.data ?? null
+    if (!queued) {
+      if ((await pendingDeleteIds('routine_runs')).has(`${routineName}|${date}`)) return null
+      const rows = await getRoutineRunsForDate(userId, date)
+      run = rows.find(r => r.routine_name === routineName)?.data ?? null
+    }
+    return run?.date === date && !run.finished && !run.quick && run.steps?.length ? run : null
+  } catch {
+    return null
+  }
+}
+
+// Today's run or, failing that, last night's unfinished one.
+async function getCurrentRun(userId, routineName) {
+  return (await getTodayRun(userId, routineName)) ?? (await getLateRun(userId, routineName))
+}
+
+// After tasks are replaced or wiped, the photos they used that nothing points
+// at any more — not the new tasks, not the routine's other variant — are
+// deleted; left alone they would hold upload slots for good.
+async function freeUnusedPhotos(userId, name, isAlt, oldTasks, newTasks) {
+  try {
+    // Strict: if the other variant can't be read nothing is deleted, since a
+    // photo it shares would break. The slot sweep frees real leftovers later.
+    const other = await loadRoutineTemplate(userId, isAlt ? name : altRoutineName(name))
+    const keep = new Set([...collectPhotoUris(newTasks), ...collectPhotoUris(other)])
+    for (const uri of new Set(collectPhotoUris(oldTasks))) {
+      if (!keep.has(uri)) deleteStepImage(uri)
+    }
+  } catch {}
+}
+
 export default function RoutineScreen() {
   const { name } = useLocalSearchParams()
   const { user } = useAuth()
+  // The id, not the object, is what everything below reads: the session can
+  // end while this screen is open, and user.id would then crash the app.
+  const userId = user?.id
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isFitness = name === 'Fitness'
@@ -1974,6 +2231,28 @@ export default function RoutineScreen() {
 
   const [template, setTemplate] = useState([])
   const [run, setRun] = useState(null)
+  // The run on screen, also kept in a ref so every tap builds on the latest
+  // copy rather than the one its render captured, and shows at once instead
+  // of after its save comes back. Quick taps used to build on the same stale
+  // copy and undo each other.
+  const runRef = useRef(null)
+  // Everything that writes the run goes out strictly one after another, so a
+  // slow save can never land after — and undo — a newer one.
+  const runWork = useRef(Promise.resolve())
+  // Counts changes made on this screen. A read that started before one must
+  // not replace it with the older copy it read.
+  const runEdits = useRef(0)
+  // Done, Finish, Skip and going back move the run to another task. Until
+  // that move is saved they wait, so a double tap can't move it twice.
+  const [stepBusy, setStepBusy] = useState(false)
+  const stepBusyRef = useRef(false)
+  // Loads are numbered; one overtaken by a newer load (a quick Main /
+  // Alternative switch) or by the screen losing focus is dropped.
+  const loadSeq = useRef(0)
+  // The variant whose data is on screen. While another one is loading the
+  // content stays dimmed and takes no taps, so nothing done to the old data
+  // is written under the new variant's name.
+  const [loadedName, setLoadedName] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
   const [namePrompt, setNamePrompt] = useState(null)
@@ -2012,7 +2291,8 @@ export default function RoutineScreen() {
   const [hideWorkouts, setHideWorkouts] = useState(false)
 
   async function setWorkoutsHidden(hidden) {
-    const saved = await saveRoutinePrefs(user.id, { hideWorkouts: hidden })
+    if (!userId) return
+    const saved = await saveRoutinePrefs(userId, { hideWorkouts: hidden })
     setHideWorkouts(saved.hideWorkouts)
   }
 
@@ -2022,7 +2302,8 @@ export default function RoutineScreen() {
   }
 
   async function makeViewModeDefault() {
-    const saved = await saveRoutinePrefs(user.id, { runMode: viewMode })
+    if (!userId) return
+    const saved = await saveRoutinePrefs(userId, { runMode: viewMode })
     setDefaultRunMode(saved.runMode)
   }
 
@@ -2064,8 +2345,76 @@ export default function RoutineScreen() {
   // and Main/Alternative tab switches dim + restore instead of blanking.
   const contentFade   = useRef(new Animated.Value(0)).current
 
+  // ── Run writes ───────────────────────────────────────────────────────────
+
+  function showRun(next) {
+    runRef.current = next
+    setRun(next)
+  }
+
+  function queueRunWork(fn) {
+    const work = runWork.current.then(fn)
+    runWork.current = work.catch(() => {})
+    return work
+  }
+
+  // Put a new version of the run on screen at once and queue its save. A
+  // finished run also records the day, under the run's own date — every
+  // finish path comes through here.
+  function commitRun(next) {
+    runEdits.current++
+    showRun(next)
+    const uid = userId, routineName = storageName
+    return queueRunWork(async () => {
+      await saveRun(uid, routineName, next)
+      if (next.finished) await recordRunCompletion(uid, routineName, next)
+    }).catch(() => {
+      Alert.alert('Couldn’t save', 'Your last change may not have been saved. Check your connection and try again.')
+    })
+  }
+
+  // Apply `change` to the latest run. It returns the new run, or the same one
+  // when there is nothing to do.
+  function updateRun(change) {
+    const cur = runRef.current
+    const next = cur && userId ? change(cur) : null
+    return next && next !== cur ? commitRun(next) : Promise.resolve()
+  }
+
+  // A change that moves the run to another task. Refused while the last such
+  // move is still saving; returns whether it went ahead. The hold ends when
+  // the save lands, or after a moment at most: a request that hangs (no
+  // signal) must not freeze the routine, and the queue keeps the writes in
+  // order anyway — the hold only has to outlast a double tap.
+  function moveRun(change) {
+    if (stepBusyRef.current) return false
+    const hold = {}
+    stepBusyRef.current = hold
+    setStepBusy(true)
+    const release = () => {
+      if (stepBusyRef.current !== hold) return
+      stepBusyRef.current = null
+      setStepBusy(false)
+    }
+    updateRun(change).finally(release)
+    setTimeout(release, 1500)
+    return true
+  }
+
+  // Read the run back after storage changed it (saving a template folds the
+  // change into a run underway). Queued behind every write, so it sees them.
+  // Not shown if a tap changed the run meanwhile, or if the screen has moved
+  // on to other data since `seq`.
+  async function refreshRun(uid, routineName, seq) {
+    const edits = runEdits.current
+    const fresh = await queueRunWork(() => getCurrentRun(uid, routineName))
+    if (runEdits.current === edits && seq === loadSeq.current) showRun(fresh)
+  }
+
   const load = useCallback(async () => {
-    if (!user || !name) return
+    if (!userId || !name) return
+    const seq = ++loadSeq.current
+    const superseded = () => seq !== loadSeq.current
     // Set when this pass hands off to a re-run under the other variant: the
     // loading state has to stay up so the old variant never flashes in between.
     let handedOff = false
@@ -2076,47 +2425,57 @@ export default function RoutineScreen() {
       if (!autoPickedVariant.current) {
         autoPickedVariant.current = true
         const [mainRun, altRun] = await Promise.all([
-          getTodayRun(user.id, name),
-          getTodayRun(user.id, altRoutineName(name)),
+          getCurrentRun(userId, name),
+          getCurrentRun(userId, altRoutineName(name)),
         ])
-        if (!mainRun && altRun) {
+        if (superseded()) return
+        // Already there (a retry on the Alternative tab): nothing would
+        // re-trigger the load, so carry on with this one.
+        if (!mainRun && altRun && !isAlt) {
           setVariant('alt')
           handedOff = true
           return // variant change re-triggers load with the alt storage name
         }
       }
+      const edits = runEdits.current
       const promises = [
-        getRoutineTemplate(user.id, storageName),
-        getTodayRun(user.id, storageName),
-        isFitness ? getGymSplit(user.id) : Promise.resolve(null),
-        getRoutineSettings(user.id, name),
+        getRoutineTemplate(userId, storageName),
+        queueRunWork(() => getCurrentRun(userId, storageName)),
+        isFitness ? getGymSplit(userId) : Promise.resolve(null),
+        getRoutineSettings(userId, name),
       ]
       let [tmpl, todayRun, split, rSettings] = await Promise.all(promises)
+      if (superseded()) return
       setRoutineDesc(rSettings?.description ?? '')
       if (isMorning && !isAlt) {
-        tmpl = await syncIntegratedTasks(user.id, name, tmpl)
+        tmpl = await queueRunWork(() => syncIntegratedTasks(userId, name, tmpl))
         // Re-read: syncing Looks tasks in also folds them into a run that is
         // already underway, which the copy read above predates.
-        todayRun = await getTodayRun(user.id, storageName)
+        todayRun = await queueRunWork(() => getCurrentRun(userId, storageName))
+        if (superseded()) return
       }
       setTemplate(tmpl)
-      setRun(todayRun)
+      // A tap made while this was reading is newer than what it read.
+      if (runEdits.current === edits) showRun(todayRun)
+      setLoadedName(storageName)
       if (isFitness) {
         setGymSplit(split ?? null)
-        const routines = await getWorkoutRoutineList(user.id)
+        const routines = await getWorkoutRoutineList(userId)
+        if (superseded()) return
         setAllRoutines(routines)
       }
       if (isMorning) {
-        const ms = await getMorningSettings(user.id)
+        const ms = await getMorningSettings(userId)
+        if (superseded()) return
         setMorningSettings(ms)
       }
       Animated.timing(contentFade, { toValue: 1, duration: 160, useNativeDriver: true }).start()
     } catch {
-      setError(true)
+      if (!superseded()) setError(true)
     } finally {
-      if (!handedOff) setLoading(false)
+      if (!handedOff && !superseded()) setLoading(false)
     }
-  }, [user, name, storageName, isAlt, isFitness, isMorning])
+  }, [userId, name, storageName, isAlt, isFitness, isMorning])
 
   function retryLoad() {
     autoPickedVariant.current = false
@@ -2125,21 +2484,25 @@ export default function RoutineScreen() {
     load()
   }
 
-  useFocusEffect(useCallback(() => { load() }, [load]))
+  // Losing focus drops a load still in flight; coming back starts a new one.
+  useFocusEffect(useCallback(() => {
+    load()
+    return () => { loadSeq.current++ }
+  }, [load]))
 
   // The preferred run mode can change under us in Settings, so re-read it on
   // every focus — but never override a mode the user picked on this visit.
   useFocusEffect(useCallback(() => {
-    if (!user) return
+    if (!userId) return
     let cancelled = false
-    getRoutinePrefs(user.id).then(p => {
+    getRoutinePrefs(userId).then(p => {
       if (cancelled) return
       setDefaultRunMode(p.runMode)
       setHideWorkouts(p.hideWorkouts)
       if (!viewModeChosen.current) setViewMode(p.runMode)
     })
     return () => { cancelled = true }
-  }, [user]))
+  }, [userId]))
 
   function switchVariant(v) {
     if (v === variant) return
@@ -2161,20 +2524,22 @@ export default function RoutineScreen() {
   // every one of them is covered; autoLogSpan's marker makes re-entry a no-op,
   // so re-opening a done routine can't resurrect a block you deleted.
   useEffect(() => {
-    if (!user || !run?.finished) return
+    if (!userId || !loadedName || !run?.finished) return
     // Quick-checked runs have no timer, so the tick time is the whole span.
     const startedAt = run.startedAt ?? run.completedAt
     const completedAt = run.completedAt ?? startedAt
     if (!startedAt) return
     const d = new Date(startedAt)
-    autoLogSpan(user.id, `routine:${storageName}:${run.date}`, {
-      day: run.date,
+    // The block goes on the day the routine really began. A start moved back
+    // to before midnight belongs to the evening before the run's own date.
+    autoLogSpan(userId, `routine:${loadedName}:${run.date}`, {
+      day: localDateStr(d),
       startMins: d.getHours() * 60 + d.getMinutes(),
       durationMins: Math.round(Math.max(0, completedAt - startedAt) / 60000),
       text: `${name} routine`,
       kind: 'routine',
     }).catch(() => {})
-  }, [user, run?.finished, run?.date, run?.startedAt, run?.completedAt, storageName, name])
+  }, [userId, run?.finished, run?.date, run?.startedAt, run?.completedAt, loadedName, name])
 
   function startBtnPressIn() {
     Animated.spring(startBtnScale, { toValue: 0.96, useNativeDriver: true, speed: 40, bounciness: 4 }).start()
@@ -2183,33 +2548,50 @@ export default function RoutineScreen() {
     Animated.spring(startBtnScale, { toValue: 1, useNativeDriver: true, speed: 15, bounciness: 12 }).start()
   }
 
+  // Starting the timer keeps any tasks already ticked off without it and
+  // begins at the first one still open. It used to wipe them — even on a
+  // routine that was already all ticked.
+  const startingRef = useRef(false)
   async function handleStart() {
-    const newRun = await startRun(user.id, storageName)
-    setRun(newRun)
+    if (!userId || startingRef.current) return
+    startingRef.current = true
+    try {
+      // A tick still being saved is part of what carries over.
+      await queueRunWork(() => {})
+      const cur = runRef.current
+      if (cur && !cur.quick) return
+      commitRun(timedRunFrom(template, cur, Date.now(), today()))
+    } finally {
+      startingRef.current = false
+    }
   }
 
   // Tick a task off without starting the timer — records the check timestamp.
-  async function handlePreviewToggle(taskId) {
-    try {
-      const updated = await quickCheckToggle(user.id, storageName, template, taskId)
-      setRun(updated)
-    } catch (e) {
+  // Queued with the run's other writes, so Start can't overtake a tick.
+  function handlePreviewToggle(taskId) {
+    if (!userId) return
+    const uid = userId, routineName = storageName, tasks = template
+    const edits = runEdits.current, seq = loadSeq.current
+    queueRunWork(async () => {
+      const updated = await quickCheckToggle(uid, routineName, tasks, taskId)
+      if (runEdits.current === edits && seq === loadSeq.current) showRun(updated)
+    }).catch(e => {
       // storage refuses the toggle when the run can't be read from anywhere
       // (cloud unreachable, no local mirror) — building on a guess would let
       // a blank run replay over real progress. Tell the user rather than
       // letting the tap silently do nothing.
       Alert.alert('Couldn’t update', e.message)
-    }
+    })
   }
 
-  async function handleStepDone(elapsedMs) {
-    const updated = await advanceRun(user.id, storageName, run, elapsedMs)
-    setRun(updated)
+  // Done moves on to the next task still open. Tasks already done are never
+  // walked through again or re-stamped.
+  function handleStepDone(elapsedMs) {
+    moveRun(r => advanceRunStep(r, Date.now(), elapsedMs))
   }
 
-  async function handleFinish(elapsedMs) {
-    const updated = await completeRun(user.id, storageName, run, elapsedMs)
-    setRun(updated)
+  function handleFinish(elapsedMs) {
+    if (!moveRun(r => (r.finished ? r : finishRun(r, Date.now(), elapsedMs)))) return
     // After the first completed routine, ask for a review once (ever).
     setTimeout(() => { maybePromptReview() }, 1200)
   }
@@ -2217,60 +2599,44 @@ export default function RoutineScreen() {
   // Skip the current task: it goes on today's do-later list and the routine
   // moves on. Reaching the end this way still leaves the routine short of
   // fully complete until the list is cleared.
-  async function handleSkipStep(elapsedMs) {
-    const updated = skipRunStep(run, run.currentStep, Date.now(), elapsedMs)
-    await saveRun(user.id, storageName, updated)
-    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
-    setRun(updated)
+  function handleSkipStep(elapsedMs) {
+    moveRun(r => skipRunStep(r, r.currentStep, Date.now(), elapsedMs))
   }
 
   // Tick a do-later item (or untick it). The history row and streak follow.
-  async function handleLaterToggle(id) {
-    const updated = toggleLaterItem(run, id, Date.now())
-    await saveRun(user.id, storageName, updated)
-    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
-    setRun(updated)
+  function handleLaterToggle(id) {
+    updateRun(r => toggleLaterItem(r, id, Date.now()))
   }
 
   // Reopening a step also clears its skip mark and pulls it off the do-later
-  // list, since the user is doing it now.
-  async function handleGoBack() {
-    if (!run || run.currentStep === 0) return
-    const updated = reopenRunStep(run, run.currentStep - 1, Date.now())
-    await saveRun(user.id, storageName, updated)
-    setRun(updated)
+  // list, since the user is doing it now. The time it already has is kept.
+  function handleGoBack() {
+    moveRun(r => (r.currentStep > 0 ? reopenRunStep(r, r.currentStep - 1, Date.now()) : r))
   }
 
   // Jump back to an arbitrary earlier task (used by the "unfinished steps"
-  // prompt on Finish). Same reopening semantics as handleGoBack.
-  async function handleJumpTo(idx) {
-    if (!run || idx < 0 || idx >= run.steps.length) return
-    const updated = reopenRunStep(run, idx, Date.now())
-    await saveRun(user.id, storageName, updated)
-    setRun(updated)
+  // prompt on Finish). Same reopening as handleGoBack; the task already in
+  // hand is left as it is, timer and all.
+  function handleJumpTo(idx) {
+    moveRun(r => (idx >= 0 && idx < r.steps.length && idx !== r.currentStep ? reopenRunStep(r, idx, Date.now()) : r))
   }
 
   // The user says the current task really began at a different time — reset
   // its timer to match, and let the routine's own start follow so total time
   // and the auto time-log stay truthful.
-  async function handleAdjustStart(newStartedAt) {
-    if (!run) return
-    const updated = runWithAdjustedStart(run, newStartedAt, Date.now())
-    await saveRun(user.id, storageName, updated)
-    setRun(updated)
+  function handleAdjustStart(newStartedAt) {
+    updateRun(r => runWithAdjustedStart(r, newStartedAt, Date.now()))
   }
 
-  async function handleToggleSubTask(subTaskId) {
-    const updated = {
-      ...run,
-      steps: run.steps.map((step, i) =>
-        i === run.currentStep
+  function handleToggleSubTask(subTaskId) {
+    updateRun(r => ({
+      ...r,
+      steps: r.steps.map((step, i) =>
+        i === r.currentStep
           ? { ...step, subTasks: step.subTasks.map(st => st.id === subTaskId ? { ...st, done: !st.done } : st) }
           : step
       ),
-    }
-    await saveRun(user.id, storageName, updated)
-    setRun(updated)
+    }))
   }
 
   // Photo the user tapped to see full screen, or null when nothing is open.
@@ -2279,62 +2645,82 @@ export default function RoutineScreen() {
   // Checklist mode: which tasks are expanded to show their sub-steps
   const [clExpanded, setClExpanded] = useState({})
 
-  async function handleChecklistSubToggle(stepIdx, subTaskId) {
-    const updated = {
-      ...run,
-      steps: run.steps.map((step, i) =>
+  function handleChecklistSubToggle(stepIdx, subTaskId) {
+    updateRun(r => ({
+      ...r,
+      steps: r.steps.map((step, i) =>
         i === stepIdx
           ? { ...step, subTasks: step.subTasks.map(st => st.id === subTaskId ? { ...st, done: !st.done } : st) }
           : step
       ),
-    }
-    await saveRun(user.id, storageName, updated)
-    setRun(updated)
+    }))
   }
 
-  async function handleChecklistToggle(stepIdx) {
-    const step = run.steps[stepIdx]
-    const nowDone = !step.completedAt
-    const updatedSteps = run.steps.map((s, i) =>
-      i !== stepIdx ? s : nowDone
-        ? { ...s, completedAt: Date.now(), elapsedMs: Math.max(0, Date.now() - run.startedAt) }
-        : { ...s, completedAt: null, elapsedMs: 0, startedAt: null, skipped: false }
-    )
-    const allDone = updatedSteps.every(s => !!s.completedAt)
-    const firstUndone = updatedSteps.findIndex(s => !s.completedAt)
-    // Unticking a skipped step means doing it now: its do-later entry goes.
-    const base = nowDone ? run : withoutPendingLater(run, step.id)
-    const updated = {
-      ...base,
-      steps: updatedSteps,
-      currentStep: allDone ? run.steps.length - 1 : Math.max(firstUndone, 0),
-      ...(allDone ? { finished: true, completedAt: Date.now() } : {}),
-    }
-    await saveRun(user.id, storageName, updated)
-    if (allDone) await recordRunCompletion(user.id, storageName, updated)
-    setRun(updated)
+  function handleChecklistToggle(stepIdx) {
+    updateRun(r => {
+      const step = r.steps[stepIdx]
+      if (!step) return r
+      const now = Date.now()
+      const nowDone = !step.completedAt
+      const updatedSteps = r.steps.map((s, i) =>
+        i !== stepIdx ? s : nowDone
+          // Timed from the task ticked before it, not from the routine's start.
+          ? { ...s, completedAt: now, elapsedMs: checklistTaskMs(r, now) }
+          : { ...s, completedAt: null, elapsedMs: 0, startedAt: null, skipped: false }
+      )
+      const allDone = updatedSteps.every(s => !!s.completedAt)
+      const firstUndone = updatedSteps.findIndex(s => !s.completedAt)
+      // Unticking a skipped step means doing it now: its do-later entry goes.
+      const base = nowDone ? r : withoutPendingLater(r, step.id)
+      return {
+        ...base,
+        steps: updatedSteps,
+        currentStep: allDone ? r.steps.length - 1 : Math.max(firstUndone, 0),
+        ...(allDone ? { finished: true, completedAt: now } : {}),
+      }
+    })
   }
 
   // Checklist mode's skip: the row is handled, the task waits on the list.
-  async function handleChecklistSkip(stepIdx) {
-    const now = Date.now()
-    const updated = skipRunStep(run, stepIdx, now, Math.max(0, now - run.startedAt))
-    await saveRun(user.id, storageName, updated)
-    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
-    setRun(updated)
+  function handleChecklistSkip(stepIdx) {
+    updateRun(r => {
+      const now = Date.now()
+      return skipRunStep(r, stepIdx, now, checklistTaskMs(r, now))
+    })
+  }
+
+  // Every task is handled but the run isn't finished — an edit took away the
+  // last open ones. Checklist mode has no Done button, so this is its Finish.
+  function handleChecklistFinish() {
+    if (!moveRun(r => (r.finished ? r : finishRun(r, Date.now())))) return
+    setTimeout(() => { maybePromptReview() }, 1200)
   }
 
   function confirmReset() {
+    // Last night's run is kept under its own date, which today's reset can't reach.
+    const cur = runRef.current
+    const lateDate = cur?.date && cur.date !== today() ? cur.date : null
     Alert.alert(
-      'Reset today?',
-      'This clears your progress for today so you can start over.',
+      lateDate ? 'Reset last night?' : 'Reset today?',
+      lateDate
+        ? 'This clears last night’s progress on this routine so you can start over.'
+        : 'This clears your progress for today so you can start over.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Reset', style: 'destructive',
           onPress: async () => {
-            await resetTodayRun(user.id, storageName)
-            setRun(null)
+            if (!userId) return
+            const uid = userId, routineName = storageName
+            // Queued behind any save still going out, which would otherwise
+            // land after the reset and bring the run back.
+            await queueRunWork(async () => {
+              if (!lateDate) return resetTodayRun(uid, routineName)
+              await trySync('routine_runs', 'delete', null, { user_id: uid, routine_name: routineName, date: lateDate })
+              await trySync('history', 'delete', null, { user_id: uid, date: lateDate, routine_name: name })
+            })
+            runEdits.current++
+            showRun(null)
           },
         },
       ]
@@ -2342,11 +2728,16 @@ export default function RoutineScreen() {
   }
 
   async function applyAITasks(tasks) {
-    await saveRoutineTemplate(user.id, storageName, tasks)
-    setTemplate(tasks)
+    if (!userId) return
+    const uid = userId, routineName = storageName, seq = loadSeq.current
+    const previous = template
+    await queueRunWork(() => saveRoutineTemplate(uid, routineName, tasks))
+    if (seq === loadSeq.current) setTemplate(tasks)
     // Saving folds the new tasks into a run that's underway; pull the result
     // back so the steps on screen match what was just saved.
-    setRun(await getTodayRun(user.id, storageName))
+    await refreshRun(uid, routineName, seq)
+    // The replaced tasks' photos would otherwise keep their upload slots.
+    freeUnusedPhotos(uid, name, isAlt, previous, tasks)
   }
 
   // Clear the alternative back to its empty state. Past completed days stay.
@@ -2359,48 +2750,76 @@ export default function RoutineScreen() {
         {
           text: 'Delete', style: 'destructive',
           onPress: async () => {
-            await wipeAltRoutine(user.id, name)
+            if (!userId) return
+            const uid = userId, seq = loadSeq.current
+            const previous = template
+            await queueRunWork(() => wipeAltRoutine(uid, name))
+            // Its photos go too, unless the main routine uses the same ones.
+            freeUnusedPhotos(uid, name, true, previous, [])
+            if (seq !== loadSeq.current) return
             setTemplate([])
-            setRun(null)
+            runEdits.current++
+            showRun(null)
           },
         },
       ]
     )
   }
 
-  // Seed the alternative from the current main routine.
+  // Seed the alternative from the current main routine. Photos and the Looks
+  // link stay with the main routine, as when copying a single task: a photo
+  // shared by both broke one of them as soon as the other deleted it.
   async function copyMainToAlt() {
-    const mainTmpl = await getRoutineTemplate(user.id, name)
+    if (!userId) return
+    const uid = userId, seq = loadSeq.current
+    // Strict: offline with no copy on this device the lenient read returns
+    // the stock tasks, which would be copied in place of the real routine.
+    let mainTmpl
+    try {
+      mainTmpl = await loadRoutineTemplate(uid, name)
+    } catch (e) {
+      Alert.alert('Could not copy', e.message)
+      return
+    }
     if (mainTmpl.length === 0) {
       Alert.alert('Main routine is empty', 'Add tasks to your main routine first, or build the alternative from scratch.')
       return
     }
-    await saveRoutineTemplate(user.id, altRoutineName(name), mainTmpl)
-    setTemplate(mainTmpl)
+    const copy = mainTmpl.map(({ image, fromLooks, ...task }) => ({
+      ...task,
+      subTasks: (task.subTasks ?? []).map(({ image: stepImage, ...st }) => st),
+    }))
+    await queueRunWork(() => saveRoutineTemplate(uid, altRoutineName(name), copy))
+    if (seq === loadSeq.current) setTemplate(copy)
   }
 
   // Mirror the Looks card into the Morning template (or pull it back out).
+  // Saving the template folds the change into a run underway, so the run on
+  // screen is read back too and the Looks tasks appear (or go) at once.
   const looksIntegrated = template.some(t => t.fromLooks)
   async function toggleLooksIntegration(looksData) {
-    if (looksIntegrated) {
-      const next = await setLooksInRoutine(user.id, false)
+    if (!userId) return
+    const uid = userId, routineName = storageName, seq = loadSeq.current
+    const apply = async (enabled, mode) => {
+      const next = await queueRunWork(() => setLooksInRoutine(uid, enabled, mode))
+      if (seq !== loadSeq.current) return
       setTemplate(next)
+      await refreshRun(uid, routineName, seq)
+    }
+    if (looksIntegrated) {
+      await apply(false)
       return
     }
     if (!looksData.categories.some(c => c.steps.length > 0)) {
       Alert.alert('Nothing to add yet', 'Add some steps to your Looks routine first.')
       return
     }
-    const apply = async mode => {
-      const next = await setLooksInRoutine(user.id, true, mode)
-      setTemplate(next)
-    }
     Alert.alert(
       'Add Looks to Morning tasks',
       'How should your Looks routine show up?',
       [
-        { text: 'One task with all steps', onPress: () => apply('single') },
-        { text: 'A task per category', onPress: () => apply('multi') },
+        { text: 'One task with all steps', onPress: () => apply(true, 'single') },
+        { text: 'A task per category', onPress: () => apply(true, 'multi') },
         { text: 'Cancel', style: 'cancel' },
       ]
     )
@@ -2420,13 +2839,18 @@ export default function RoutineScreen() {
     })
   }
 
+  // Open another workout before this one's exercises arrive and only the
+  // latest may fill the sheet — otherwise A's list could show under B.
+  const previewSeq = useRef(0)
   async function openRoutinePreview(routine) {
+    const seq = ++previewSeq.current
     setPreviewExDetail(null)
     previewDragY.setValue(0)
     setPreviewRoutine(routine)
     setPreviewExercises([])
     setLoadingPreview(true)
-    const exercises = await getWorkoutPlan(user.id, routine.name)
+    const exercises = await getWorkoutPlan(userId, routine.name)
+    if (seq !== previewSeq.current) return
     setPreviewExercises(exercises)
     setLoadingPreview(false)
   }
@@ -2440,7 +2864,7 @@ export default function RoutineScreen() {
         {
           text: 'Delete', style: 'destructive',
           onPress: async () => {
-            await deleteWorkoutPlan(user.id, routineName)
+            await deleteWorkoutPlan(userId, routineName)
             setAllRoutines(prev => prev.filter(r => r.name !== routineName))
           },
         },
@@ -2458,7 +2882,7 @@ export default function RoutineScreen() {
         const clean = newName?.trim()
         if (!clean || clean === oldName) return
         try {
-          await renameWorkoutPlan(user.id, oldName, clean)
+          await renameWorkoutPlan(userId, oldName, clean)
           setAllRoutines(prev => prev.map(r => r.name === oldName ? { ...r, name: clean } : r))
         } catch (e) {
           Alert.alert('Rename failed', e.message)
@@ -2507,6 +2931,9 @@ export default function RoutineScreen() {
       </View>
     )
   }
+
+  // Signed out (or the session ended) while this screen was open.
+  if (!userId) return <Redirect href="/(auth)/login" />
 
   if (error) {
     return (
@@ -2575,6 +3002,18 @@ export default function RoutineScreen() {
   // which correctly leaves everything past the first task locked.
   const previewSteps = template.map(t => run?.steps?.find(st => st.id === t.id))
 
+  // Last night's run, still being finished after midnight.
+  const isLateRun = !!run?.date && run.date !== today()
+  // The summary tells apart tasks never done from ones done or put off.
+  const fullyDone = runFullyDone(run)
+  const notDoneCount = run?.steps?.filter(st => !st.completedAt).length ?? 0
+  // Every task handled on a run that isn't finished yet (an edit removed the
+  // last open ones).
+  const allHandled = !!run && !run.finished && run.steps.length > 0 && notDoneCount === 0
+  // The other variant is still loading: what's on screen belongs to the one
+  // just left.
+  const staleVariant = loadedName !== storageName
+
   return (
     <View style={[s.page, { backgroundColor: theme.bg }]}>
       {/* Header */}
@@ -2614,7 +3053,7 @@ export default function RoutineScreen() {
         })}
       </View>
 
-      <Animated.View style={{ flex: 1, opacity: contentFade }}>
+      <Animated.View style={{ flex: 1, opacity: contentFade }} pointerEvents={staleVariant ? 'none' : 'auto'}>
       <ScrollView
         contentContainerStyle={s.content}
         keyboardShouldPersistTaps="handled"
@@ -2634,33 +3073,41 @@ export default function RoutineScreen() {
               backgroundColor: theme.isDark ? theme.card : card.bg,
               borderColor: theme.isDark ? theme.cardBorder : card.border,
             }]}>
-              <Text style={s.doneEmoji}>{pendingLater(run) > 0 ? '⏭' : '🎉'}</Text>
+              <Text style={s.doneEmoji}>{fullyDone ? '🎉' : '⏭'}</Text>
               <View style={{ flex: 1 }}>
-                <Text style={[s.doneTitle, { color: pendingLater(run) > 0 ? '#f59e0b' : card.color }]}>
-                  {pendingLater(run) > 0 ? 'Almost there' : 'All done!'}
+                <Text style={[s.doneTitle, { color: fullyDone ? card.color : '#f59e0b' }]}>
+                  {fullyDone ? 'All done!' : 'Almost there'}
                 </Text>
                 <Text style={[s.doneSub, { color: theme.subtext }]}>
                   Total time: {fmtMs(run.completedAt - run.startedAt)}
                   {pendingLater(run) > 0 ? `  ·  ${pendingLater(run)} to do later` : ''}
+                  {notDoneCount > 0 ? `  ·  ${notDoneCount} not done` : ''}
                 </Text>
               </View>
             </View>
-            {run.steps.map(step => (
-              <View key={step.id} style={[s.doneStep, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-                <View style={[s.doneCheck, { backgroundColor: step.skipped ? '#f59e0b' : card.color }]}>
-                  <Text style={s.doneCheckMark}>{step.skipped ? '→' : '✓'}</Text>
+            {run.steps.map(step => {
+              // A task never done gets no tick and no time, so it can't pass
+              // for one that was done in "0s".
+              const notDone = !step.completedAt
+              return (
+                <View key={step.id} style={[s.doneStep, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+                  <View style={[s.doneCheck, { backgroundColor: notDone ? theme.divider : step.skipped ? '#f59e0b' : card.color }]}>
+                    <Text style={[s.doneCheckMark, notDone && { color: theme.muted }]}>
+                      {notDone ? '–' : step.skipped ? '→' : '✓'}
+                    </Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.doneStepText, { color: notDone ? theme.muted : theme.text }]}>{step.text}</Text>
+                    {step.subTasks?.filter(st => st.done).map(st => (
+                      <Text key={st.id} style={[s.doneSubText, { color: theme.muted }]}>· {st.text}</Text>
+                    ))}
+                  </View>
+                  <Text style={[s.doneTime, { color: step.skipped ? '#f59e0b' : notDone ? theme.muted : theme.subtext }]}>
+                    {notDone ? 'not done' : step.skipped ? 'later' : fmtMs(step.elapsedMs)}
+                  </Text>
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[s.doneStepText, { color: theme.text }]}>{step.text}</Text>
-                  {step.subTasks?.filter(st => st.done).map(st => (
-                    <Text key={st.id} style={[s.doneSubText, { color: theme.muted }]}>· {st.text}</Text>
-                  ))}
-                </View>
-                <Text style={[s.doneTime, { color: step.skipped ? '#f59e0b' : theme.subtext }]}>
-                  {step.skipped ? 'later' : fmtMs(step.elapsedMs)}
-                </Text>
-              </View>
-            ))}
+              )
+            })}
             {/* Skipped steps wait here. Tick one whenever it gets done; the
                 time it was ticked stays beside it, and the routine only
                 counts as complete once the list is clear. */}
@@ -2703,7 +3150,7 @@ export default function RoutineScreen() {
               <Text style={[s.editTmrText, { color: card.color }]}>Edit Tomorrow's Routine</Text>
             </Pressable>
             <Pressable style={s.resetBtn} onPress={confirmReset}>
-              <Text style={s.resetText}>Reset today</Text>
+              <Text style={s.resetText}>{isLateRun ? 'Reset last night' : 'Reset today'}</Text>
             </Pressable>
           </Animated.View>
         )}
@@ -2711,11 +3158,17 @@ export default function RoutineScreen() {
         {/* ── Running ── */}
         {run && !run.finished && !run.quick && (
           <>
+            {isLateRun && (
+              <Text style={[s.workoutRunHint, { color: theme.subtext }]}>
+                Still going from last night — it counts for yesterday when you finish.
+              </Text>
+            )}
             {renderModeToggle()}
             {viewMode === 'steps' ? (
               <RunRoutine
                 run={run}
                 color={card.color}
+                busy={stepBusy}
                 onStepDone={handleStepDone}
                 onFinish={handleFinish}
                 onGoBack={handleGoBack}
@@ -2831,10 +3284,22 @@ export default function RoutineScreen() {
                     </Pressable>
                   )
                 })}
+                {/* Every task handled but not finished — an edit took away
+                    the last open ones. There's no Done button here, so
+                    finishing (and stopping the timer) happens here. */}
+                {allHandled && (
+                  <Pressable
+                    style={[s.clFinishBtn, stepBusy && { opacity: 0.6 }]}
+                    onPress={handleChecklistFinish}
+                    disabled={stepBusy}
+                  >
+                    <Text style={s.clFinishText}>Finish Routine  ✓</Text>
+                  </Pressable>
+                )}
               </View>
             )}
             <Pressable style={[s.resetBtn, { marginTop: 16 }]} onPress={confirmReset}>
-              <Text style={s.resetText}>Reset today</Text>
+              <Text style={s.resetText}>{isLateRun ? 'Reset last night' : 'Reset today'}</Text>
             </Pressable>
           </>
         )}
@@ -2954,7 +3419,7 @@ export default function RoutineScreen() {
             </View>
 
             {(!run || run.quick) ? (
-              <WorkoutWeekCalendar userId={user.id} theme={theme} accentColor={card.color} />
+              <WorkoutWeekCalendar userId={userId} theme={theme} accentColor={card.color} />
             ) : !run.finished ? (
               <Text style={[s.workoutRunHint, { color: theme.subtext }]}>
                 Your routine keeps running while you train. Start a workout here and come back to it after.
@@ -3255,7 +3720,8 @@ export default function RoutineScreen() {
               </View>
             ))}
 
-            {template.length > 0 && (
+            {/* Nothing left to start once every task is ticked off. */}
+            {template.length > 0 && !(run?.quick && run.finished) && (
               <Animated.View style={{ transform: [{ scale: startBtnScale }] }}>
                 <Pressable
                   style={[s.startBtn, { backgroundColor: card.color, shadowColor: card.color }]}
@@ -3284,19 +3750,19 @@ export default function RoutineScreen() {
           <>
             {!morningSettings.hideTodo && (
               <MorningTodoList
-                userId={user.id}
+                userId={userId}
                 theme={theme}
                 color={card.color}
                 onHide={async () => {
                   const ns = { ...morningSettings, hideTodo: true }
-                  await saveMorningSettings(user.id, ns)
+                  await saveMorningSettings(userId, ns)
                   setMorningSettings(ns)
                 }}
               />
             )}
             {!morningSettings.hideWeight && (
               <WeightTracker
-                userId={user.id}
+                userId={userId}
                 theme={theme}
                 color={card.color}
                 morningSettings={morningSettings}
@@ -3305,13 +3771,13 @@ export default function RoutineScreen() {
             )}
             {!morningSettings.hideLooks && (
               <LooksSection
-                userId={user.id}
+                userId={userId}
                 theme={theme}
                 integrated={looksIntegrated}
                 onToggleIntegrate={toggleLooksIntegration}
                 onHide={async () => {
                   const ns = { ...morningSettings, hideLooks: true }
-                  await saveMorningSettings(user.id, ns)
+                  await saveMorningSettings(userId, ns)
                   setMorningSettings(ns)
                 }}
               />
@@ -3323,7 +3789,7 @@ export default function RoutineScreen() {
                     style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
                     onPress={async () => {
                       const ns = { ...morningSettings, hideTodo: false }
-                      await saveMorningSettings(user.id, ns)
+                      await saveMorningSettings(userId, ns)
                       setMorningSettings(ns)
                     }}
                   >
@@ -3335,7 +3801,7 @@ export default function RoutineScreen() {
                     style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
                     onPress={async () => {
                       const ns = { ...morningSettings, hideWeight: false }
-                      await saveMorningSettings(user.id, ns)
+                      await saveMorningSettings(userId, ns)
                       setMorningSettings(ns)
                     }}
                   >
@@ -3347,7 +3813,7 @@ export default function RoutineScreen() {
                     style={[s.hiddenPill, { borderColor: LOOKS_COLOR + '40', backgroundColor: LOOKS_COLOR + '10' }]}
                     onPress={async () => {
                       const ns = { ...morningSettings, hideLooks: false }
-                      await saveMorningSettings(user.id, ns)
+                      await saveMorningSettings(userId, ns)
                       setMorningSettings(ns)
                     }}
                   >
@@ -3361,7 +3827,7 @@ export default function RoutineScreen() {
 
         {/* ── Night: sleep tracker (main routine only) ── */}
         {isNight && !isAlt && (
-          <SleepTracker userId={user.id} theme={theme} color={card.color} />
+          <SleepTracker userId={userId} theme={theme} color={card.color} />
         )}
 
       </ScrollView>
@@ -3843,6 +4309,8 @@ const s = StyleSheet.create({
     marginRight: 14, flexShrink: 0,
   },
   clCheckMark: { color: '#fff', fontWeight: '800', fontSize: 13 },
+  clFinishBtn: { backgroundColor: '#10b981', borderRadius: 22, padding: 18, alignItems: 'center', marginTop: 6 },
+  clFinishText: { color: '#fff', fontWeight: '800', fontSize: 17, letterSpacing: 0.3 },
   clItemText: { fontSize: 17, fontWeight: '600' },
   clItemDone: { textDecorationLine: 'line-through', opacity: 0.38 },
   stepImage: { width: '100%', height: 150, borderRadius: 14, marginTop: 10 },

@@ -10,9 +10,15 @@ function fmt(v) {
   return v % 1 === 0 ? String(Math.round(v)) : v.toFixed(1)
 }
 
+// Whole local calendar days between a 'YYYY-MM-DD' date and today. The bare
+// date parses as UTC midnight, the evening before anywhere in the Americas,
+// so both sides are taken at local noon. Null when there is no date.
 function daysAgo(dateStr) {
-  const diff = Math.round((Date.now() - new Date(dateStr).getTime()) / 86400000)
-  if (diff === 0) return 'Today'
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr ?? '')) return null
+  const noon = new Date()
+  noon.setHours(12, 0, 0, 0)
+  const diff = Math.round((noon - new Date(dateStr + 'T12:00:00')) / 86400000)
+  if (diff <= 0) return 'Today'
   if (diff === 1) return 'Yesterday'
   return `${diff} days ago`
 }
@@ -20,9 +26,15 @@ function daysAgo(dateStr) {
 export default function HistoryPicker({ section, sectionLabel, sectionColor, loadHistory, onAdd, onClose }) {
   const [meals, setMeals] = useState([])
   const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
 
   useEffect(() => {
-    loadHistory().then(m => { setMeals(m); setLoading(false) })
+    let alive = true
+    loadHistory()
+      .then(m => { if (alive) setMeals(Array.isArray(m) ? m : []) })
+      .catch(() => { if (alive) setFailed(true) })
+      .finally(() => { if (alive) setLoading(false) })
+    return () => { alive = false }
   }, [])
 
   const handleAdd = (meal) => {
@@ -50,6 +62,11 @@ export default function HistoryPicker({ section, sectionLabel, sectionColor, loa
         {loading ? (
           <View style={h.centered}>
             <ActivityIndicator size="large" color={sectionColor} />
+          </View>
+        ) : failed ? (
+          <View style={h.centered}>
+            <Text style={h.emptyTitle}>We couldn't load your history</Text>
+            <Text style={h.emptyDesc}>Check your connection and try again.</Text>
           </View>
         ) : meals.length === 0 ? (
           <View style={h.centered}>
@@ -83,7 +100,7 @@ export default function HistoryPicker({ section, sectionLabel, sectionColor, loa
                       {carbs > 0 && <Text style={h.macroChip}>{fmt(carbs)}g C</Text>}
                       {fat > 0 && <Text style={h.macroChip}>{fmt(fat)}g F</Text>}
                     </View>
-                    <Text style={h.mealDate}>{daysAgo(meal.lastEaten || '')}</Text>
+                    {!!daysAgo(meal.lastEaten) && <Text style={h.mealDate}>{daysAgo(meal.lastEaten)}</Text>}
                   </View>
                   <Pressable
                     style={[h.addBtn, { backgroundColor: sectionColor }]}

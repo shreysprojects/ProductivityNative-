@@ -1,5 +1,6 @@
 import { Redirect } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
+import { useTheme } from '../lib/ThemeContext'
 import { View, ActivityIndicator } from 'react-native'
 import { useEffect, useState } from 'react'
 import { hasUserSetup } from '../lib/storage'
@@ -13,18 +14,20 @@ const CHECK_TIMEOUT_MS = 6000
 
 export default function Root() {
   const { user, loading } = useAuth()
+  const { theme } = useTheme()
   const [setupChecked, setSetupChecked] = useState(false)
   const [setupDone, setSetupDone] = useState(false)
   const [onboardingDone, setOnboardingDone] = useState(false)
+  const userId = user?.id ?? null
 
   useEffect(() => {
-    if (!user) { setSetupChecked(false); return }
+    if (!userId) { setSetupChecked(false); return }
     let cancelled = false
 
     const timeout = new Promise(resolve => setTimeout(() => resolve(null), CHECK_TIMEOUT_MS))
 
     Promise.race([
-      Promise.all([hasUserSetup(user.id), hasOnboardingDone(user.id)]),
+      Promise.all([hasUserSetup(userId), hasOnboardingDone(userId)]),
       timeout,
     ])
       .then(result => {
@@ -49,12 +52,14 @@ export default function Root() {
       })
 
     return () => { cancelled = true }
-  }, [user])
+  }, [userId])
 
   if (loading || (user && !setupChecked)) {
     return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f6f7fb' }}>
-        <ActivityIndicator size="large" color="#4f46e5" />
+      // Themed like every other screen: a fixed light background flashed
+      // white on each launch in dark mode.
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: theme.bg }}>
+        <ActivityIndicator size="large" color={theme.accent} />
       </View>
     )
   }

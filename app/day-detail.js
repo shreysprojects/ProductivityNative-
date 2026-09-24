@@ -167,8 +167,10 @@ export default function DayDetailScreen() {
 
   const isActive  = history.length > 0 || !!workout
   const doneTasks = tasks.filter(t => t.done)
-  const totalCal  = meals.reduce((s, m) => s + (Number(m.macros?.calories) || 0), 0)
-  const totalProt = meals.reduce((s, m) => s + (Number(m.macros?.protein)  || 0), 0)
+  // Rounded for display: adding the meals up picks up float noise
+  // (39.60000000000001g protein).
+  const totalCal  = Math.round(meals.reduce((s, m) => s + (Number(m.macros?.calories) || 0), 0))
+  const totalProt = Math.round(meals.reduce((s, m) => s + (Number(m.macros?.protein)  || 0), 0) * 10) / 10
 
   const isEmpty =
     !isActive && meals.length === 0 &&

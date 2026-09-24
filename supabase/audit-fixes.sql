@@ -1,4 +1,10 @@
 -- ============================================================================
+-- HISTORICAL REFERENCE — DO NOT RUN AGAINST THE LIVE DATABASE.
+-- This file was never applied to the live database; its fixes (and more) now
+-- ship as supabase/migrations/20260923090000_security_hardening.sql and
+-- 20260923090100_photo_upload_lockdown.sql. Running it on top of those would
+-- make the avatars bucket listable by anyone again.
+-- ============================================================================
 -- audit-fixes.sql  —  paste the WHOLE file into Supabase SQL Editor and Run.
 -- Run AFTER schema.sql, rls-supplement.sql, security-fixes.sql and
 -- ai-workout-limits.sql. Idempotent: safe to run more than once.

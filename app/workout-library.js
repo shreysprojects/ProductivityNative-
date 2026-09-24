@@ -4,12 +4,13 @@ import {
   TextInput, ActivityIndicator, FlatList, Alert,
 } from 'react-native'
 import { Image } from 'expo-image'
+import { StatusBar } from 'expo-status-bar'
 import * as ImagePicker from 'expo-image-picker'
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator'
-import { router, useLocalSearchParams } from 'expo-router'
+import { router, useLocalSearchParams, useNavigation } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
 import { supabase } from '../lib/supabase'
-import { getWorkoutPlan, saveWorkoutPlan, getWorkoutLog, today } from '../lib/storage'
+import { loadWorkoutPlan, saveWorkoutPlan, getWorkoutLog, today } from '../lib/storage'
 import { WGER_CATEGORIES, fetchExercisesByCategory, searchExercises } from '../lib/wgerApi'
 import { getCustomExercises, saveCustomExercise, deleteCustomExercise, toLibraryExercise } from '../lib/customExercises'
 import CustomExerciseModal from '../components/CustomExerciseModal'
@@ -81,7 +82,9 @@ function PreviewPanel({ exercise, onClose }) {
   )
 }
 
-function ExerciseCard({ exercise, isIn, isPreviewing, onToggle, onPreview, isDoneToday }) {
+// planItem is this exercise's entry in the workout being edited, if it has one.
+function ExerciseCard({ exercise, planItem, disabled, isPreviewing, onToggle, onPreview, isDoneToday }) {
+  const isIn = !!planItem
   return (
     <View style={[s.card, isIn && s.cardActive]}>
       <Pressable style={s.cardMain} onPress={() => onPreview(exercise)}>
@@ -122,11 +125,12 @@ function ExerciseCard({ exercise, isIn, isPreviewing, onToggle, onPreview, isDon
         </Text>
       </Pressable>
       <Pressable
-        style={[s.addBtn, isIn && s.addBtnActive]}
+        style={[s.addBtn, isIn && s.addBtnActive, disabled && s.dimmed]}
         onPress={() => onToggle(exercise)}
+        disabled={disabled}
       >
         <Text style={[s.addBtnText, isIn && s.addBtnTextActive]}>
-          {isIn ? '✓ Added  ·  3 sets × 10 reps' : '+ Add to Workout'}
+          {isIn ? `✓ Added  ·  ${planItem.sets ?? 3} sets × ${planItem.reps ?? 10} reps` : '+ Add to Workout'}
         </Text>
       </Pressable>
     </View>
@@ -187,8 +191,11 @@ async function findLibraryMatch(extractedName) {
 
   for (const q of queries) {
     if (q.length < 3) continue
-    let results = []
-    try { results = await searchExercises(q, 25) } catch { results = [] }
+    // A search that failed is not "no match": the import stops and says so,
+    // rather than reporting every exercise as missing from the library.
+    let results
+    try { ({ results } = await searchExercises(q, 25)) }
+    catch { throw new Error('Could not search the exercise library. Check your connection and try again.') }
     if (!results.length) continue
 
     let best = null
@@ -213,7 +220,25 @@ async function findLibraryMatch(extractedName) {
 export default function WorkoutLibrary() {
   const { muscleGroup } = useLocalSearchParams()
   const { user } = useAuth()
+  const userId = user?.id
+  const navigation = useNavigation()
   const [plan, setPlan] = useState([])
+  // The editor saves the whole plan back, so nothing can be added or saved
+  // until the real plan is in: a failed read used to look like an empty
+  // plan, and saving it replaced the real one.
+  const [planStatus, setPlanStatus] = useState('loading')   // loading | ready | error
+  const [planError, setPlanError] = useState(null)
+  const planReady = planStatus === 'ready'
+  const planReq = useRef(0)
+  // Changes not saved yet: leaving asks first, and a late read never
+  // replaces them.
+  const [dirty, setDirty] = useState(false)
+  const dirtyRef = useRef(false)
+  const leaving = useRef(false)
+  // The plan as last rendered, for the screenshot import that finishes a
+  // minute after it started.
+  const planRef = useRef(plan)
+  planRef.current = plan
   const [category, setCategory] = useState(() => initialCategory(muscleGroup))
   const [exercises, setExercises] = useState([])
   const [loading, setLoading] = useState(false)
@@ -222,7 +247,9 @@ export default function WorkoutLibrary() {
   const [offset, setOffset] = useState(0)
   const [search, setSearch] = useState('')
   const [searchResults, setSearchResults] = useState(null)
+  const [searchCount, setSearchCount] = useState(0)
   const [searchLoading, setSearchLoading] = useState(false)
+  const [searchMore, setSearchMore] = useState(false)
   const [searchError, setSearchError] = useState(false)
   const [loadError, setLoadError] = useState(false)
   const [preview, setPreview] = useState(null)
@@ -230,26 +257,80 @@ export default function WorkoutLibrary() {
   const [importing, setImporting] = useState(false)
   const [doneToday, setDoneToday] = useState(new Set())
   const searchTimer = useRef(null)
+  // Every list request carries the number of the list it was made for; a
+  // reply for a category or search the user has since left is dropped, so
+  // it can't replace newer results or mix into another category's.
+  const catSeq = useRef(0)
+  const searchSeq = useRef(0)
+  // The text the search results on screen belong to.
+  const searchedFor = useRef('')
   // The user's own exercises, already in library shape, and the create/edit
   // sheet ({ initial?, lib? } while open).
   const [customs, setCustoms] = useState([])
   const [customModal, setCustomModal] = useState(null)
 
-  useEffect(() => {
-    if (!user || !muscleGroup) return
-    getWorkoutPlan(user.id, muscleGroup).then(setPlan)
-  }, [user, muscleGroup])
+  function loadPlan() {
+    const req = ++planReq.current
+    setPlanStatus('loading')
+    loadWorkoutPlan(userId, muscleGroup)
+      .then(list => {
+        if (req !== planReq.current) return
+        if (!dirtyRef.current) setPlan(list)
+        setPlanStatus('ready')
+      })
+      .catch(e => {
+        if (req !== planReq.current) return
+        setPlanError(e?.message ?? 'Could not load this workout.')
+        setPlanStatus('error')
+      })
+  }
 
   useEffect(() => {
-    if (!user) return
-    getCustomExercises(user.id)
+    if (!userId || !muscleGroup) return
+    loadPlan()
+  }, [userId, muscleGroup])
+
+  function markDirty() {
+    dirtyRef.current = true
+    setDirty(true)
+  }
+
+  // Unsaved changes, or screenshots still being read, stop a back press to
+  // ask first. Swipe-back is off meanwhile: it completes on the native side
+  // before there is a chance to ask.
+  const unsaved = dirty || importing
+  useEffect(() => {
+    navigation.setOptions({ gestureEnabled: !unsaved })
+    if (!unsaved) return
+    return navigation.addListener('beforeRemove', e => {
+      if (leaving.current) return
+      e.preventDefault()
+      Alert.alert(
+        'Discard changes?',
+        importing
+          ? 'Your screenshots are still being read. Leave now and those exercises are lost.'
+          : 'Your changes to this workout have not been saved.',
+        [
+          { text: 'Keep editing', style: 'cancel' },
+          {
+            text: 'Discard', style: 'destructive',
+            onPress: () => { leaving.current = true; navigation.dispatch(e.data.action) },
+          },
+        ],
+      )
+    })
+  }, [navigation, unsaved, importing])
+
+  useEffect(() => {
+    if (!userId) return
+    getCustomExercises(userId)
       .then(list => setCustoms(list.map(toLibraryExercise)))
       .catch(() => {})
-  }, [user])
+  }, [userId])
 
   useEffect(() => {
-    if (!user) return
-    getWorkoutLog(user.id, today()).then(log => {
+    if (!userId) return
+    getWorkoutLog(userId, today()).then(log => {
       if (!log) return
       const ids = new Set(
         (log.exercises || [])
@@ -258,66 +339,115 @@ export default function WorkoutLibrary() {
       )
       setDoneToday(ids)
     })
-  }, [user])
+  }, [userId])
 
-  useEffect(() => {
-    if (search.trim()) return
+  function loadCategory() {
+    const req = ++catSeq.current
     setExercises([])
     setOffset(0)
     setCount(0)
     setLoadError(false)
     setLoading(true)
+    setLoadingMore(false)
     fetchExercisesByCategory(category.id, 0)
       .then(data => {
+        if (req !== catSeq.current) return
         setExercises(data.results)
         setCount(data.count)
         setOffset(data.results.length)
       })
-      .catch(() => setLoadError(true))
-      .finally(() => setLoading(false))
+      .catch(() => { if (req === catSeq.current) setLoadError(true) })
+      .finally(() => { if (req === catSeq.current) setLoading(false) })
+  }
+
+  useEffect(() => {
+    if (search.trim()) return
+    loadCategory()
   }, [category])
+
+  function runSearch(q) {
+    const req = ++searchSeq.current
+    setSearchLoading(true)
+    setSearchMore(false)
+    setSearchError(false)
+    searchExercises(q)
+      .then(({ results, count: total }) => {
+        if (req !== searchSeq.current) return
+        searchedFor.current = q
+        setSearchResults(results)
+        setSearchCount(total)
+      })
+      .catch(() => {
+        if (req !== searchSeq.current) return
+        searchedFor.current = q
+        setSearchError(true)
+        setSearchResults([])
+        setSearchCount(0)
+      })
+      .finally(() => { if (req === searchSeq.current) setSearchLoading(false) })
+  }
 
   useEffect(() => {
     clearTimeout(searchTimer.current)
-    if (!search.trim()) {
+    // Whatever the old text was still waiting on is now stale, including
+    // when the box has just been cleared.
+    searchSeq.current++
+    setSearchMore(false)
+    const q = search.trim()
+    if (!q) {
       setSearchResults(null)
+      setSearchCount(0)
       setSearchError(false)
+      setSearchLoading(false)
       return
     }
-    searchTimer.current = setTimeout(async () => {
-      setSearchLoading(true)
-      setSearchError(false)
-      try {
-        const results = await searchExercises(search)
-        setSearchResults(results)
-      } catch {
-        setSearchError(true)
-        setSearchResults([])
-      } finally {
-        setSearchLoading(false)
-      }
-    }, 500)
+    searchTimer.current = setTimeout(() => runSearch(q), 500)
     return () => clearTimeout(searchTimer.current)
   }, [search])
 
+  // The next page of whichever list is showing, dropped if that list has
+  // changed by the time it arrives.
   function loadMore() {
-    if (loadingMore || exercises.length >= count || search.trim()) return
+    const q = search.trim()
+    if (q) {
+      if (searchMore || searchedFor.current !== q || !searchResults || searchResults.length >= searchCount) return
+      const req = searchSeq.current
+      setSearchMore(true)
+      searchExercises(q, 20, searchResults.length)
+        .then(({ results }) => {
+          if (req === searchSeq.current) setSearchResults(prev => [...(prev ?? []), ...results])
+        })
+        .catch(() => {})
+        .finally(() => { if (req === searchSeq.current) setSearchMore(false) })
+      return
+    }
+    if (loading || loadingMore || exercises.length >= count) return
+    const req = catSeq.current
     setLoadingMore(true)
     fetchExercisesByCategory(category.id, offset)
       .then(data => {
+        if (req !== catSeq.current) return
         setExercises(prev => [...prev, ...data.results])
         setOffset(prev => prev + data.results.length)
       })
-      .catch(console.error)
-      .finally(() => setLoadingMore(false))
+      .catch(() => {})
+      .finally(() => { if (req === catSeq.current) setLoadingMore(false) })
+  }
+
+  function retryList() {
+    const q = search.trim()
+    if (q) runSearch(q)
+    else loadCategory()
   }
 
   function togglePlan(exercise) {
+    if (!planReady) return
     setPlan(prev =>
       prev.some(e => e.id === exercise.id)
         ? prev.filter(e => e.id !== exercise.id)
         : [...prev, { ...exercise, sets: 3, reps: 10, restSeconds: 90 }]
     )
+    markDirty()
   }
 
   function movePlanItem(fromIdx, direction) {
@@ -329,6 +459,7 @@ export default function WorkoutLibrary() {
       arr.splice(toIdx, 0, item)
       return arr
     })
+    markDirty()
   }
 
   function handlePreview(exercise) {
@@ -336,19 +467,24 @@ export default function WorkoutLibrary() {
   }
 
   // A new custom exercise goes straight into this workout; an edit refreshes
-  // the copy already in it (sets and reps kept).
+  // the copy already in it (sets and reps kept). The save returns once it is
+  // on the phone, so it shows up at once; the cloud catches up behind it.
   async function handleSaveCustom(custom) {
     setCustomModal(null)
     try {
-      const saved = await saveCustomExercise(user.id, custom)
+      const saved = await saveCustomExercise(userId, custom)
       const lib = toLibraryExercise(saved)
       const isNew = !customs.some(c => c.id === lib.id)
-      setCustoms(prev => (isNew ? [...prev, lib] : prev.map(c => (c.id === lib.id ? lib : c))))
+      const inPlan = planRef.current.some(e => e.id === lib.id)
+      setCustoms(prev => (prev.some(c => c.id === lib.id)
+        ? prev.map(c => (c.id === lib.id ? lib : c))
+        : [...prev, lib]))
       setPlan(prev => {
-        const inPlan = prev.some(e => e.id === lib.id)
-        if (isNew) return inPlan ? prev : [...prev, { ...lib, sets: 3, reps: 10, restSeconds: 90 }]
+        const has = prev.some(e => e.id === lib.id)
+        if (isNew) return has ? prev : [...prev, { ...lib, sets: 3, reps: 10, restSeconds: 90 }]
         return prev.map(e => (e.id === lib.id ? { ...e, ...lib, sets: e.sets, reps: e.reps, restSeconds: e.restSeconds } : e))
       })
+      if (isNew || inPlan) markDirty()
     } catch (e) {
       Alert.alert('Could not save', e?.message ?? 'Please try again.')
     }
@@ -362,7 +498,7 @@ export default function WorkoutLibrary() {
         onPress: async () => {
           setCustomModal(null)
           setCustoms(prev => prev.filter(c => c.id !== lib.id))
-          try { await deleteCustomExercise(user.id, lib.customId) }
+          try { await deleteCustomExercise(userId, lib.customId) }
           catch (e) { Alert.alert('Could not delete', e?.message ?? 'Please try again.') }
         },
       },
@@ -370,9 +506,11 @@ export default function WorkoutLibrary() {
   }
 
   async function handleSave() {
+    if (!planReady) return
     setSaving(true)
     try {
-      await saveWorkoutPlan(user.id, muscleGroup, plan)
+      await saveWorkoutPlan(userId, muscleGroup, plan)
+      leaving.current = true
       router.back()
     } finally {
       setSaving(false)
@@ -380,13 +518,11 @@ export default function WorkoutLibrary() {
   }
 
   // Pick screenshots of a workout from another app, extract the exercises
-  // with AI, and rebuild the workout here in the same order.
+  // with AI, and rebuild the workout here in the same order. The picker
+  // needs no photo library permission (SDK 57): asking for it only stopped
+  // people who had said no from importing at all.
   async function importFromScreenshots() {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Photo library access is required to pick screenshots.')
-      return
-    }
+    if (!planReady) return
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
       allowsMultipleSelection: true,
@@ -453,15 +589,27 @@ export default function WorkoutLibrary() {
         if (hit) matched.push({ ...hit, sets: ex.sets ?? 3, reps: ex.reps ?? 10, restSeconds: 90 })
         else missing.push(ex.name)
       }
+      // Left the editor while this ran (and said to discard): say nothing.
+      if (leaving.current) return
 
-      const have = new Set(plan.map(e => e.id))
+      // Checked against the plan as it is now, not as it was when the import
+      // started: exercises added by hand meanwhile would come in twice. The
+      // add itself checks again, against whatever the plan is by then.
+      const have = new Set(planRef.current.map(e => e.id))
       const fresh = matched.filter(m => {
         if (have.has(m.id)) return false
         have.add(m.id)
         return true
       })
       const dupCount = matched.length - fresh.length
-      if (fresh.length) setPlan(prev => [...prev, ...fresh])
+      if (fresh.length) {
+        setPlan(prev => {
+          const ids = new Set(prev.map(e => e.id))
+          const add = fresh.filter(m => !ids.has(m.id))
+          return add.length ? [...prev, ...add] : prev
+        })
+        markDirty()
+      }
 
       const lines = []
       if (fresh.length) lines.push(`Added ${fresh.length} of ${extracted.length} exercises in order from your screenshots.`)
@@ -474,7 +622,7 @@ export default function WorkoutLibrary() {
         lines.join('\n\n')
       )
     } catch (e) {
-      Alert.alert('Import failed', e.message ?? 'Something went wrong. Please try again.')
+      if (!leaving.current) Alert.alert('Import failed', e.message ?? 'Something went wrong. Please try again.')
     } finally {
       setImporting(false)
     }
@@ -493,6 +641,9 @@ export default function WorkoutLibrary() {
 
   return (
     <View style={s.page}>
+      {/* This screen is light in both themes; dark mode's white status bar
+          text vanished into the white header. */}
+      <StatusBar style="dark" />
       <View style={s.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Text style={s.backText}>←</Text>
@@ -503,7 +654,7 @@ export default function WorkoutLibrary() {
             <Text style={s.headerSub}>{muscleGroup.replace(/\+/g, ' · ')}</Text>
           )}
         </View>
-        <Pressable onPress={handleSave} disabled={saving} style={s.saveBtn}>
+        <Pressable onPress={handleSave} disabled={saving || !planReady} style={[s.saveBtn, !planReady && s.dimmed]}>
           <Text style={s.saveBtnText}>{saving ? 'Saving…' : `Save (${plan.length})`}</Text>
         </Pressable>
       </View>
@@ -519,9 +670,9 @@ export default function WorkoutLibrary() {
           clearButtonMode="while-editing"
         />
         <Pressable
-          style={[s.importBtn, importing && { opacity: 0.7 }]}
+          style={[s.importBtn, importing && { opacity: 0.7 }, !planReady && s.dimmed]}
           onPress={importFromScreenshots}
-          disabled={importing}
+          disabled={importing || !planReady}
         >
           {importing
             ? <ActivityIndicator size="small" color={COLOR} />
@@ -538,7 +689,7 @@ export default function WorkoutLibrary() {
           </View>
           {!importing && <Text style={{ color: COLOR, fontSize: 16, fontWeight: '600' }}>→</Text>}
         </Pressable>
-        <Pressable style={s.createBtn} onPress={() => setCustomModal({})}>
+        <Pressable style={[s.createBtn, !planReady && s.dimmed]} onPress={() => setCustomModal({})} disabled={!planReady}>
           <Text style={{ fontSize: 15 }}>✚</Text>
           <View style={{ flex: 1 }}>
             <Text style={s.importBtnTitle}>Create your own exercise</Text>
@@ -574,6 +725,21 @@ export default function WorkoutLibrary() {
         contentContainerStyle={s.list}
         ListHeaderComponent={(
           <>
+          {planStatus === 'loading' && (
+            <View style={[s.planSection, s.planStatusRow]}>
+              <ActivityIndicator color={COLOR} />
+              <Text style={s.planSectionCount}>Loading your workout…</Text>
+            </View>
+          )}
+          {planStatus === 'error' && (
+            <View style={s.planSection}>
+              <Text style={s.planSectionTitle}>Couldn't load this workout</Text>
+              <Text style={s.planErrorText}>{planError}</Text>
+              <Pressable onPress={loadPlan} style={[s.retryBtn, { alignSelf: 'flex-start' }]}>
+                <Text style={s.retryText}>Retry</Text>
+              </Pressable>
+            </View>
+          )}
           {plan.length > 0 && (
           <View style={s.planSection}>
             <View style={s.planSectionHeader}>
@@ -627,7 +793,8 @@ export default function WorkoutLibrary() {
                 <View key={c.id}>
                   <ExerciseCard
                     exercise={c}
-                    isIn={plan.some(e => e.id === c.id)}
+                    planItem={plan.find(e => e.id === c.id)}
+                    disabled={!planReady}
                     isPreviewing={preview?.id === c.id}
                     onToggle={togglePlan}
                     onPreview={handlePreview}
@@ -653,13 +820,16 @@ export default function WorkoutLibrary() {
         onEndReached={loadMore}
         onEndReachedThreshold={0.5}
         ListEmptyComponent={
-          loading || searchLoading ? (
+          (isSearching ? searchLoading : loading) ? (
             <ActivityIndicator color={COLOR} style={{ marginTop: 40 }} size="large" />
-          ) : loadError || searchError ? (
+          ) : (isSearching ? searchError : loadError) ? (
             <View style={s.errorWrap}>
               <Text style={s.errorEmoji}>⚠️</Text>
               <Text style={s.errorText}>Could not load exercises.</Text>
               <Text style={s.errorSub}>Check your internet connection and try again.</Text>
+              <Pressable onPress={retryList} style={s.retryBtn}>
+                <Text style={s.retryText}>Retry</Text>
+              </Pressable>
             </View>
           ) : (
             <Text style={s.empty}>
@@ -670,15 +840,27 @@ export default function WorkoutLibrary() {
           )
         }
         ListFooterComponent={
-          loadingMore
-            ? <ActivityIndicator color={COLOR} style={{ margin: 20 }} />
-            : <View style={{ height: 40 }} />
+          (isSearching ? searchMore : loadingMore) ? (
+            <ActivityIndicator color={COLOR} style={{ margin: 20 }} />
+          ) : isSearching && searchError && displayed.length > 0 ? (
+            // Your own exercises still matched; the library couldn't be searched.
+            <Pressable onPress={retryList} style={s.moreBtn} hitSlop={6}>
+              <Text style={s.moreText}>Couldn't search the exercise library · Retry</Text>
+            </Pressable>
+          ) : isSearching && searchResults?.length > 0 && searchResults.length < searchCount ? (
+            <Pressable onPress={loadMore} style={s.moreBtn} hitSlop={6}>
+              <Text style={s.moreText}>Showing {searchResults.length} of {searchCount} · Load more</Text>
+            </Pressable>
+          ) : (
+            <View style={{ height: 40 }} />
+          )
         }
         renderItem={({ item }) => (
           <View>
             <ExerciseCard
               exercise={item}
-              isIn={plan.some(e => e.id === item.id)}
+              planItem={plan.find(e => e.id === item.id)}
+              disabled={!planReady}
               isPreviewing={preview?.id === item.id}
               onToggle={togglePlan}
               onPreview={handlePreview}
@@ -779,6 +961,14 @@ const s = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   planRemoveText: { fontSize: 11, color: '#ef4444', fontWeight: '800' },
+  planStatusRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  planErrorText: { fontSize: 13, color: '#666', lineHeight: 18, marginTop: 4 },
+  retryBtn: { backgroundColor: COLOR, borderRadius: 10, paddingHorizontal: 16, paddingVertical: 8, marginTop: 10 },
+  retryText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  // Waiting on the plan: shown, but not pressable yet.
+  dimmed: { opacity: 0.45 },
+  moreBtn: { alignItems: 'center', paddingVertical: 16, marginBottom: 24 },
+  moreText: { fontSize: 13, fontWeight: '700', color: COLOR },
   empty: { textAlign: 'center', color: '#aaa', marginTop: 40, fontSize: 14 },
   errorWrap: { alignItems: 'center', padding: 40, gap: 6 },
   errorEmoji: { fontSize: 36, marginBottom: 4 },

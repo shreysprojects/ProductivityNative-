@@ -1,19 +1,21 @@
 import { useState, useCallback } from 'react'
-import { View, Text, Pressable, StyleSheet } from 'react-native'
+import { View, Text, Pressable, StyleSheet, Alert, ActivityIndicator } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { router, useFocusEffect } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
-import { getRoutineNames, saveRoutineOrder, getRoutineGroupMap, saveRoutineGroupMap } from '../lib/storage'
+import { loadRoutineNames, saveRoutineOrder, getRoutineGroupMap, saveRoutineGroupMap } from '../lib/storage'
 import { routineTheme } from '../lib/themes'
 
 // One draggable list with the two section headers as fixed rows: drag a
 // routine under the WHENEVER header to make it a no-pressure routine, or
 // back up under EVERY DAY to make it a daily priority.
 
-const H_EVERYDAY = '__everyday__'
-const H_WHENEVER = '__whenever__'
+// The headers are objects rather than strings, so no routine name — not even
+// one spelled like a header — can be mistaken for one.
+const H_EVERYDAY = { header: 'everyday' }
+const H_WHENEVER = { header: 'whenever' }
 const isHeader = item => item === H_EVERYDAY || item === H_WHENEVER
 
 // Same section identities as the dashboard headers
@@ -25,16 +27,31 @@ export default function ReorderRoutines() {
   const { theme } = useTheme()
   const insets = useSafeAreaInsets()
   const [data, setData] = useState([])
+  // 'loading' | 'ready' | 'error'. Nothing can be moved or saved until the
+  // list has loaded: saving the empty placeholder would drop every routine.
+  const [status, setStatus] = useState('loading')
+  const [loadError, setLoadError] = useState('')
   const [saving, setSaving] = useState(false)
 
-  useFocusEffect(useCallback(() => {
-    if (!user) return
-    Promise.all([getRoutineNames(user.id), getRoutineGroupMap(user.id)]).then(([names, gMap]) => {
-      const everyday = names.filter(n => (gMap[n] ?? 'everyday') === 'everyday')
-      const whenever = names.filter(n => gMap[n] === 'whenever')
-      setData([H_EVERYDAY, ...everyday, H_WHENEVER, ...whenever])
-    })
-  }, [user]))
+  // The strict read: offline it fails, instead of offering a guessed list
+  // that Done would then save over the real one.
+  const load = useCallback(() => {
+    if (!user?.id) return
+    setStatus('loading')
+    Promise.all([loadRoutineNames(user.id), getRoutineGroupMap(user.id)])
+      .then(([names, gMap]) => {
+        const everyday = names.filter(n => (gMap[n] ?? 'everyday') === 'everyday')
+        const whenever = names.filter(n => gMap[n] === 'whenever')
+        setData([H_EVERYDAY, ...everyday, H_WHENEVER, ...whenever])
+        setStatus('ready')
+      })
+      .catch(e => {
+        setLoadError(e?.message ?? 'Could not load your routines.')
+        setStatus('error')
+      })
+  }, [user?.id])
+
+  useFocusEffect(load)
 
   // Split the flat list back into the two groups (headers pinned in place).
   function splitGroups(list) {
@@ -53,19 +70,22 @@ export default function ReorderRoutines() {
 
   async function done() {
     if (!user) return router.back()
+    if (status !== 'ready' || saving) return
     setSaving(true)
     try {
       const { everyday, whenever } = splitGroups(data)
       const groupMap = {}
       everyday.forEach(n => { groupMap[n] = 'everyday' })
       whenever.forEach(n => { groupMap[n] = 'whenever' })
-      await Promise.all([
-        saveRoutineOrder(user.id, [...everyday, ...whenever]),
-        saveRoutineGroupMap(user.id, groupMap),
-      ])
-    } finally {
+      // The order first: it's the half that can fail (offline, or nothing to
+      // save), and the groups shouldn't change without it.
+      await saveRoutineOrder(user.id, [...everyday, ...whenever])
+      await saveRoutineGroupMap(user.id, groupMap)
+    } catch (e) {
       setSaving(false)
+      return Alert.alert('Could not save', e?.message ?? 'Please try again.')
     }
+    setSaving(false)
     router.back()
   }
 
@@ -129,7 +149,12 @@ export default function ReorderRoutines() {
           <Text style={[s.back, { color: theme.text }]}>←</Text>
         </Pressable>
         <Text style={[s.title, { color: theme.text }]}>Organize Routines</Text>
-        <Pressable onPress={done} disabled={saving} hitSlop={12} style={s.headerBtn}>
+        <Pressable
+          onPress={done}
+          disabled={saving || status !== 'ready'}
+          hitSlop={12}
+          style={[s.headerBtn, status !== 'ready' && { opacity: 0.4 }]}
+        >
           <Text style={[s.doneText, { color: theme.accent }]}>{saving ? '…' : 'Done'}</Text>
         </Pressable>
       </View>
@@ -138,17 +163,28 @@ export default function ReorderRoutines() {
         Hold ☰ and drag to reorder — drop a routine under a section to move it there, or tap the button on the right.
       </Text>
 
-      <DraggableFlatList
-        data={data}
-        keyExtractor={n => n}
-        onDragEnd={({ data: next }) => {
-          const { everyday, whenever } = splitGroups(next)
-          setData([H_EVERYDAY, ...everyday, H_WHENEVER, ...whenever])
-        }}
-        renderItem={renderItem}
-        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 40 }}
-        showsVerticalScrollIndicator={false}
-      />
+      {status === 'ready' ? (
+        <DraggableFlatList
+          data={data}
+          keyExtractor={item => (isHeader(item) ? `header:${item.header}` : `routine:${item}`)}
+          onDragEnd={({ data: next }) => {
+            const { everyday, whenever } = splitGroups(next)
+            setData([H_EVERYDAY, ...everyday, H_WHENEVER, ...whenever])
+          }}
+          renderItem={renderItem}
+          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 40 }}
+          showsVerticalScrollIndicator={false}
+        />
+      ) : status === 'error' ? (
+        <View style={s.stateBox}>
+          <Text style={[s.stateText, { color: theme.subtext }]}>{loadError}</Text>
+          <Pressable style={[s.retryBtn, { backgroundColor: theme.accent }]} onPress={load}>
+            <Text style={s.retryText}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <ActivityIndicator color={theme.accent} style={{ paddingVertical: 32 }} />
+      )}
     </View>
   )
 }
@@ -164,6 +200,12 @@ const s = StyleSheet.create({
   title: { fontSize: 17, fontWeight: '800' },
   doneText: { fontSize: 16, fontWeight: '700', textAlign: 'right' },
   hint: { fontSize: 13, lineHeight: 18, paddingHorizontal: 20, paddingTop: 16, paddingBottom: 8 },
+
+  // Load failure
+  stateBox: { alignItems: 'center', padding: 32 },
+  stateText: { fontSize: 13, fontWeight: '500', textAlign: 'center', lineHeight: 18 },
+  retryBtn: { borderRadius: 14, paddingVertical: 13, paddingHorizontal: 30, marginTop: 20 },
+  retryText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 
   sectionRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8,

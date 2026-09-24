@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, Pressable, ScrollView, Image,
-  ActivityIndicator, Alert, StyleSheet,
+  ActivityIndicator, Alert, Linking, StyleSheet,
 } from 'react-native'
 import * as ImagePicker from 'expo-image-picker'
 // manipulateAsync is the older entry point (the contextual API is the newer
@@ -27,8 +27,17 @@ const CHIPS = [
 
 const CONFIDENCE_COLOR = { high: '#10b981', medium: '#f59e0b', low: '#ef4444' }
 
+// How many portions a typed amount stands for: a decimal comma counts ("1,5"
+// on a French keyboard), 0 or less is the smallest portion and anything
+// unreadable is one.
+const clampServings = n => Math.min(20, Math.max(0.25, Math.round(n * 100) / 100))
+function servingsOf(text) {
+  const n = parseFloat(String(text ?? '').replace(',', '.'))
+  return Number.isFinite(n) ? clampServings(n) : 1
+}
+
 function scaleMacros(macros, servings) {
-  const mult = parseFloat(servings) || 1
+  const mult = servingsOf(servings)
   const out = {}
   Object.entries(macros ?? {}).forEach(([k, v]) => {
     const n = (Number(v) || 0) * mult
@@ -84,20 +93,30 @@ export default function AIFoodEstimate({
   }
 
   async function attachPhoto(fromCamera) {
-    const perm = fromCamera
-      ? await ImagePicker.requestCameraPermissionsAsync()
-      : await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (perm.status !== 'granted') {
-      Alert.alert(
-        'Permission needed',
-        fromCamera ? 'Camera access is required to take a photo.' : 'Photo library access is required to pick a photo.'
-      )
+    let asset
+    try {
+      // Only the camera needs permission; the photo library's system picker
+      // hands over just the photo chosen.
+      if (fromCamera) {
+        const perm = await ImagePicker.requestCameraPermissionsAsync()
+        if (perm.status !== 'granted') {
+          // Refused for good, asking again does nothing: only Settings can
+          // turn it back on.
+          Alert.alert('Permission needed', 'Camera access is required to take a photo.', perm.canAskAgain === false ? [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings().catch(() => {}) },
+          ] : undefined)
+          return
+        }
+      }
+      const res = fromCamera
+        ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.8 })
+        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.8 })
+      asset = res.canceled ? null : res.assets?.[0]
+    } catch (e) {
+      Alert.alert(fromCamera ? 'Could not open the camera' : 'Could not open your photos', String(e?.message ?? e))
       return
     }
-    const res = fromCamera
-      ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.8 })
-      : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.8 })
-    const asset = res.canceled ? null : res.assets?.[0]
     if (!asset) return
     try {
       // Judging a portion does not need a big image; 1024px keeps the upload
@@ -135,7 +154,7 @@ export default function AIFoodEstimate({
   }
 
   function add() {
-    const mult = parseFloat(servings) || 1
+    const mult = servingsOf(servings)
     const portion = result.portion
       ? (mult === 1 ? result.portion : `${mult} × ${result.portion}`)
       : null
@@ -160,7 +179,7 @@ export default function AIFoodEstimate({
         <Text style={a.backText}>‹  {backLabel}</Text>
       </Pressable>
 
-      <ScrollView contentContainerStyle={a.scroll} keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={a.scroll} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
         <View style={a.queryCard}>
           <Text style={a.queryKicker}>{kicker}</Text>
           <Text style={a.queryText}>“{query}”</Text>
@@ -272,17 +291,19 @@ export default function AIFoodEstimate({
             <View style={a.portionBox}>
               <Text style={a.portionTitle}>HOW MANY OF THAT PORTION?</Text>
               <View style={a.portionRow}>
-                <Pressable style={a.step} onPress={() => setServings(String(Math.max(0.25, (parseFloat(servings) || 1) - 0.25)))}>
+                <Pressable style={a.step} onPress={() => setServings(String(clampServings(servingsOf(servings) - 0.25)))}>
                   <Text style={a.stepText}>−</Text>
                 </Pressable>
                 <TextInput
                   style={a.portionInput}
                   value={String(servings)}
                   onChangeText={setServings}
+                  // Once typing stops the box shows the amount actually used.
+                  onEndEditing={() => setServings(String(servingsOf(servings)))}
                   keyboardType="decimal-pad"
                   selectTextOnFocus
                 />
-                <Pressable style={a.step} onPress={() => setServings(((parseFloat(servings) || 1) + 0.25).toFixed(2))}>
+                <Pressable style={a.step} onPress={() => setServings(String(clampServings(servingsOf(servings) + 0.25)))}>
                   <Text style={a.stepText}>+</Text>
                 </Pressable>
                 <Text style={a.portionLabel}>× {result.portion || 'the estimated portion'}</Text>

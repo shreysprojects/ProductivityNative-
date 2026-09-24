@@ -10,10 +10,12 @@ import { useAuth } from '../lib/AuthContext'
 import { supabase } from '../lib/supabase'
 import { blockUser, unblockUser, isBlocked } from '../lib/blockedStorage'
 import {
-  ROUTINE_DEFAULTS, addRoutine, saveRoutineTemplate, getRoutineNames,
-  saveWorkoutPlan, getWorkoutRoutineList,
+  ROUTINE_DEFAULTS, RESERVED_ROUTINES, addRoutine, saveRoutineTemplate,
+  loadRoutineNames, validateRoutineName,
+  saveWorkoutPlan, loadWorkoutRoutineList, sanitizeWorkoutExercises,
 } from '../lib/storage'
 import MuscleMap from '../components/MuscleMap'
+import ErrorBoundary from '../components/ErrorBoundary'
 
 // ── Task icon keyword matcher ─────────────────────────────────────────────────
 
@@ -66,19 +68,23 @@ const SPLIT_EXPAND = {
   cardio:     ['Legs', 'Core'],
 }
 
+// Own entries only: a workout named "constructor" or "__proto__" used to find
+// Object's built-ins here instead of a muscle list.
+const splitExpand = key => (Array.isArray(SPLIT_EXPAND[key]) ? SPLIT_EXPAND[key] : null)
+
 function musclesFromGroup(group) {
-  if (!group) return []
+  if (typeof group !== 'string' || !group) return []
   const result = new Set()
   group.split(/[+/]/).forEach(part => {
     const lower = part.trim().toLowerCase()
-    if (SPLIT_EXPAND[lower]) {
-      SPLIT_EXPAND[lower].forEach(m => result.add(m))
+    if (splitExpand(lower)) {
+      splitExpand(lower).forEach(m => result.add(m))
       return
     }
     let matched = false
     lower.split(/\s+/).forEach(word => {
-      if (SPLIT_EXPAND[word]) {
-        SPLIT_EXPAND[word].forEach(m => result.add(m))
+      if (splitExpand(word)) {
+        splitExpand(word).forEach(m => result.add(m))
         matched = true
       }
     })
@@ -88,16 +94,56 @@ function musclesFromGroup(group) {
 }
 
 // Aggregate primary/secondary muscle names from a saved plan's exercises.
-function musclesFromPlan(exercises = []) {
+// Names only, and only strings: the muscle map draws each one, and anything
+// else in a friend's plan crashed it.
+function musclesFromPlan(exercises) {
   const primary = new Set(), secondary = new Set()
-  exercises.forEach(ex => {
-    ex.muscles?.forEach(m => { if (m?.name) primary.add(m.name) })
-    ex.musclesSecondary?.forEach(m => { if (m?.name) secondary.add(m.name) })
+  const names = list => (Array.isArray(list) ? list : [])
+    .map(m => m?.name)
+    .filter(n => typeof n === 'string' && n)
+  ;(Array.isArray(exercises) ? exercises : []).forEach(ex => {
+    names(ex?.muscles).forEach(n => primary.add(n))
+    names(ex?.musclesSecondary).forEach(n => secondary.add(n))
   })
   return {
     primary: [...primary],
     secondary: [...secondary].filter(m => !primary.has(m)),
   }
+}
+
+// ── A friend's data ───────────────────────────────────────────────────────────
+// Everything this screen shows is someone else's rows: plain JSON that they,
+// or an older version of the app, wrote. Its shape is checked before anything
+// is drawn from it. A list that wasn't an array, or an object where text
+// belongs, used to crash this screen or leave it spinning forever.
+
+const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v)
+const objects = v => (Array.isArray(v) ? v.filter(isObj) : [])
+const str = v => (typeof v === 'string' ? v : '')
+const numOrNull = v => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN
+  return Number.isFinite(n) ? n : null
+}
+
+// Tasks that have text; an emoji only when it is one.
+function safeTasks(list) {
+  return objects(list)
+    .filter(t => typeof t.text === 'string')
+    .map(t => ({ ...t, emoji: typeof t.emoji === 'string' ? t.emoji : undefined }))
+}
+
+// What a copied routine keeps: each task's words, emoji, time goal and steps.
+// Pictures stay behind — they are the friend's photos, which vanish from the
+// copy when the friend removes them, and which editing the copy would try to
+// delete as if they were yours. A Looks task becomes a plain one, or your own
+// Looks card would rewrite or remove it.
+function copyableTasks(tasks) {
+  return safeTasks(tasks).map(({ image, fromLooks, ...t }) => ({
+    ...t,
+    subTasks: objects(t.subTasks)
+      .filter(st => typeof st.text === 'string')
+      .map(({ image: _image, fromLooks: _fromLooks, ...st }) => st),
+  }))
 }
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
@@ -332,7 +378,11 @@ function DayDetailModal({ date, data, muscleByGroup, theme, onClose }) {
 
               {(primaryMuscles.length > 0 || secondaryMuscles.length > 0) && (
                 <View style={fp.dMuscleWrap}>
-                  <MuscleMap muscles={primaryMuscles} secondaryMuscles={secondaryMuscles} size={220} interactive={false} />
+                  {/* Drawn from the friend's own names: if one still breaks
+                      the map, only the map goes missing. */}
+                  <ErrorBoundary fallback={null}>
+                    <MuscleMap muscles={primaryMuscles} secondaryMuscles={secondaryMuscles} size={220} interactive={false} />
+                  </ErrorBoundary>
                 </View>
               )}
 
@@ -435,7 +485,9 @@ export default function FriendProfileScreen() {
   const [copiedWorkouts, setCopiedWorkouts] = useState({})
 
   useEffect(() => {
-    if (userId) load()
+    // The spinner comes down however load ends: a row it choked on used to
+    // leave this screen loading forever.
+    if (userId) load().catch(() => {}).finally(() => setLoading(false))
   }, [userId])
 
   async function load() {
@@ -481,22 +533,27 @@ export default function FriendProfileScreen() {
 
     setStreak(streakRes.data ?? null)
 
-    const names = routineRes.data?.names ?? []
+    const names = (Array.isArray(routineRes.data?.names) ? routineRes.data.names : [])
+      .filter(n => typeof n === 'string' && n)
     setRoutineNames(names)
-    const taskMap = {}
+    // Keyed by the friend's own names, so no inherited keys: a routine called
+    // "constructor" must not find Object's.
+    const taskMap = Object.create(null)
     ;(templatesRes.data ?? []).forEach(row => {
-      if (Array.isArray(row.tasks)) taskMap[row.routine_name] = row.tasks
+      if (Array.isArray(row.tasks)) taskMap[row.routine_name] = safeTasks(row.tasks)
     })
     names.forEach(n => {
-      if (!taskMap[n] && ROUTINE_DEFAULTS[n]) taskMap[n] = ROUTINE_DEFAULTS[n]
+      if (!taskMap[n] && Array.isArray(ROUTINE_DEFAULTS[n])) taskMap[n] = ROUTINE_DEFAULTS[n]
     })
     setRoutineTasks(taskMap)
 
     // Saved workouts + muscle map per group (drives primary/secondary highlighting)
-    const plans = plansRes.data ?? []
+    const plans = (plansRes.data ?? [])
+      .filter(p => typeof p?.muscle_group === 'string')
+      .map(p => ({ muscle_group: p.muscle_group, exercises: sanitizeWorkoutExercises(p.exercises) }))
     setWorkoutPlans(plans)
-    const groupMap = {}
-    plans.forEach(p => { groupMap[p.muscle_group] = musclesFromPlan(p.exercises ?? []) })
+    const groupMap = Object.create(null)
+    plans.forEach(p => { groupMap[p.muscle_group] = musclesFromPlan(p.exercises) })
     setMuscleByGroup(groupMap)
 
     // Index logged activity by date. Runs may be stored under the routine's
@@ -504,8 +561,13 @@ export default function FriendProfileScreen() {
     // variant completed more steps, since history is recorded per base name.
     const runsByKey = {}
     ;(runsRes.data ?? []).forEach(r => {
+      if (typeof r.routine_name !== 'string') return
       const key = `${r.routine_name.replace(/::alt$/, '')}__${r.date}`
-      const steps = r.data?.steps ?? []
+      const steps = objects(r.data?.steps).map(st => ({
+        text: str(st.text),
+        completedAt: !!st.completedAt,
+        elapsedMs: numOrNull(st.elapsedMs),
+      }))
       const done = list => list.filter(st => st.completedAt).length
       if (!runsByKey[key] || done(steps) > done(runsByKey[key])) runsByKey[key] = steps
     })
@@ -515,19 +577,36 @@ export default function FriendProfileScreen() {
 
     ;(histRes.data ?? []).forEach(h => {
       ensure(h.date).routines.push({
-        name: h.routine_name,
-        completion: h.completion,
+        name: str(h.routine_name),
+        completion: Number(h.completion) || 0,
         steps: runsByKey[`${h.routine_name}__${h.date}`] ?? [],
       })
     })
     ;(wlRes.data ?? []).forEach(row => {
-      const exercises = (row.data?.exercises ?? []).filter(e => !e.skipped && (e.sets ?? []).length > 0)
-      const muscleGroup = row.data?.muscleGroup
+      const exercises = objects(row.data?.exercises)
+        .filter(e => !e.skipped)
+        .map(e => ({
+          name: str(e.name) || 'Exercise',
+          inputType: e.inputType === 'time' ? 'time' : 'reps',
+          sets: objects(e.sets).map(s => ({
+            reps: numOrNull(s.reps), weight: numOrNull(s.weight), time: numOrNull(s.time),
+            unit: str(s.unit) || null,
+          })),
+        }))
+        .filter(e => e.sets.length > 0)
+      const muscleGroup = str(row.data?.muscleGroup)
       if (!exercises.length && !muscleGroup) return
       ensure(row.date).workout = { muscleGroup, exercises }
     })
     ;(mealsRes.data ?? []).forEach(row => {
-      if (Array.isArray(row.meals) && row.meals.length) ensure(row.date).meals = row.meals
+      const meals = objects(row.meals).map(m => ({
+        name: str(m.name) || 'Meal',
+        macros: isObj(m.macros) ? {
+          calories: numOrNull(m.macros.calories), protein: numOrNull(m.macros.protein),
+          carbs: numOrNull(m.macros.carbs), fat: numOrNull(m.macros.fat),
+        } : {},
+      }))
+      if (meals.length) ensure(row.date).meals = meals
     })
 
     setByDate(map)
@@ -537,12 +616,24 @@ export default function FriendProfileScreen() {
   async function copyRoutine(name) {
     if (!viewerId) return
     try {
-      const existing = await getRoutineNames(viewerId)
-      let newName = name
+      // The strict read: the list is written back whole, so one built from a
+      // failed read would drop your own routines.
+      const existing = await loadRoutineNames(viewerId)
+      const taken = n => [...existing, ...RESERVED_ROUTINES]
+        .some(e => typeof e === 'string' && e.toLowerCase() === n.toLowerCase())
+      const base = name.trim()
+      let newName = base
       let i = 2
-      while (existing.includes(newName)) { newName = `${name} (${i})`; i++ }
+      while (taken(newName)) { newName = `${base} (${i})`; i++ }
+      // The friend's name goes through the same rules as one typed here. A
+      // name like "Morning::alt" or "new" means something else to the app.
+      const problem = validateRoutineName(newName, existing)
+      if (problem) {
+        Alert.alert("Can't copy this routine", problem)
+        return
+      }
       await addRoutine(viewerId, newName)
-      await saveRoutineTemplate(viewerId, newName, routineTasks[name] ?? [])
+      await saveRoutineTemplate(viewerId, newName, copyableTasks(routineTasks[name]))
       setCopiedRoutines(prev => ({ ...prev, [name]: true }))
       Alert.alert('Saved', `"${newName}" was added to your routines.`)
     } catch (e) {
@@ -553,12 +644,14 @@ export default function FriendProfileScreen() {
   async function copyWorkout(plan) {
     if (!viewerId) return
     try {
-      const list = await getWorkoutRoutineList(viewerId)
+      // The strict read: a failed one came back as "no workouts", so the name
+      // check passed and the copy replaced your own workout of the same name.
+      const list = await loadWorkoutRoutineList(viewerId)
       const existing = list.map(w => w.name)
       let newName = plan.muscle_group
       let i = 2
       while (existing.includes(newName)) { newName = `${plan.muscle_group} (${i})`; i++ }
-      await saveWorkoutPlan(viewerId, newName, plan.exercises ?? [])
+      await saveWorkoutPlan(viewerId, newName, sanitizeWorkoutExercises(plan.exercises))
       setCopiedWorkouts(prev => ({ ...prev, [plan.muscle_group]: true }))
       Alert.alert('Saved', `"${newName}" was added to your workouts.`)
     } catch (e) {
@@ -582,7 +675,7 @@ export default function FriendProfileScreen() {
     }
     Alert.alert(
       `Block @${handle}?`,
-      "They won't be able to see your profile or reach you in the community. You can unblock them any time from Settings.",
+      "They won't be able to see your profile or reach you in the community, and you'll no longer be friends. You can unblock them any time from Settings.",
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -745,7 +838,7 @@ export default function FriendProfileScreen() {
                             {tasks.length} task{tasks.length !== 1 ? 's' : ''}
                           </Text>
                         )}
-                        {!isSelf && <CopyButton copied={!!copiedRoutines[name]} onPress={() => copyRoutine(name)} theme={theme} />}
+                        {!isSelf && <CopyButton copied={copiedRoutines[name] === true} onPress={() => copyRoutine(name)} theme={theme} />}
                       </View>
                       {tasks.map((task, i) => (
                         <View key={task.id ?? i} style={[fp.taskRow, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.divider }]}>
@@ -774,12 +867,14 @@ export default function FriendProfileScreen() {
                         <Text style={[fp.routineCount, { color: theme.muted }]}>
                           {exercises.length} exercise{exercises.length !== 1 ? 's' : ''}
                         </Text>
-                        {!isSelf && <CopyButton copied={!!copiedWorkouts[plan.muscle_group]} onPress={() => copyWorkout(plan)} theme={theme} />}
+                        {!isSelf && <CopyButton copied={copiedWorkouts[plan.muscle_group] === true} onPress={() => copyWorkout(plan)} theme={theme} />}
                       </View>
 
                       {(mg?.primary?.length > 0 || mg?.secondary?.length > 0) && (
                         <View style={fp.planMuscleWrap}>
-                          <MuscleMap muscles={mg.primary} secondaryMuscles={mg.secondary} size={170} interactive={false} />
+                          <ErrorBoundary fallback={null}>
+                            <MuscleMap muscles={mg.primary} secondaryMuscles={mg.secondary} size={170} interactive={false} />
+                          </ErrorBoundary>
                         </View>
                       )}
 

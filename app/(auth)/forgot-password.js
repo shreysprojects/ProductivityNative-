@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   View, Text, TextInput, Pressable, StyleSheet,
   KeyboardAvoidingView, Platform, ScrollView, Alert, ActivityIndicator,
@@ -7,18 +7,30 @@ import { router } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 
 export default function ForgotPassword() {
-  const { sendPasswordReset, confirmPasswordReset } = useAuth()
+  const { user, sendPasswordReset, confirmPasswordReset } = useAuth()
   const [phase, setPhase] = useState('email') // 'email' | 'reset'
   const [email, setEmail] = useState('')
   const [code, setCode] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [loading, setLoading] = useState(false)
+  // The code is single-use, and accepting it signs the user in. When the new
+  // password is refused after that (too weak, same as the old one, a dropped
+  // connection), only the password is asked for again: the spent code could
+  // only ever fail from here on.
+  const [codeAccepted, setCodeAccepted] = useState(false)
+
+  useEffect(() => {
+    if (phase === 'reset' && user?.email && user.email.toLowerCase() === email.trim().toLowerCase()) {
+      setCodeAccepted(true)
+    }
+  }, [user?.id])
 
   async function handleSend() {
     if (!email.trim()) return Alert.alert('Enter your email')
     setLoading(true)
     try {
       await sendPasswordReset(email)
+      setCodeAccepted(false)
       setPhase('reset')
       Alert.alert('Check your email', `We sent a password reset code to ${email.trim()}. Enter it below along with your new password.`)
     } catch (e) {
@@ -29,7 +41,7 @@ export default function ForgotPassword() {
   }
 
   async function handleReset() {
-    if (!code.trim()) return Alert.alert('Enter the code from your email')
+    if (!codeAccepted && !code.trim()) return Alert.alert('Enter the code from your email')
     if (newPassword.length < 8) return Alert.alert('Weak password', 'Password must be at least 8 characters.')
     setLoading(true)
     try {
@@ -51,7 +63,9 @@ export default function ForgotPassword() {
         <Text style={s.sub}>
           {phase === 'email'
             ? "Enter your account email and we'll send you a reset code."
-            : `Enter the code sent to ${email.trim()} and choose a new password.`}
+            : codeAccepted
+              ? `Your code was accepted. Choose a new password for ${email.trim()}.`
+              : `Enter the code sent to ${email.trim()} and choose a new password.`}
         </Text>
 
         {phase === 'email' ? (
@@ -71,25 +85,29 @@ export default function ForgotPassword() {
           </>
         ) : (
           <>
+            {!codeAccepted && (
+              <TextInput
+                style={s.input}
+                placeholder="Reset code"
+                placeholderTextColor="rgba(255,255,255,0.35)"
+                autoCapitalize="none"
+                keyboardType="number-pad"
+                value={code}
+                onChangeText={setCode}
+              />
+            )}
             <TextInput
               style={s.input}
-              placeholder="Reset code"
-              placeholderTextColor="rgba(255,255,255,0.35)"
-              autoCapitalize="none"
-              keyboardType="number-pad"
-              value={code}
-              onChangeText={setCode}
-            />
-            <TextInput
-              style={s.input}
-              placeholder="New password"
+              placeholder="New password (min 8 characters)"
               placeholderTextColor="rgba(255,255,255,0.35)"
               secureTextEntry
               value={newPassword}
               onChangeText={setNewPassword}
             />
             <Pressable style={[s.btn, loading && s.btnDisabled]} onPress={handleReset} disabled={loading}>
-              {loading ? <ActivityIndicator color="#fff" /> : <Text style={s.btnText}>Reset password</Text>}
+              {loading
+                ? <ActivityIndicator color="#fff" />
+                : <Text style={s.btnText}>{codeAccepted ? 'Set new password' : 'Reset password'}</Text>}
             </Pressable>
             <Pressable onPress={() => setPhase('email')} disabled={loading} style={s.resend}>
               <Text style={s.resendText}>Use a different email</Text>

@@ -86,19 +86,26 @@ const tb = StyleSheet.create({
 })
 
 export default function TabsLayout() {
-  const { user, loading, profile, profileLoading } = useAuth()
+  const { user, loading, profile, profileLoading, profileError } = useAuth()
   const { theme } = useTheme()
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
+  const userId = user?.id ?? null
 
   useEffect(() => {
-    if (!user) return
-    getSections(user.id).then(setSections)
+    if (!userId) return
+    getSections(userId).then(setSections)
     return onSectionsChange(setSections)
-  }, [user])
+  }, [userId])
 
   if (loading) return null
   if (!user) return <Redirect href="/(auth)/login" />
-  if (!profileLoading && !profile) return <Redirect href="/(auth)/complete-profile" />
+  // Set-up is only for a profile known to be missing or to have no username
+  // yet (sign-up makes a row without one; Google and Apple accounts start
+  // that way). A profile that could not be READ is not missing: sending
+  // those users to set-up renamed the account and wiped its bio and photo.
+  if (!profileLoading && !profileError && !profile?.username) {
+    return <Redirect href="/(auth)/complete-profile" />
+  }
 
   return (
     <Tabs

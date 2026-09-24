@@ -1,32 +1,44 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   View, Text, TextInput, Pressable, StyleSheet,
   KeyboardAvoidingView, Platform, ScrollView, Alert, Image,
 } from 'react-native'
-import { Link, router } from 'expo-router'
+import { Link, router, useIsFocused } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import GoogleSignInButton from '../../components/GoogleSignInButton'
 import AppleSignInButton from '../../components/AppleSignInButton'
 
 export default function Login() {
-  const { signIn, resendSignUpCode } = useAuth()
+  const { user, signIn, resendSignUpCode } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
+  const isFocused = useIsFocused()
+  const userId = user?.id ?? null
+
+  // Signed in — by this form, or by a session that came back on its own (a
+  // token refresh once the network returns after an offline start, which
+  // used to leave a signed-in user sitting here). Only while this screen is
+  // the one showing: a password reset or email check stacked on top signs
+  // the user in partway through and moves on by itself.
+  useEffect(() => {
+    if (userId && isFocused) router.replace('/')
+  }, [userId, isFocused])
 
   async function handleSignIn() {
-    if (!email || !password) return Alert.alert('Fill in all fields')
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) return Alert.alert('Invalid email', 'Please enter a valid email address.')
+    const cleanEmail = email.trim()
+    if (!cleanEmail || !password) return Alert.alert('Fill in all fields')
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return Alert.alert('Invalid email', 'Please enter a valid email address.')
     setLoading(true)
     try {
-      await signIn({ email, password })
-      router.replace('/')
+      // The effect above moves on once the session lands.
+      await signIn({ email: cleanEmail, password })
     } catch (e) {
       const msg = (e.message ?? '').toLowerCase()
       if (msg.includes('not confirmed') || msg.includes('confirm')) {
         // Account exists but email isn't verified yet → send them to verify it.
-        try { await resendSignUpCode(email) } catch {}
-        router.push({ pathname: '/(auth)/verify-email', params: { email: email.trim() } })
+        try { await resendSignUpCode(cleanEmail) } catch {}
+        router.push({ pathname: '/(auth)/verify-email', params: { email: cleanEmail } })
         return
       }
       Alert.alert('Sign in failed', e.message)

@@ -1,7 +1,7 @@
 import { Platform, Pressable, Text, StyleSheet, Alert } from 'react-native'
 import * as WebBrowser from 'expo-web-browser'
 import * as Google from 'expo-auth-session/providers/google'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuth, createNoncePair } from '../lib/AuthContext'
 import { router } from 'expo-router'
 
@@ -29,6 +29,14 @@ function ButtonShell({ dimmed, onPress }) {
 function ConfiguredGoogleSignInButton() {
   const { signInWithGoogle } = useAuth()
   const [nonce, setNonce] = useState(null)
+  // One sign-in at a time: a second tap used to open a second Google prompt.
+  const busy = useRef(false)
+  const mounted = useRef(false)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -46,20 +54,50 @@ function ConfiguredGoogleSignInButton() {
   })
 
   useEffect(() => {
+    if (response?.type === 'error') {
+      // Google refused (a misconfigured client, a revoked grant). This used to
+      // end silently, as if the button had done nothing.
+      Alert.alert(
+        'Google sign-in failed',
+        response.error?.description || response.error?.message || 'Please try again.'
+      )
+      return
+    }
+    // A closed or dismissed prompt is the user's choice, not a failure.
     if (response?.type !== 'success') return
     // expo-auth-session returns idToken in authentication (PKCE) or params (implicit)
     const idToken = response.authentication?.idToken ?? response.params?.id_token
     if (!idToken) {
+      busy.current = false
       Alert.alert('Google sign-in failed', 'No ID token received.')
       return
     }
     signInWithGoogle(idToken, nonce?.raw)
-      .then(() => router.replace('/(tabs)'))
+      // Through the start-up checks in app/index.js, which send a new
+      // account through setup first. The login screen moves on by itself once
+      // the session arrives, so only navigate if this screen is still here.
+      .then(() => { if (mounted.current) router.replace('/') })
       .catch(e => Alert.alert('Google sign-in failed', e.message))
+      .finally(() => { busy.current = false })
   }, [response])
 
   const ready = !!request && !!nonce
-  return <ButtonShell dimmed={!ready} onPress={() => { if (ready) promptAsync() }} />
+
+  async function handlePress() {
+    if (!ready || busy.current) return
+    busy.current = true
+    try {
+      const result = await promptAsync()
+      // A success is finished by the effect above; anything else ends here.
+      if (result?.type !== 'success') busy.current = false
+    } catch (e) {
+      // The prompt itself failed to open. Unhandled, this was a silent tap.
+      busy.current = false
+      Alert.alert('Google sign-in failed', e?.message ?? 'Please try again.')
+    }
+  }
+
+  return <ButtonShell dimmed={!ready} onPress={handlePress} />
 }
 
 export default function GoogleSignInButton() {

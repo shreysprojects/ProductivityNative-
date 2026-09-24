@@ -1,6 +1,9 @@
 -- ============================================================
--- Run this entire file in Supabase SQL Editor (one paste)
--- Dashboard → SQL Editor → New query → paste → Run
+-- HISTORICAL REFERENCE — DO NOT RUN AGAINST THE LIVE DATABASE.
+-- The live schema is managed by supabase/migrations/ (applied with
+-- `npx supabase@latest db push --linked`). Several policies below were
+-- replaced for security reasons (see 20260923090000_security_hardening.sql);
+-- re-running this file would put the old, weaker ones back.
 -- ============================================================
 
 -- Profiles (one row per auth user, auto-created by trigger below)

@@ -21,6 +21,7 @@ import {
   getMyFriendCode, getFriends, getPendingRequests,
   addFriendByCode, acceptFriendRequest, declineFriendRequest, removeFriend,
 } from '../../lib/friendsStorage'
+import ErrorBoundary from '../../components/ErrorBoundary'
 
 const BIO_MAX = 120
 
@@ -62,6 +63,33 @@ function postError(e, fallback) {
     return { title: 'Posting limit reached', msg: "You can share up to 5 posts per day, with a short wait between each. Please try again later." }
   }
   return { title: 'Error', msg: fallback }
+}
+
+// The hourly report cap is refused the same way (42501).
+const REPORT_LIMIT_MSG = "You've reported a lot of posts recently. You can report up to 5 an hour, so please try again later."
+
+// ── Untrusted post content ─────────────────────────────────────────────────────
+// Posts are JSON written by other people's phones (older app versions, or
+// anything sent straight to the API), so every field is type-checked before it
+// is drawn. One malformed post (tasks: [null], sections: [{}], an object where
+// a name belongs) used to crash the whole app, not just its own card.
+
+const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v)
+const objects = v => (Array.isArray(v) ? v.filter(isObj) : [])
+const str = v => (typeof v === 'string' ? v : '')
+const num = v => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN
+  return Number.isFinite(n) ? n : 0
+}
+
+// Every phone that scrolls past a post loads its pictures, so only pictures
+// from the app's own exercise library are shown: any other URL would hand its
+// owner the IP address of everyone who saw the post.
+const EXERCISE_GIF_PREFIX =
+  `${String(process.env.EXPO_PUBLIC_SUPABASE_URL ?? '').replace(/\/+$/, '')}/storage/v1/object/public/exercise-gifs/`
+
+function libraryGif(url) {
+  return typeof url === 'string' && url.startsWith(EXERCISE_GIF_PREFIX) && !url.includes('..') ? url : null
 }
 
 function getTaskName(task) {
@@ -115,7 +143,7 @@ function buildWorkoutContent(log, unit) {
       return {
         name: ex.name,
         inputType: ex.inputType ?? 'reps',
-        gifUrl: ex.gifUrl ?? null,
+        gifUrl: libraryGif(ex.gifUrl),
         sets: completed.length,
         reps: first.reps ?? null,
         time: first.time ?? null,
@@ -227,32 +255,36 @@ function validateMealContent(mealNames, bio = '') {
   return null
 }
 
+// A check that could not run (offline, a server error, a non-2xx reply) is
+// not a pass. It used to count as one, so anything shared while moderation
+// was unreachable went up unchecked; now the post waits until it can be checked.
+async function runModeration(body) {
+  try {
+    const { data, error } = await supabase.functions.invoke('openai-proxy', { body })
+    if (error || typeof data?.allowed !== 'boolean') return { allowed: false, unchecked: true }
+    return { allowed: data.allowed, reason: data.reason ?? null }
+  } catch { return { allowed: false, unchecked: true } }
+}
+
 async function moderateProfilePicture(avatarUrl) {
   if (!avatarUrl) return { allowed: true }
-  try {
-    const { data } = await supabase.functions.invoke('openai-proxy', {
-      body: { action: 'moderate_profile_picture', avatarUrl },
-    })
-    return { allowed: data?.allowed !== false, reason: data?.reason ?? null }
-  } catch { return { allowed: true } }
+  return runModeration({ action: 'moderate_profile_picture', avatarUrl })
 }
 
-async function aiModerateTexts(texts, bio = '') {
-  try {
-    const { data } = await supabase.functions.invoke('openai-proxy', {
-      body: { action: 'moderate_texts', texts, bio },
-    })
-    return { allowed: data?.allowed !== false, reason: data?.reason ?? null }
-  } catch { return { allowed: true } }
+function aiModerateTexts(texts, bio = '') {
+  return runModeration({ action: 'moderate_texts', texts, bio })
 }
 
-async function aiModerationCheck(routineName, tasks, bio = '') {
-  try {
-    const { data } = await supabase.functions.invoke('openai-proxy', {
-      body: { action: 'moderate_routine', routineName, tasks, bio },
-    })
-    return { allowed: data?.allowed !== false, reason: data?.reason ?? null }
-  } catch { return { allowed: true } }
+function aiModerationCheck(routineName, tasks, bio = '') {
+  return runModeration({ action: 'moderate_routine', routineName, tasks, bio })
+}
+
+function moderationAlert(result, title, fallback = 'Please edit your content before sharing.') {
+  if (result.unchecked) {
+    Alert.alert("Couldn't check your post", "We couldn't check your post just now, so it wasn't shared. Please try again in a minute.")
+  } else {
+    Alert.alert(title, result.reason ?? fallback)
+  }
 }
 
 // ── Visibility toggle row ─────────────────────────────────────────────────────
@@ -334,9 +366,10 @@ function CardAuthorHeader({ item, theme, isOwn, onDelete, onReport, onBlock }) {
 // ── Routine card ──────────────────────────────────────────────────────────────
 
 function RoutineCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
-  const tasks = item.tasks ?? []
+  const tasks = objects(item.tasks)
+  const routineName = str(item.routine_name)
   const isOwn = item.user_id === currentUserId
-  const totalMins = tasks.reduce((sum, t) => sum + (Number(t.time) || 0), 0)
+  const totalMins = tasks.reduce((sum, t) => sum + num(t.time), 0)
   const durStr = fmtDur(totalMins)
 
   return (
@@ -345,7 +378,7 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
-          <Text style={ec.routinePillText}>{routineTheme(item.routine_name).emoji}  {item.routine_name}</Text>
+          <Text style={ec.routinePillText}>{routineTheme(routineName).emoji}  {routineName}</Text>
         </View>
         <View style={ec.routineMeta}>
           {durStr && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>⏱  {durStr}</Text>}
@@ -359,8 +392,8 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
       {tasks.length > 0 && (
         <View style={[ec.taskList, { borderTopColor: theme.divider }]}>
           {tasks.map((task, i) => {
-            const { emoji, name: displayName } = resolveTask(task)
-            const taskTime = fmtDur(Number(task.time) || 0)
+            const { emoji, name: displayName } = resolveTask({ name: str(task.name), emoji: str(task.emoji) })
+            const taskTime = fmtDur(num(task.time))
             const isLast = i === tasks.length - 1
             return (
               <View key={i} style={[ec.taskRow, !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.divider }]}>
@@ -384,10 +417,10 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
 
 function WorkoutCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   const isOwn = item.user_id === currentUserId
-  const c = item.content ?? {}
-  const exercises = c.exercises ?? []
-  const durStr = fmtDur(c.durationMins)
-  const unit = c.unit ?? ''
+  const c = isObj(item.content) ? item.content : {}
+  const exercises = objects(c.exercises)
+  const durStr = fmtDur(num(c.durationMins))
+  const unit = str(c.unit)
 
   return (
     <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
@@ -395,7 +428,7 @@ function WorkoutCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
-          <Text style={ec.routinePillText}>🏋️ {c.muscleGroup ?? 'Workout'}</Text>
+          <Text style={ec.routinePillText}>🏋️ {str(c.muscleGroup) || 'Workout'}</Text>
         </View>
         <View style={ec.routineMeta}>
           {durStr && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>⏱  {durStr}</Text>}
@@ -412,15 +445,19 @@ function WorkoutCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
         <View style={[ec.taskList, { borderTopColor: theme.divider }]}>
           {exercises.map((ex, i) => {
             const isLast = i === exercises.length - 1
-            const setStr = fmtExerciseSet(ex, unit)
+            const setStr = fmtExerciseSet({
+              inputType: ex.inputType,
+              sets: num(ex.sets), reps: num(ex.reps), time: num(ex.time), weight: num(ex.weight),
+            }, unit)
+            const gif = libraryGif(ex.gifUrl)
             return (
               <View key={i} style={[ec.taskRow, !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.divider }]}>
-                {ex.gifUrl ? (
-                  <Image source={{ uri: ex.gifUrl }} style={ec.exerciseThumb} contentFit="cover" />
+                {gif ? (
+                  <Image source={{ uri: gif }} style={ec.exerciseThumb} contentFit="cover" />
                 ) : (
                   <View style={[ec.taskBullet, { backgroundColor: '#6366f1' }]} />
                 )}
-                <Text style={[ec.taskName, { color: theme.text }]} numberOfLines={1}>{ex.name}</Text>
+                <Text style={[ec.taskName, { color: theme.text }]} numberOfLines={1}>{str(ex.name)}</Text>
                 {setStr && <Text style={[ec.taskTime, { color: theme.muted }]}>{setStr}</Text>}
               </View>
             )
@@ -437,9 +474,11 @@ function WorkoutCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
 
 function MealDayCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
   const isOwn = item.user_id === currentUserId
-  const c = item.content ?? {}
-  const totals = c.totals ?? {}
-  const sections = c.sections ?? []
+  const c = isObj(item.content) ? item.content : {}
+  const t = isObj(c.totals) ? c.totals : {}
+  const totals = { calories: num(t.calories), protein: num(t.protein), carbs: num(t.carbs), fat: num(t.fat) }
+  const sections = objects(c.sections).map(sec => ({ ...sec, items: objects(sec.items) }))
+  const date = str(c.date)
 
   return (
     <View style={[ec.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
@@ -450,8 +489,8 @@ function MealDayCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
           <Text style={ec.routinePillText}>🍽 Meal Day</Text>
         </View>
         <View style={ec.routineMeta}>
-          {c.date && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>📅 {fmtDate(c.date)}</Text>}
-          {c.date && totals.calories > 0 && <Text style={[ec.routineMetaDot, { color: theme.muted }]}>·</Text>}
+          {!!date && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>📅 {fmtDate(date)}</Text>}
+          {!!date && totals.calories > 0 && <Text style={[ec.routineMetaDot, { color: theme.muted }]}>·</Text>}
           {totals.calories > 0 && <Text style={[ec.routineMetaText, { color: theme.muted }]}>{Math.round(totals.calories)} kcal</Text>}
         </View>
       </View>
@@ -467,17 +506,17 @@ function MealDayCard({ item, currentUserId, theme, onDelete, onReport, onBlock }
       {sections.length > 0 && (
         <View style={[ec.taskList, { borderTopColor: theme.divider }]}>
           {sections.map((sec, si) => (
-            <View key={sec.key}>
+            <View key={si}>
               <View style={[ec.mealSectionHeader, si > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.divider }]}>
-                <Text style={[ec.mealSectionLabel, { color: theme.subtext }]}>{sec.emoji} {sec.label}</Text>
+                <Text style={[ec.mealSectionLabel, { color: theme.subtext }]}>{str(sec.emoji)} {str(sec.label)}</Text>
               </View>
               {sec.items.map((m, mi) => {
                 const isLast = si === sections.length - 1 && mi === sec.items.length - 1
                 return (
                   <View key={mi} style={[ec.taskRow, !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.divider }]}>
                     <View style={[ec.taskBullet, { backgroundColor: '#10b981' }]} />
-                    <Text style={[ec.taskName, { color: theme.text }]} numberOfLines={1}>{m.name}</Text>
-                    <Text style={[ec.taskTime, { color: theme.muted }]}>{Math.round(m.calories)} kcal</Text>
+                    <Text style={[ec.taskName, { color: theme.text }]} numberOfLines={1}>{str(m.name)}</Text>
+                    <Text style={[ec.taskTime, { color: theme.muted }]}>{Math.round(num(m.calories))} kcal</Text>
                   </View>
                 )
               })}
@@ -502,14 +541,22 @@ function MacroChip({ label, value, unit, color, theme }) {
 
 // ── Community card router ─────────────────────────────────────────────────────
 
+// Only the kinds of post this version knows how to draw. Anything else (a
+// deep-work session, a type from a newer version) used to fall through to the
+// routine card, which crashed on the routine name it doesn't have.
+const KNOWN_POST_TYPES = ['workout', 'meal_day']
+
 function CommunityCard({ item, currentUserId, theme, onDelete, onReport, onBlock }) {
+  if (item._table === 'shared_routines') {
+    return <RoutineCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
+  }
   if (item.post_type === 'workout') {
     return <WorkoutCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
   }
   if (item.post_type === 'meal_day') {
     return <MealDayCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
   }
-  return <RoutineCard item={item} currentUserId={currentUserId} theme={theme} onDelete={onDelete} onReport={onReport} onBlock={onBlock} />
+  return null
 }
 
 // ── Post modal ────────────────────────────────────────────────────────────────
@@ -531,13 +578,15 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
   const [goals, setGoals] = useState(null)
   const [showBio, setShowBio] = useState(true)
   const [showAvatar, setShowAvatar] = useState(true)
-  const [showAge, setShowAge] = useState(true)
-  const [showGender, setShowGender] = useState(true)
+  // Age and gender go on a post only when switched on for it. They used to
+  // start on every time this sheet opened.
+  const [showAge, setShowAge] = useState(false)
+  const [showGender, setShowGender] = useState(false)
 
   useEffect(() => {
     if (!visible || !userId) return
     setLocalBio(profile?.bio ?? '')
-    setShowBio(true); setShowAvatar(true); setShowAge(true); setShowGender(true)
+    setShowBio(true); setShowAvatar(true); setShowAge(false); setShowGender(false)
     setActiveTab('routine')
     setPosting(null)
     setLoadingContent(true)
@@ -575,7 +624,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
     if (profile?.avatar_url && showAvatar) {
       const avatarResult = await moderateProfilePicture(profile.avatar_url)
       if (!avatarResult.allowed) {
-        Alert.alert('Profile picture not allowed', avatarResult.reason ?? 'Your profile picture contains inappropriate content. Please update it in Settings before sharing.')
+        moderationAlert(avatarResult, 'Profile picture not allowed', 'Your profile picture contains inappropriate content. Please update it in Settings before sharing.')
         return null
       }
     }
@@ -605,7 +654,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
       const validationError = validateRoutineContent(name, tasks, trimmedBio)
       if (validationError) { Alert.alert('Cannot share this routine', validationError); return }
       const aiResult = await aiModerationCheck(name.trim(), tasks, trimmedBio)
-      if (!aiResult.allowed) { Alert.alert('Cannot share this routine', aiResult.reason ?? 'Please edit your content before sharing.'); return }
+      if (!aiResult.allowed) { moderationAlert(aiResult, 'Cannot share this routine'); return }
       const author = await getAuthorPayload()
       if (!author) return
       const { error } = await supabase.from('shared_routines').insert({ user_id: userId, ...author, routine_name: name.trim(), tasks })
@@ -627,7 +676,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
       const validationError = validateWorkoutContent(content.muscleGroup, content.exercises, trimmedBio)
       if (validationError) { Alert.alert('Cannot share this workout', validationError); return }
       const aiResult = await aiModerateTexts([content.muscleGroup, ...content.exercises.map(e => e.name)], trimmedBio)
-      if (!aiResult.allowed) { Alert.alert('Cannot share this workout', aiResult.reason ?? 'Please edit your content before sharing.'); return }
+      if (!aiResult.allowed) { moderationAlert(aiResult, 'Cannot share this workout'); return }
       const author = await getAuthorPayload()
       if (!author) return
       const { error } = await supabase.from('community_posts').insert({ user_id: userId, post_type: 'workout', ...author, content })
@@ -650,7 +699,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
       const validationError = validateMealContent(mealNames, trimmedBio)
       if (validationError) { Alert.alert('Cannot share this meal day', validationError); return }
       const aiResult = await aiModerateTexts(mealNames, trimmedBio)
-      if (!aiResult.allowed) { Alert.alert('Cannot share this meal day', aiResult.reason ?? 'Please edit your content before sharing.'); return }
+      if (!aiResult.allowed) { moderationAlert(aiResult, 'Cannot share this meal day'); return }
       const author = await getAuthorPayload()
       if (!author) return
       const { error } = await supabase.from('community_posts').insert({ user_id: userId, post_type: 'meal_day', ...author, content })
@@ -948,7 +997,9 @@ export default function ExploreScreen() {
       return
     }
     const routines = (routinesRes.data ?? []).map(r => ({ ...r, post_type: 'routine', _table: 'shared_routines' }))
-    const posts = (postsRes.data ?? []).map(p => ({ ...p, _table: 'community_posts' }))
+    const posts = (postsRes.data ?? [])
+      .filter(p => KNOWN_POST_TYPES.includes(p.post_type))
+      .map(p => ({ ...p, _table: 'community_posts' }))
     const merged = [...routines, ...posts].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     setBlockedIds(blocked)
     setFeed(merged)
@@ -977,6 +1028,8 @@ export default function ExploreScreen() {
     const result = await addFriendByCode(user.id, addCodeInput.trim())
     setAddingFriend(false)
     if (result.error === 'not_found') return Alert.alert('Not Found', 'No user found with that friend code. Double-check and try again.')
+    if (result.error === 'lookup_failed') return Alert.alert('Connection problem', "We couldn't look up that friend code. Check your connection and try again.")
+    if (result.error === 'accept_failed') return Alert.alert('Error', "They've already sent you a request, but we couldn't accept it. Please try again.")
     if (result.error === 'self') return Alert.alert('Oops', "That's your own friend code!")
     if (result.error === 'already_friends') return Alert.alert('Already Friends', "You're already friends with that user.")
     if (result.error === 'pending_sent') return Alert.alert('Already Sent', 'You already sent this person a friend request.')
@@ -1027,7 +1080,11 @@ export default function ExploreScreen() {
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Remove', style: 'destructive', onPress: async () => {
-          await supabase.from(item._table).delete().eq('id', item.id)
+          const { error } = await supabase.from(item._table).delete().eq('id', item.id)
+          if (error) {
+            Alert.alert('Error', 'Could not remove this post. Please try again.')
+            return
+          }
           fetchFeed()
         },
       },
@@ -1037,14 +1094,17 @@ export default function ExploreScreen() {
   function handleBlock(item) {
     if (!user?.id || item.user_id === user.id) return
     const handle = item.author_username ?? item.author_name ?? 'this user'
-    Alert.alert(`Block @${handle}?`, "You won't see their posts anymore, and they won't see yours.", [
+    Alert.alert(`Block @${handle}?`, "You won't see their posts anymore, and they won't see yours. If you're friends, that ends too.", [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Block', style: 'destructive', onPress: async () => {
           try {
+            // Also ends any friendship or request between you (see blockUser).
             await blockUser(user.id, item.user_id)
             setBlockedIds(prev => prev.includes(item.user_id) ? prev : [...prev, item.user_id])
             setFeed(prev => prev.filter(p => p.user_id !== item.user_id))
+            setFriends(prev => prev.filter(f => f.userId !== item.user_id))
+            setPendingRequests(prev => prev.filter(r => r.userId !== item.user_id))
             Alert.alert('Blocked', `You will no longer see posts from @${handle}.`)
           } catch {
             Alert.alert('Error', 'Could not block this user. Please try again.')
@@ -1064,6 +1124,7 @@ export default function ExploreScreen() {
               reporter_id: user.id, post_id: item.id, reported_user_id: item.user_id,
             })
             if (error?.code === '23505') Alert.alert('Already reported', 'You have already reported this post.')
+            else if (error?.code === '42501') Alert.alert('Report limit reached', REPORT_LIMIT_MSG)
             else if (error) Alert.alert('Error', 'Could not submit report. Please try again.')
             else Alert.alert('Report submitted', 'Thank you. Our team reviews every report within 24 hours and removes anything that breaks the rules.')
           },
@@ -1081,7 +1142,7 @@ export default function ExploreScreen() {
             reported_user_id: item.user_id,
           })
           if (error?.code === '23505') Alert.alert('Already reported', 'You have already reported this post.')
-          else if (error?.code === '42501') Alert.alert('Rate limit reached', 'You can only report 5 posts per hour. Please try again later.')
+          else if (error?.code === '42501') Alert.alert('Report limit reached', REPORT_LIMIT_MSG)
           else if (error) Alert.alert('Error', 'Could not submit report. Please try again.')
           else Alert.alert('Report submitted', 'Thank you. We will review this post.')
         },
@@ -1162,14 +1223,18 @@ export default function ExploreScreen() {
             contentContainerStyle={ec.listContent}
             showsVerticalScrollIndicator={false}
             renderItem={({ item }) => (
-              <CommunityCard
-                item={item}
-                currentUserId={user?.id}
-                theme={theme}
-                onDelete={handleDelete}
-                onReport={handleReport}
-                onBlock={handleBlock}
-              />
+              // A post that still manages to break hides itself instead of
+              // taking the feed, and the app, down with it.
+              <ErrorBoundary fallback={null}>
+                <CommunityCard
+                  item={item}
+                  currentUserId={user?.id}
+                  theme={theme}
+                  onDelete={handleDelete}
+                  onReport={handleReport}
+                  onBlock={handleBlock}
+                />
+              </ErrorBoundary>
             )}
             ListHeaderComponent={FeedHeader}
             ListFooterComponent={FeedFooter}

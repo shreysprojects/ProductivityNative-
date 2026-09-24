@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert, AppState } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, ScrollView, Modal, KeyboardAvoidingView, Platform, Alert, AppState, ActivityIndicator } from 'react-native'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import { Image } from 'expo-image'
 import * as Notifications from 'expo-notifications'
 import ReanimatedSwipeable from 'react-native-gesture-handler/ReanimatedSwipeable'
 import ExerciseVideo from '../components/ExerciseVideo'
-import { router, useLocalSearchParams } from 'expo-router'
+import { router, useLocalSearchParams, useNavigation } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
-import { getWorkoutPlan, getLastSetsByExercise, saveWorkoutLog, today } from '../lib/storage'
+import { loadWorkoutPlan, getLastSetsByExercise, saveWorkoutSession, sanitizeWorkoutExercises, today } from '../lib/storage'
 import { saveFitPhoto } from '../lib/photoStorage'
 
 const COLOR_DEFAULT = '#2b7fff'
@@ -27,6 +28,73 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 // One rest-over notification at a time: rescheduled on every rest, cancelled
 // on skip, finish, exit and unmount.
 const REST_NOTIF_ID = 'workout-rest-over'
+
+// Plans travel between accounts (friends copy each other's), so the numbers
+// this screen does sums with are bounded here as well as in storage: a sets
+// count of 1e8 hung the screen, and counts stored as text added up to "043 sets".
+function clampInt(v, lo, hi, fallback) {
+  const n = Math.round(Number(v))
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback
+}
+const setCount = ex => clampInt(ex?.sets, 1, 20, 3)
+const restSecs = ex => clampInt(ex?.restSeconds, 0, 900, 90)
+
+// Decimal-comma keyboards type "22,5", which parseFloat reads as 22.
+const toAmount = v => parseFloat(String(v ?? '').replace(',', '.')) || 0
+
+// A previous set's weight in today's unit: 135 lbs pre-fills a kg column as
+// 61.2, not 135.
+function prevWeight(prev, unit) {
+  const w = Number(prev?.weight) || 0
+  if (prev?.isTime) return w
+  if (prev?.unit === 'lbs' && unit === 'kg') return +(w * 0.453592).toFixed(1)
+  if (prev?.unit === 'kg' && unit === 'lbs') return +(w / 0.453592).toFixed(1)
+  return w
+}
+
+// An unfinished workout is kept on the phone as it goes, so one that iOS
+// kills in the background (Expo Go often is, while the phone is locked
+// between sets) can be picked up again later that day.
+const DRAFT_KEY = (userId, group) => `@workout_draft_${userId}_${group}`
+
+function clearDraft(userId, group) {
+  AsyncStorage.removeItem(DRAFT_KEY(userId, group)).catch(() => {})
+}
+
+// Today's draft for this workout, or null. Anything else found is dropped:
+// yesterday's session, or one whose rows no longer line up with its exercises.
+async function readDraft(userId, group) {
+  try {
+    const raw = await AsyncStorage.getItem(DRAFT_KEY(userId, group))
+    const d = raw ? JSON.parse(raw) : null
+    if (!d) return null
+    const exercises = sanitizeWorkoutExercises(d.exercises)
+    const rows = Array.isArray(d.rows) ? d.rows : []
+    const saved = Array.isArray(d.exercises) ? d.exercises.length : 0
+    if (d.date !== today() || !exercises.length || exercises.length !== saved || rows.length !== saved) {
+      clearDraft(userId, group)
+      return null
+    }
+    const flags = o => Object.fromEntries(exercises.map((_, i) => [i, !!o?.[i]]))
+    return {
+      exercises,
+      rows: rows.map(list => (Array.isArray(list) ? list : []).slice(0, 50).map(r => ({
+        id: typeof r?.id === 'string' ? r.id : uid(),
+        type: SET_TYPES[r?.type] ? r.type : 'normal',
+        weight: typeof r?.weight === 'string' ? r.weight : '',
+        reps: typeof r?.reps === 'string' ? r.reps : '',
+        done: !!r?.done,
+      }))),
+      skipped: flags(d.skipped),
+      timeModes: flags(d.timeModes),
+      startedAt: Number(d.startedAt) || Date.now(),
+      restEndsAt: Number(d.restEndsAt) > Date.now() ? Number(d.restEndsAt) : null,
+      restFor: typeof d.restFor === 'string' ? d.restFor : null,
+    }
+  } catch {
+    return null
+  }
+}
 
 function fmtElapsed(ms) {
   const s = Math.floor(ms / 1000)
@@ -58,6 +126,29 @@ function ElapsedTimer({ startedAt, styles: s }) {
   )
 }
 
+// The rest countdown ticks in its own component too, so each second
+// re-renders these few characters rather than every set on the page. Rest is
+// a deadline, not a counter: iOS pauses JS timers while the phone is locked,
+// so the seconds are re-derived from it on every tick, and again the moment
+// the app is active again. onDone(endsAt) fires once the deadline passes.
+function RestLeft({ endsAt, onDone, style }) {
+  const [now, setNow] = useState(Date.now)
+
+  useEffect(() => {
+    const tick = () => {
+      const t = Date.now()
+      setNow(t)
+      if (t >= endsAt) onDone(endsAt)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    const sub = AppState.addEventListener('change', state => { if (state === 'active') tick() })
+    return () => { clearInterval(id); sub.remove() }
+  }, [endsAt])
+
+  return <Text style={style}>{Math.max(0, Math.ceil((endsAt - now) / 1000))}s</Text>
+}
+
 // Labels for one exercise's rows: W / D for warm-ups and drop sets, a running
 // number for working sets.
 function setLabels(rows) {
@@ -73,6 +164,8 @@ function setLabels(rows) {
 export default function WorkoutRun() {
   const { muscleGroup } = useLocalSearchParams()
   const { user } = useAuth()
+  const userId = user?.id
+  const navigation = useNavigation()
   const { unit, theme } = useTheme()
   const COLOR = theme.accent
   const s = makeStyles(theme, COLOR)
@@ -80,18 +173,21 @@ export default function WorkoutRun() {
   const [exercises,    setExercises]    = useState([])
   const [prevData,     setPrevData]     = useState({})
   const [loadingPlan,  setLoadingPlan]  = useState(true)
+  const [loadError,    setLoadError]    = useState(null)      // why the plan couldn't be read; null = fine
   const [phase,        setPhase]        = useState('ready')   // ready | active | done
   // rows[exerciseIdx] = [{ id, type, weight, reps, done }]: every set of every
   // exercise, all on one page, editable in any order.
   const [rows,         setRows]         = useState([])
   const [skipped,      setSkipped]      = useState({})
-  // Rest is a wall-clock deadline, not a counter: the seconds shown are
-  // re-derived from it on every tick and again when the app comes back to
-  // the foreground, so time spent with the phone locked still counts.
+  // Rest is a wall-clock deadline (see RestLeft), so time spent with the
+  // phone locked still counts.
   const [restEndsAt,   setRestEndsAt]   = useState(null)      // ms timestamp; null = not resting
-  const [restLeft,     setRestLeft]     = useState(0)         // seconds shown; 0 = not resting
   const [restFor,      setRestFor]      = useState(null)
   const notifPermRef = useRef(null)     // null = not asked yet, then true/false
+  // The rest running now, for the notification code to check once its
+  // awaits are done: a rest skipped or replaced meanwhile gets no notification.
+  const restEndsRef = useRef(null)
+  const notifQueue = useRef(Promise.resolve())
   const [log,          setLog]          = useState([])
   const [settingsFor,  setSettingsFor]  = useState(null)      // exercise index whose rest is being edited
   const [editRest,     setEditRest]     = useState(90)
@@ -100,32 +196,79 @@ export default function WorkoutRun() {
   const [progressPhoto, setProgressPhoto] = useState(null)
 
   const startTimeRef = useRef(null)
+  // Loaded once per visit. Reloading on an auth event (the hourly token
+  // refresh) re-seeded every set from last time in the middle of a workout.
+  const loadStarted = useRef(false)
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
+  // Set once leaving has been decided, so the guard below lets it through.
+  const leavingRef = useRef(false)
+  const draftRef = useRef(null)
 
   useEffect(() => {
-    if (!user || !muscleGroup) return
+    if (!userId || !muscleGroup || loadStarted.current) return
+    loadStarted.current = true
+    readDraft(userId, muscleGroup).then(draft => {
+      if (!draft) { loadPlan(); return }
+      Alert.alert(
+        'Resume workout?',
+        "You started this workout earlier today and didn't finish it.",
+        [
+          { text: 'Start over', style: 'destructive', onPress: () => { clearDraft(userId, muscleGroup); loadPlan() } },
+          { text: 'Resume', onPress: () => resumeDraft(draft) },
+        ],
+      )
+    })
+  }, [userId, muscleGroup])
+
+  function loadPlan() {
+    setLoadError(null)
+    setLoadingPlan(true)
     Promise.all([
-      getWorkoutPlan(user.id, muscleGroup),
+      loadWorkoutPlan(userId, muscleGroup),
       // Last sets per exercise, from any workout; keyed by lowercase name.
-      getLastSetsByExercise(user.id),
+      getLastSetsByExercise(userId).catch(() => ({})),
     ]).then(([plan, prev]) => {
+      // Once a workout is under way, nothing re-seeds its sets.
+      if (phaseRef.current !== 'ready') return
       setPrevData(prev)
       setExercises(plan)
       // Every set starts filled in from last time, so a repeat of last
       // session is a row of ticks.
-      setRows(plan.map(ex => Array.from({ length: ex.sets ?? 3 }, (_, k) => makeRow(prevSets(prev, ex.name)[k]))))
+      setRows(plan.map(ex => Array.from({ length: setCount(ex) }, (_, k) => makeRow(prevSets(prev, ex.name)[k]))))
       const modes = {}
       plan.forEach((ex, i) => { modes[i] = ex.inputType === 'time' })
       setTimeModes(modes)
-      setLoadingPlan(false)
-    })
-  }, [user, muscleGroup])
+    }).catch(e => {
+      setLoadError(e?.message || 'Could not load this workout.')
+    }).finally(() => setLoadingPlan(false))
+  }
+
+  // Straight back into the session as it was left, rest countdown included.
+  function resumeDraft(d) {
+    setExercises(d.exercises)
+    setRows(d.rows)
+    setSkipped(d.skipped)
+    setTimeModes(d.timeModes)
+    startTimeRef.current = d.startedAt
+    if (d.restEndsAt) {
+      restEndsRef.current = d.restEndsAt
+      setRestEndsAt(d.restEndsAt)
+      setRestFor(d.restFor)
+    }
+    setPhase('active')
+    setLoadingPlan(false)
+    getLastSetsByExercise(userId).then(setPrevData).catch(() => {})
+  }
 
   function makeRow(prev) {
+    const weight = prevWeight(prev, unit)
+    const reps = parseInt(prev?.reps, 10) || 0
     return {
       id: uid(),
       type: SET_TYPES[prev?.type] ? prev.type : 'normal',
-      weight: prev && prev.weight ? String(prev.weight) : '',
-      reps: prev && prev.reps ? String(prev.reps) : '',
+      weight: weight ? String(weight) : '',
+      reps: reps ? String(reps) : '',
       done: false,
     }
   }
@@ -133,47 +276,91 @@ export default function WorkoutRun() {
   const prevSets = (map, name) => map[String(name ?? '').trim().toLowerCase()] ?? []
 
   // Leaving mid-workout throws the session away unless it is finished first.
-  function confirmExit() {
+  // `action` is the navigation that was held up to ask, when it wasn't the
+  // Exit button (the Android back button, say).
+  function confirmExit(action) {
     Alert.alert(
       'Exit workout?',
       'Sets from this session are only saved when you finish.',
       [
         { text: 'Keep going', style: 'cancel' },
-        { text: 'Exit without saving', style: 'destructive', onPress: () => { stopRest(); router.back() } },
+        { text: 'Exit without saving', style: 'destructive', onPress: () => leave(action) },
         { text: 'Finish & save', onPress: requestFinish },
       ],
     )
   }
 
-  // Rest countdown. iOS pauses JS timers in the background, so a counter
-  // would freeze while the phone is locked; deriving from the deadline on
-  // every tick, and once more the moment the app is active again, means the
-  // rest keeps counting however the phone was used in between.
+  function leave(action) {
+    stopRest()
+    draftRef.current = null
+    clearDraft(userId, muscleGroup)
+    leavingRef.current = true
+    if (action) navigation.dispatch(action)
+    else router.back()
+  }
+
+  // The listener below is set up once per phase, so it reaches the latest
+  // confirmExit (and the sets a "Finish & save" would save) through a ref.
+  const confirmExitRef = useRef(confirmExit)
+  confirmExitRef.current = confirmExit
+
+  // Mid-workout, a stray swipe from the screen edge must not end the session.
+  // The gesture is off while active (iOS would complete it natively, before
+  // anything could ask), and every other way out asks first, like "← Exit".
   useEffect(() => {
-    if (!restEndsAt) { setRestLeft(0); return }
-    const tick = () => {
-      const left = Math.max(0, Math.ceil((restEndsAt - Date.now()) / 1000))
-      setRestLeft(left)
-      if (left <= 0) setRestEndsAt(null)
+    navigation.setOptions({ gestureEnabled: phase !== 'active' })
+    if (phase !== 'active') return
+    return navigation.addListener('beforeRemove', e => {
+      if (leavingRef.current) return
+      e.preventDefault()
+      confirmExitRef.current(e.data.action)
+    })
+  }, [navigation, phase])
+
+  // The session is written to the phone a moment after each change, and at
+  // once when the app leaves the foreground, since that is when iOS kills it.
+  function writeDraft() {
+    if (!draftRef.current) return
+    AsyncStorage.setItem(DRAFT_KEY(userId, muscleGroup), JSON.stringify(draftRef.current)).catch(() => {})
+  }
+
+  useEffect(() => {
+    if (phase !== 'active' || !userId) { draftRef.current = null; return }
+    draftRef.current = {
+      date: today(), muscleGroup, startedAt: startTimeRef.current,
+      exercises, rows, skipped, timeModes, restEndsAt, restFor,
     }
-    tick()
-    const id = setInterval(tick, 1000)
-    const sub = AppState.addEventListener('change', state => { if (state === 'active') tick() })
-    return () => { clearInterval(id); sub.remove() }
-  }, [restEndsAt])
+    const t = setTimeout(writeDraft, 1000)
+    return () => clearTimeout(t)
+  }, [phase, exercises, rows, skipped, timeModes, restEndsAt])
+
+  useEffect(() => {
+    if (phase !== 'active') return
+    const sub = AppState.addEventListener('change', state => { if (state !== 'active') writeDraft() })
+    return () => sub.remove()
+  }, [phase])
+
+  // Scheduling is async and can wait on the permission prompt, so the
+  // notification calls run one after another, in the order rests start and
+  // stop.
+  function queueNotif(fn) {
+    notifQueue.current = notifQueue.current.then(fn).catch(() => {})
+  }
 
   // A locked phone cannot show the countdown, so the end of the rest is a
-  // local notification scheduled for the deadline. Permission is asked once
+  // local notification set for the deadline itself. Permission is asked once
   // per session; without it the countdown still works, just silently.
-  async function scheduleRestNotification(seconds, exerciseName) {
-    try {
+  function scheduleRestNotification(endsAt, exerciseName) {
+    queueNotif(async () => {
       if (notifPermRef.current === null) {
         const perm = await Notifications.requestPermissionsAsync()
         const S = Notifications.IosAuthorizationStatus
         notifPermRef.current = perm.granted ||
           [S.AUTHORIZED, S.PROVISIONAL, S.EPHEMERAL].includes(perm.ios?.status)
       }
-      if (!notifPermRef.current) return
+      // Answering the prompt takes time. A rest that has ended or been
+      // replaced meanwhile, or is about to end anyway, gets nothing.
+      if (!notifPermRef.current || restEndsRef.current !== endsAt || endsAt - Date.now() < 1000) return
       await Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID).catch(() => {})
       await Notifications.scheduleNotificationAsync({
         identifier: REST_NOTIF_ID,
@@ -182,34 +369,42 @@ export default function WorkoutRun() {
           body: exerciseName ? `Back to ${exerciseName}.` : 'Time for the next set.',
           sound: true,
         },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-          seconds: Math.max(1, Math.round(seconds)),
-        },
+        trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: endsAt },
       })
-    } catch {}
+      // Skipped while that was being scheduled: take it back.
+      if (restEndsRef.current !== endsAt) await Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID)
+    })
   }
 
   function cancelRestNotification() {
-    Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID).catch(() => {})
+    queueNotif(() => Notifications.cancelScheduledNotificationAsync(REST_NOTIF_ID))
   }
 
   function startRest(seconds, exerciseName) {
     const secs = Math.max(0, Math.round(seconds))
-    setRestEndsAt(Date.now() + secs * 1000)
-    setRestLeft(secs)   // shown at once; the effect keeps it current from here
+    if (secs === 0) { stopRest(); return }
+    const endsAt = Date.now() + secs * 1000
+    restEndsRef.current = endsAt
+    setRestEndsAt(endsAt)
     setRestFor(exerciseName)
-    scheduleRestNotification(secs, exerciseName)
+    scheduleRestNotification(endsAt, exerciseName)
   }
 
   function stopRest() {
+    restEndsRef.current = null
     setRestEndsAt(null)
-    setRestLeft(0)
     cancelRestNotification()
   }
 
+  // The countdown reached zero. The notification is left to fire.
+  function endRest(at) {
+    if (restEndsRef.current !== at) return
+    restEndsRef.current = null
+    setRestEndsAt(null)
+  }
+
   // Leaving the screen any other way must not leave a stray "Rest over".
-  useEffect(() => () => { cancelRestNotification() }, [])
+  useEffect(() => () => { restEndsRef.current = null; cancelRestNotification() }, [])
 
   function startWorkout() {
     startTimeRef.current = Date.now()
@@ -229,7 +424,7 @@ export default function WorkoutRun() {
     if (!row) return
     const nowDone = !row.done
     updateRow(exIdx, rowId, { done: nowDone })
-    if (nowDone) startRest(exercises[exIdx]?.restSeconds ?? 90, exercises[exIdx]?.name ?? null)
+    if (nowDone) startRest(restSecs(exercises[exIdx]), exercises[exIdx]?.name ?? null)
   }
 
   function skipRest() { stopRest() }
@@ -266,7 +461,7 @@ export default function WorkoutRun() {
   }
 
   function openSettings(exIdx) {
-    setEditRest(exercises[exIdx]?.restSeconds ?? 90)
+    setEditRest(restSecs(exercises[exIdx]))
     setSettingsFor(exIdx)
   }
 
@@ -277,47 +472,59 @@ export default function WorkoutRun() {
 
   // ── Finish ────────────────────────────────────────────────────────────────
 
-  // Every set with a weight or reps is saved, ticked or not, so it shows as
-  // "previous" next time; the tick is recorded with it.
+  // Only ticked sets are saved. Every set starts filled in from last time,
+  // so a weight in the box is no sign the set was done; a skipped exercise
+  // saves none, and one with nothing ticked is logged as skipped.
   function buildLog() {
     return exercises.map((ex, i) => {
       const isTime = timeModes[i] ?? false
+      const sets = skipped[i] ? [] : (rows[i] ?? [])
+        .filter(r => r.done)
+        .map(r => {
+          const amount = toAmount(r.weight)
+          return { reps: parseInt(r.reps, 10) || 0, weight: amount, time: isTime ? amount : 0, unit, isTime, type: r.type, done: true }
+        })
       return {
         exerciseId: ex.id,
         name: ex.name,
         inputType: ex.inputType ?? 'reps',
         gifUrl: ex.gifUrl ?? null,
-        skipped: !!skipped[i],
-        sets: (rows[i] ?? [])
-          .filter(r => r.done || (parseFloat(r.weight) || 0) > 0 || (parseInt(r.reps, 10) || 0) > 0)
-          .map(r => {
-            const amount = parseFloat(r.weight) || 0
-            return { reps: parseInt(r.reps, 10) || 0, weight: amount, time: isTime ? amount : 0, unit, isTime, type: r.type, done: !!r.done }
-          }),
+        skipped: sets.length === 0,
+        sets,
       }
     })
   }
 
   function requestFinish() {
     const pending = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i] ?? []).filter(r => !r.done).length), 0)
+    const skippedCount = exercises.filter((_, i) => skipped[i]).length
     const go = () => { const finalLog = buildLog(); setLog(finalLog); finishWorkout(finalLog) }
-    if (pending === 0) { go(); return }
+    if (pending === 0 && skippedCount === 0) { go(); return }
+    const notes = []
+    if (pending > 0) notes.push(`${pending} set${pending === 1 ? ' is' : 's are'} not ticked off and won't be saved.`)
+    if (skippedCount > 0) notes.push(`${skippedCount} exercise${skippedCount === 1 ? ' is' : 's are'} skipped.`)
     Alert.alert(
       'Finish workout?',
-      `${pending} set${pending === 1 ? ' is' : 's are'} not ticked off. Sets with a weight or reps are saved either way.`,
+      notes.join(' '),
       [{ text: 'Keep going', style: 'cancel' }, { text: 'Finish', onPress: go }],
     )
   }
 
   async function finishWorkout(finalLog) {
     stopRest()
+    draftRef.current = null
     setPhase('done')
-    if (user) {
-      await saveWorkoutLog(user.id, today(), {
-        date: today(), muscleGroup,
+    if (userId) {
+      const date = today()
+      // One session of the day: another workout already finished today is
+      // kept alongside this one instead of being overwritten by it.
+      await saveWorkoutSession(userId, date, {
+        date, muscleGroup,
         startedAt: startTimeRef.current, completedAt: Date.now(),
         exercises: finalLog,
       })
+      // Only once it is saved: until then the draft can still bring it back.
+      clearDraft(userId, muscleGroup)
     }
     Alert.alert(
       '📸 Progress photo?',
@@ -347,7 +554,38 @@ export default function WorkoutRun() {
   }
 
   // ── Loading ──────────────────────────────────────────────────────────────
-  if (loadingPlan) return <View style={s.page} />
+  if (loadingPlan) {
+    return (
+      <View style={s.page}>
+        <View style={s.readyContent}>
+          <Pressable onPress={() => router.back()} style={s.back}>
+            <Text style={s.backText}>← Exit</Text>
+          </Pressable>
+          <ActivityIndicator color={COLOR} style={{ marginTop: 40 }} />
+        </View>
+      </View>
+    )
+  }
+
+  // ── Couldn't load ────────────────────────────────────────────────────────
+  // Not "No exercises planned": the plan may well be there.
+  if (loadError) {
+    return (
+      <View style={s.page}>
+        <View style={s.emptyWrap}>
+          <Text style={s.emptyEmoji}>⚠️</Text>
+          <Text style={s.emptyTitle}>Couldn't load this workout</Text>
+          <Text style={s.emptySub}>{loadError}</Text>
+          <Pressable style={s.emptyBtn} onPress={loadPlan}>
+            <Text style={s.emptyBtnText}>Retry</Text>
+          </Pressable>
+          <Pressable style={s.emptyBack} onPress={() => router.back()} hitSlop={8}>
+            <Text style={s.backText}>← Go Back</Text>
+          </Pressable>
+        </View>
+      </View>
+    )
+  }
 
   // ── Empty plan ───────────────────────────────────────────────────────────
   if (!loadingPlan && exercises.length === 0) {
@@ -367,7 +605,7 @@ export default function WorkoutRun() {
 
   // ── Ready ────────────────────────────────────────────────────────────────
   if (phase === 'ready') {
-    const totalSets = exercises.reduce((sum, ex) => sum + (ex.sets ?? 3), 0)
+    const totalSets = exercises.reduce((sum, ex) => sum + setCount(ex), 0)
     return (
       <View style={s.page}>
         <ScrollView contentContainerStyle={s.readyContent} showsVerticalScrollIndicator={false}>
@@ -383,13 +621,13 @@ export default function WorkoutRun() {
           <Text style={s.readyMeta}>{exercises.length} exercise{exercises.length !== 1 ? 's' : ''}  ·  {totalSets} sets</Text>
 
           {exercises.map((ex, i) => (
-            <View key={ex.id} style={s.readyItem}>
+            <View key={`${i}-${ex.id}`} style={s.readyItem}>
               <View style={s.readyNum}>
                 <Text style={s.readyNumText}>{i + 1}</Text>
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={s.readyItemName}>{ex.name}</Text>
-                <Text style={s.readyItemMeta}>{ex.sets ?? 3} sets</Text>
+                <Text style={s.readyItemMeta}>{setCount(ex)} sets</Text>
               </View>
               {ex.gifUrl ? (
                 <Image source={{ uri: ex.gifUrl }} style={s.readyThumb} contentFit="cover" autoplay={false} />
@@ -409,10 +647,8 @@ export default function WorkoutRun() {
 
   // ── Done ─────────────────────────────────────────────────────────────────
   if (phase === 'done') {
-    const totalDone = log.reduce((sum, e) => {
-      const real = (e.sets ?? []).filter(st => st.reps > 0 || st.weight > 0)
-      return sum + (real.length > 0 ? real.length : (e.sets ?? []).length)
-    }, 0)
+    // The log holds ticked sets only, so every set in it counts as done.
+    const totalDone = log.reduce((sum, e) => sum + (e.sets ?? []).length, 0)
     const typeMark = st => (st.type === 'warmup' ? 'W ' : st.type === 'drop' ? 'D ' : '')
     return (
       <View style={s.page}>
@@ -423,28 +659,26 @@ export default function WorkoutRun() {
             <Text style={s.doneSub}>{muscleGroup.replace(/\+/g, ' · ')}  ·  {totalDone} sets done</Text>
           )}
           {log.map((entry, i) => {
-            const allSets = entry.sets ?? []
-            const realSets = allSets.filter(st => st.reps > 0 || st.weight > 0)
-            const effectivelySkipped = entry.skipped ? realSets.length === 0 : allSets.length === 0
-            const displaySets = realSets.length > 0 ? realSets : allSets
+            const doneSets = entry.sets ?? []
+            const notDone = doneSets.length === 0
             return (
-              <View key={entry.exerciseId} style={s.doneSummary}>
-                <View style={[s.doneIcon, effectivelySkipped && s.doneIconSkipped]}>
-                  <Text style={s.doneIconText}>{effectivelySkipped ? '–' : '✓'}</Text>
+              <View key={`${i}-${entry.exerciseId}`} style={s.doneSummary}>
+                <View style={[s.doneIcon, notDone && s.doneIconSkipped]}>
+                  <Text style={s.doneIconText}>{notDone ? '–' : '✓'}</Text>
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={s.doneSummaryName}>{entry.name}</Text>
-                  {effectivelySkipped ? (
+                  {notDone ? (
                     <Text style={s.doneSummaryMeta}>Skipped</Text>
-                  ) : displaySets.length > 0 ? (
+                  ) : (
                     <Text style={s.doneSummaryMeta}>
-                      {displaySets.map(st =>
+                      {doneSets.map(st =>
                         typeMark(st) + ((timeModes[i] ?? false)
                           ? `${st.weight}s`
                           : st.weight > 0 ? `${st.weight}${unit}×${st.reps}` : String(st.reps))
                       ).join('  ')}
                     </Text>
-                  ) : null}
+                  )}
                 </View>
               </View>
             )
@@ -477,7 +711,7 @@ export default function WorkoutRun() {
   const totalRows = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i]?.length ?? 0)), 0)
   const doneRows  = exercises.reduce((n, _, i) => (skipped[i] ? n : n + (rows[i] ?? []).filter(r => r.done).length), 0)
   const pct       = totalRows ? Math.round((doneRows / totalRows) * 100) : 0
-  const isResting = restLeft > 0
+  const isResting = restEndsAt != null
 
   return (
     <KeyboardAvoidingView style={s.page} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -485,14 +719,14 @@ export default function WorkoutRun() {
 
         {/* Top row: exit | timer or rest | sets done */}
         <View style={s.topRow}>
-          <Pressable style={s.topSide} onPress={confirmExit}>
+          <Pressable style={s.topSide} onPress={() => confirmExit()}>
             <Text style={s.backText}>← Exit</Text>
           </Pressable>
 
           {isResting ? (
             <Pressable style={s.restPill} onPress={skipRest}>
               <Text style={s.restPillLabel}>REST</Text>
-              <Text style={s.restPillTime}>{restLeft}s</Text>
+              <RestLeft endsAt={restEndsAt} onDone={endRest} style={s.restPillTime} />
               <Text style={s.restPillSkip}>· Skip →</Text>
             </Pressable>
           ) : (
@@ -513,7 +747,7 @@ export default function WorkoutRun() {
           <View style={s.restBanner}>
             <View style={s.restDot} />
             <Text style={s.restBannerText} numberOfLines={1}>
-              Resting{restFor ? ` after ${restFor}` : ''} · {restLeft}s
+              Resting{restFor ? ` after ${restFor}` : ''} · <RestLeft endsAt={restEndsAt} onDone={endRest} />
             </Text>
             <Pressable onPress={skipRest} hitSlop={8}>
               <Text style={s.restBannerSkip}>Skip</Text>
@@ -521,7 +755,7 @@ export default function WorkoutRun() {
           </View>
         )}
 
-        <Text style={s.hint}>Tick a set when it's done. Tap a set number for warm-up or drop set. Swipe a set left to remove it.</Text>
+        <Text style={s.hint}>Tick a set when it's done; only ticked sets are saved. Tap a set number for warm-up or drop set. Swipe a set left to remove it.</Text>
 
         {exercises.map((ex, i) => {
           const exRows = rows[i] ?? []
@@ -530,7 +764,7 @@ export default function WorkoutRun() {
           const isSkipped = !!skipped[i]
           const exDone = exRows.length > 0 && exRows.every(r => r.done)
           return (
-            <View key={ex.id} style={[s.exBlock, exDone && !isSkipped && s.exBlockDone, isSkipped && s.exBlockSkipped]}>
+            <View key={`${i}-${ex.id}`} style={[s.exBlock, exDone && !isSkipped && s.exBlockDone, isSkipped && s.exBlockSkipped]}>
               {/* Header: thumbnail (tap for the demo), name, rest, actions */}
               <View style={s.exHead}>
                 <Pressable onPress={() => setMediaOpen(m => ({ ...m, [i]: !m[i] }))} hitSlop={4}>
@@ -543,7 +777,7 @@ export default function WorkoutRun() {
                 <View style={{ flex: 1 }}>
                   <Text style={s.exBlockName} numberOfLines={2}>{i + 1}. {ex.name}</Text>
                   <Text style={s.exBlockMeta}>
-                    {ex.category ? `${ex.category} · ` : ''}rest {ex.restSeconds ?? 90}s
+                    {ex.category ? `${ex.category} · ` : ''}rest {restSecs(ex)}s
                     {isSkipped ? ' · skipped' : ''}
                   </Text>
                 </View>
@@ -603,7 +837,7 @@ export default function WorkoutRun() {
                           <View style={[s.prevCell, { width: COL.prev }]}>
                             <Text style={s.prevText} numberOfLines={1}>
                               {prev
-                                ? isTimed ? `${prev.weight}s` : `${prev.weight}×${prev.reps}`
+                                ? isTimed ? `${Number(prev.weight) || 0}s` : `${prevWeight(prev, unit)}×${Number(prev.reps) || 0}`
                                 : '—'}
                             </Text>
                           </View>
@@ -672,7 +906,7 @@ export default function WorkoutRun() {
                 <Text style={s.modalStepText}>−</Text>
               </Pressable>
               <Text style={s.modalStepValue}>{editRest}s</Text>
-              <Pressable style={s.modalStepBtn} onPress={() => setEditRest(n => n + 15)}>
+              <Pressable style={s.modalStepBtn} onPress={() => setEditRest(n => Math.min(900, n + 15))}>
                 <Text style={s.modalStepText}>+</Text>
               </Pressable>
             </View>
@@ -699,6 +933,7 @@ function makeStyles(theme, COLOR = COLOR_DEFAULT) { return StyleSheet.create({
   emptySub: { fontSize: 14, color: theme.subtext, textAlign: 'center', lineHeight: 20, marginBottom: 24 },
   emptyBtn: { backgroundColor: COLOR, borderRadius: 14, paddingHorizontal: 24, paddingVertical: 12 },
   emptyBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  emptyBack: { marginTop: 18 },
 
   // Ready
   readyContent: { padding: 20, paddingTop: 56, paddingBottom: 40 },

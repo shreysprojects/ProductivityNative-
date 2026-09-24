@@ -77,12 +77,17 @@ function motivationalMsg(step, total) {
   return 'Last one! 🎯'
 }
 
-export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinish, onGoBack, onToggleSubTask, onJumpTo, onAdjustStart, onSkip }) {
+// `busy` is true while a move to another task is still being saved; the
+// buttons that move the run wait for it, so a double tap can't move it twice.
+export default function RunRoutine({ run, color = '#2b7fff', busy = false, onStepDone, onFinish, onGoBack, onToggleSubTask, onJumpTo, onAdjustStart, onSkip }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const { currentStep, steps } = run
   const step    = steps[currentStep]
-  const isLast  = currentStep === steps.length - 1
+  // Finish once no other task is still open. Tasks can be done out of order
+  // (skipped, checked off in the checklist, gone back to), so the last task
+  // on the list isn't necessarily the last one left.
+  const isLast  = steps.every((t, i) => i === currentStep || !!t.completedAt)
   const [photoViewer, setPhotoViewer] = useState(null)
   const [adjustVisible, setAdjustVisible] = useState(false)
   const [timeText, setTimeText] = useState('')
@@ -115,11 +120,16 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
     Animated.spring(btnScale, { toValue: 1, useNativeDriver: true, speed: 15, bounciness: 12 }).start()
   }
 
-  const pct      = Math.round((currentStep / steps.length) * 100)
+  // Progress counts tasks actually done, not the position in the list.
+  const doneCount = steps.filter(t => t.completedAt).length
+  const pct      = Math.round((doneCount / steps.length) * 100)
   const goalSecs = step.timeGoalSecs ?? (step.timeGoalMins ?? 0) * 60
   const hasSubs  = step.subTasks?.length > 0
   const subDone  = step.subTasks?.filter(st => st.done).length ?? 0
-  const upcoming = steps.slice(currentStep + 1, currentStep + 4)
+  const upcoming = steps
+    .map((t, i) => ({ t, i }))
+    .filter(({ t, i }) => i > currentStep && !t.completedAt)
+    .slice(0, 3)
   const imageUnlocked = stepImageUnlocked(steps, currentStep)
   // Any task the user moved past with unchecked sub-steps
   const skippedBefore = steps.slice(0, currentStep).some(t => t.subTasks?.some(st => !st.done))
@@ -143,7 +153,9 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Finish anyway', style: 'destructive', onPress: () => onFinish(ms) },
-        { text: 'Go back', onPress: () => onJumpTo(unfinished[0].i) },
+        // Already on that task: closing the alert is all "go back" means,
+        // and its timer must keep running.
+        { text: 'Go back', onPress: () => { if (unfinished[0].i !== currentStep) onJumpTo(unfinished[0].i) } },
       ]
     )
   }
@@ -168,19 +180,19 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
 
       {/* ── Progress dots ─────────────────────────────────────── */}
       <View style={s.dotsRow}>
-        {steps.map((_, i) => (
+        {steps.map((t, i) => (
           <View key={i} style={[
             s.dot,
-            i < currentStep  && [s.dotDone, { backgroundColor: color }],
+            i !== currentStep && !!t.completedAt && [s.dotDone, { backgroundColor: color }],
             i === currentStep && [s.dotCurrent, { backgroundColor: color }],
-            i > currentStep  && s.dotFuture,
+            i !== currentStep && !t.completedAt && s.dotFuture,
           ]} />
         ))}
       </View>
 
       {/* ── Motivational + pct ────────────────────────────────── */}
       <View style={s.topRow}>
-        <Text style={[s.motivational, { color }]}>{motivationalMsg(currentStep, steps.length)}</Text>
+        <Text style={[s.motivational, { color }]}>{motivationalMsg(doneCount, steps.length)}</Text>
         <Text style={[s.pctLabel, { color }]}>{pct}%</Text>
       </View>
 
@@ -261,10 +273,10 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
       {/* ── Upcoming pills ───────────────────────────────────── */}
       {upcoming.length > 0 && (
         <View style={s.upcomingRow}>
-          {upcoming.map((t, i) => (
+          {upcoming.map(({ t, i }) => (
             <View key={t.id} style={[s.upcomingPill, { backgroundColor: color + '10', borderColor: color + '28' }]}>
               <View style={[s.upcomingNum, { backgroundColor: color + '22' }]}>
-                <Text style={[s.upcomingNumText, { color }]}>{currentStep + i + 2}</Text>
+                <Text style={[s.upcomingNumText, { color }]}>{i + 1}</Text>
               </View>
               <Text style={[s.upcomingText, { color: color + 'cc' }]} numberOfLines={1}>{t.text}</Text>
             </View>
@@ -275,9 +287,10 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
       {/* ── Action button ────────────────────────────────────── */}
       <Animated.View style={{ transform: [{ scale: btnScale }] }}>
         <Pressable
-          style={[s.btn, { backgroundColor: isLast ? '#10b981' : color }]}
+          style={[s.btn, { backgroundColor: isLast ? '#10b981' : color }, busy && { opacity: 0.6 }]}
           onPressIn={pressIn}
           onPressOut={pressOut}
+          disabled={busy}
           onPress={() => isLast ? handleFinishPress(elapsedRef.current * 1000) : onStepDone(elapsedRef.current * 1000)}
         >
           <Text style={s.btnText}>
@@ -286,16 +299,17 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
         </Pressable>
       </Animated.View>
 
-      {/* ── Skip for later: the task joins today's do-later list ── */}
-      {onSkip && (
-        <Pressable style={s.backBtn} onPress={() => onSkip(elapsedRef.current * 1000)} hitSlop={6}>
+      {/* ── Skip for later: the task joins today's do-later list.
+           A task that's already done has nothing left to skip. ── */}
+      {onSkip && !step.completedAt && (
+        <Pressable style={s.backBtn} onPress={() => onSkip(elapsedRef.current * 1000)} hitSlop={6} disabled={busy}>
           <Text style={[s.backBtnText, { color: '#f59e0b' }]}>Skip, do later  ⏭</Text>
         </Pressable>
       )}
 
       {/* ── Go back ──────────────────────────────────────────── */}
       {currentStep > 0 && (
-        <Pressable style={s.backBtn} onPress={() => onGoBack?.()}>
+        <Pressable style={s.backBtn} onPress={() => onGoBack?.()} disabled={busy}>
           <Text style={[s.backBtnText, { color: color + 'aa' }]}>← Previous Task</Text>
           {skippedBefore && (
             <Text style={s.skippedNote}>(SOME STEPS ARE SKIPPED)</Text>

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react'
-import { View, Text, Pressable, TextInput, StyleSheet, Alert } from 'react-native'
+import {
+  View, Text, Pressable, TextInput, StyleSheet, Alert, AppState, Keyboard, InputAccessoryView, Platform,
+} from 'react-native'
 import { useFocusEffect, useNavigation } from 'expo-router'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { useAuth } from '../../lib/AuthContext'
@@ -140,8 +142,10 @@ function scaleMacros(base, mult) {
   return out
 }
 
+const clampPortion = p => Math.min(PORTION_MAX, Math.max(PORTION_MIN, Math.round(p * 100) / 100))
+
 function applyPortion(meal, portion) {
-  const p = Math.min(PORTION_MAX, Math.max(PORTION_MIN, Math.round(portion * 100) / 100))
+  const p = clampPortion(portion)
   const base = meal.baseMacros ?? meal.macros ?? {}
   return { ...meal, baseMacros: base, portion: p, macros: scaleMacros(base, p) }
 }
@@ -154,6 +158,9 @@ function fmtPortion(p) {
 }
 
 const PORTION_CHIPS = [0.5, 1, 1.5, 2, 3]
+
+// iOS number pads have no return key, so the portion box gets a Done bar.
+const PORTION_DONE_ID = 'mealPortionDone'
 
 function localDateStr(d) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
@@ -427,10 +434,14 @@ function MealCard({ meal, color, expanded, onToggle, onLongPress, dragging, onDe
   const [portionText, setPortionText] = useState(String(portion))
   useEffect(() => { setPortionText(String(portion)) }, [portion])
   const setPortion = p => { if (onPortion) onPortion(meal, p) }
+  // A decimal comma counts ("1,5" on a French keyboard). 0 or an unreadable
+  // amount is refused, anything else is clamped, and either way the box ends
+  // up showing the portion actually applied.
   const commitPortionText = () => {
-    const n = parseFloat(portionText)
-    if (Number.isFinite(n) && n > 0) setPortion(n)
-    else setPortionText(String(portion))
+    const n = parseFloat(portionText.replace(',', '.'))
+    const p = Number.isFinite(n) && n > 0 ? clampPortion(n) : portion
+    setPortionText(String(p))
+    if (p !== portion) setPortion(p)
   }
   const cal    = meal.macros?.calories || 0
   const prot   = meal.macros?.protein  || 0
@@ -491,6 +502,7 @@ function MealCard({ meal, color, expanded, onToggle, onLongPress, dragging, onDe
                   onSubmitEditing={commitPortionText}
                   keyboardType="decimal-pad"
                   returnKeyType="done"
+                  inputAccessoryViewID={PORTION_DONE_ID}
                   selectTextOnFocus
                 />
                 <Pressable style={s.portionStep} onPress={() => setPortion(portion + 0.25)} hitSlop={6}>
@@ -498,6 +510,17 @@ function MealCard({ meal, color, expanded, onToggle, onLongPress, dragging, onDe
                 </Pressable>
                 <Text style={s.portionLabel}>× what was logged</Text>
               </View>
+              {/* After the input it serves: iOS attaches the bar to the input
+                  it finds in place when the bar mounts. */}
+              {Platform.OS === 'ios' && (
+                <InputAccessoryView nativeID={PORTION_DONE_ID} backgroundColor={theme.header}>
+                  <View style={s.doneBar}>
+                    <Pressable onPress={() => Keyboard.dismiss()} hitSlop={10}>
+                      <Text style={[s.doneBarText, { color: theme.accent }]}>Done</Text>
+                    </Pressable>
+                  </View>
+                </InputAccessoryView>
+              )}
               <View style={s.portionChips}>
                 {PORTION_CHIPS.map(p => (
                   <Pressable
@@ -646,9 +669,19 @@ function DayList({
       contentContainerStyle={s.content}
       containerStyle={{ flex: 1 }}
       keyboardShouldPersistTaps="handled"
+      // Lifts an open card's portion box above the keyboard (iOS).
+      automaticallyAdjustKeyboardInsets
       showsVerticalScrollIndicator={false}
     />
   )
+}
+
+// A saved-meal or snack write that failed: say so, then fail the picker's
+// call too, so it keeps the form (and its photos) instead of moving on as if
+// the save had landed.
+const failWith = title => e => {
+  Alert.alert(title, e?.message ?? 'Please try again.')
+  throw e
 }
 
 // The add-a-meal flows, shared by the Log and Plan tabs: pick how to add,
@@ -674,8 +707,8 @@ function AddMealFlows({ flow, section, userId, onFlow, onAdd, onClose }) {
         loadSaved={() => getSavedMeals(userId)}
         loadHistory={() => getRecentMealHistory(userId)}
         onIngredientPicked={item => recordMealHistory(userId, item)}
-        onSaveTemplate={meal => upsertSavedMeal(userId, meal).catch(e => Alert.alert('Could not save meal', e.message))}
-        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(e => Alert.alert('Could not delete meal', e.message))}
+        onSaveTemplate={meal => upsertSavedMeal(userId, meal).catch(failWith('Could not save meal'))}
+        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(failWith('Could not delete meal'))}
         onAdd={add}
       />
     )
@@ -687,8 +720,8 @@ function AddMealFlows({ flow, section, userId, onFlow, onAdd, onClose }) {
         userId={userId}
         loadSaved={() => getSavedMeals(userId)}
         loadHistory={() => getRecentMealHistory(userId)}
-        onSaveTemplate={snack => upsertSavedMeal(userId, snack).catch(e => Alert.alert('Could not save snack', e.message))}
-        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(e => Alert.alert('Could not delete snack', e.message))}
+        onSaveTemplate={snack => upsertSavedMeal(userId, snack).catch(failWith('Could not save snack'))}
+        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(failWith('Could not delete snack'))}
         onAdd={add}
       />
     )
@@ -697,43 +730,97 @@ function AddMealFlows({ flow, section, userId, onFlow, onAdd, onClose }) {
   return null
 }
 
+// Today's date, kept current: the page can stay open past midnight, and a
+// date worked out once kept logging to yesterday. Checked again at each
+// local midnight and whenever the app comes back to the foreground.
+function useToday() {
+  const [day, setDay] = useState(today)
+  useEffect(() => {
+    let timer
+    const check = () => setDay(today())
+    const schedule = () => {
+      const now = new Date()
+      const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+      // A second past midnight, so the new date has surely begun.
+      timer = setTimeout(() => { check(); schedule() }, midnight - now + 1000)
+    }
+    schedule()
+    const sub = AppState.addEventListener('change', state => { if (state === 'active') check() })
+    return () => { clearTimeout(timer); sub.remove() }
+  }, [])
+  return day
+}
+
 // ── Log tab: what was eaten ────────────────────────────────────────────────
 
 function LogPane({ user }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
+  const userId = user?.id
+  const todayStr = useToday()
   const [meals, setMeals] = useState([])
   const [goals, setGoals] = useState(null)
   const [addingTo, setAddingTo] = useState(null)
   const [flow, setFlow] = useState(null)  // 'picker'|'barcode'|'ai'|'history'|'saved'|'snacks'|'manual'
   const [expandedId, setExpandedId] = useState(null)
-  const [selectedDate, setSelectedDate] = useState(today())
+  const [selectedDate, setSelectedDate] = useState(todayStr)
   const [weekOffset, setWeekOffset] = useState(0)
   const [loadError, setLoadError] = useState(false)
-  // Which date the meals on screen actually belong to — a failed load for a
-  // day we've already shown keeps the stale list instead of an error page.
-  const loadedDateRef = useRef(null)
+  // Which date the meals on screen actually belong to (null while a newly
+  // picked day loads). A failed refresh of a day already shown keeps the
+  // stale list instead of an error page, and until the list matches the
+  // selected day it can't be edited: the previous day's cards would save
+  // themselves into the new one.
+  const [loadedDate, setLoadedDate] = useState(null)
+  const dayReady = loadedDate === selectedDate
+  // The selected day, for loads and failed writes that finish after the
+  // user has moved on to another one.
+  const selectedRef = useRef(selectedDate)
+
+  const selectDate = date => {
+    if (date === selectedRef.current) return
+    selectedRef.current = date
+    setSelectedDate(date)
+    setMeals([])
+    setLoadedDate(null)
+    setLoadError(false)
+  }
 
   // getMeals() treats a failed fetch and an empty day identically, so the row
   // is queried directly here: a network failure must not render as
   // "Nothing logged yet".
-  const load = useCallback(async () => {
-    if (!user) return
+  const load = useCallback(async (date) => {
+    if (!userId) return
     const [mealsRes, goalData] = await Promise.all([
-      supabase.from('meals').select('meals').eq('user_id', user.id).eq('date', selectedDate).maybeSingle(),
-      getUserGoals(user.id),
+      supabase.from('meals').select('meals').eq('user_id', userId).eq('date', date).maybeSingle(),
+      getUserGoals(userId),
     ])
+    // Another day was picked while this one loaded. Its meals must not land
+    // in that day's list, where the next drag would save them there.
+    if (date !== selectedRef.current) return
     if (mealsRes.error) {
-      if (loadedDateRef.current !== selectedDate) setLoadError(true)
+      setLoadError(true)
       return
     }
     setMeals(mealsRes.data?.meals ?? [])
     setGoals(goalData)
     setLoadError(false)
-    loadedDateRef.current = selectedDate
-  }, [user, selectedDate])
+    setLoadedDate(date)
+  }, [userId])
 
-  useFocusEffect(useCallback(() => { load() }, [load]))
+  useFocusEffect(useCallback(() => { load(selectedDate) }, [load, selectedDate]))
+
+  // Past midnight, a selection left on the old today moves on to the new one
+  // (and the strip back to this week), so "+ Add" logs to the right day.
+  const lastTodayRef = useRef(todayStr)
+  useEffect(() => {
+    const was = lastTodayRef.current
+    lastTodayRef.current = todayStr
+    if (was !== todayStr && selectedRef.current === was) {
+      setWeekOffset(0)
+      selectDate(todayStr)
+    }
+  }, [todayStr])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const totals = useMemo(() => sumMacros(meals), [meals])
   const activeSection = SECTIONS.find(sec => sec.key === addingTo)
@@ -744,10 +831,9 @@ function LogPane({ user }) {
   function handleWeekChange(newOffset) {
     if (newOffset > 0) return
     setWeekOffset(newOffset)
-    const todayStr = localDateStr(new Date())
     const days = getWeekDays(newOffset)
     const available = days.filter(d => localDateStr(d) <= todayStr)
-    if (available.length > 0) setSelectedDate(localDateStr(available[available.length - 1]))
+    if (available.length > 0) selectDate(localDateStr(available[available.length - 1]))
   }
 
   const handleMealAdded = async (meal) => {
@@ -761,11 +847,11 @@ function LogPane({ user }) {
       return [...prev, full]
     })
     try {
-      await saveMeal(user.id, date, full)
+      await saveMeal(userId, date, full)
     } catch (e) {
       // …and revert to server truth if the write actually failed.
       Alert.alert('Could not save meal', 'Please check your connection and try again.')
-      if (date === selectedDate) load()
+      if (date === selectedRef.current) load(date)
     }
   }
 
@@ -776,44 +862,47 @@ function LogPane({ user }) {
     <View style={s.pane}>
       <WeekNav
         selectedDate={selectedDate}
-        onSelect={setSelectedDate}
+        onSelect={selectDate}
         weekOffset={weekOffset}
         onWeekChange={handleWeekChange}
       />
-      {loadError ? (
+      {loadError && !dayReady ? (
         <View style={s.errorWrap}>
           <Text style={s.errorTitle}>We couldn't load this day</Text>
           <Text style={s.errorSub}>Check your connection and try again.</Text>
-          <Pressable style={s.errorBtn} onPress={load}>
+          <Pressable style={s.errorBtn} onPress={() => load(selectedDate)}>
             <Text style={s.errorBtnText}>Retry</Text>
           </Pressable>
         </View>
       ) : (
       <DayList
         meals={meals}
-        canEdit={!isViewOnly}
-        canDrag={!isViewOnly}
-        emptyText="Nothing logged yet"
+        canEdit={!isViewOnly && dayReady}
+        canDrag={!isViewOnly && dayReady}
+        emptyText={dayReady ? 'Nothing logged yet' : 'Loading…'}
         header={<DailySummary totals={totals} goals={goals} selectedDate={selectedDate} />}
         onAdd={openAdd}
         onDelete={async id => {
           const date = selectedDate
           setMeals(prev => prev.filter(m => m.id !== id))
           try {
-            await deleteMeal(user.id, date, id)
+            await deleteMeal(userId, date, id)
           } catch (e) {
             Alert.alert('Could not delete meal', 'Please try again.')
-            if (date === selectedDate) load()
+            if (date === selectedRef.current) load(date)
           }
         }}
         onReorder={async next => {
+          // A drag that ends after the day changed under it holds the old
+          // day's meals; saving them would replace the new day's.
+          if (!dayReady) return
           const date = selectedDate
           setMeals(next)
           try {
-            await saveDayMeals(user.id, date, next)
+            await saveDayMeals(userId, date, next)
           } catch (e) {
             Alert.alert('Could not move meal', 'Please check your connection and try again.')
-            if (date === selectedDate) load()
+            if (date === selectedRef.current) load(date)
           }
         }}
         onPortion={async (meal, portion) => {
@@ -821,10 +910,10 @@ function LogPane({ user }) {
           const updated = applyPortion(meal, portion)
           setMeals(prev => prev.map(m => (m.id === updated.id ? updated : m)))
           try {
-            await saveMeal(user.id, date, updated)
+            await saveMeal(userId, date, updated)
           } catch (e) {
             Alert.alert('Could not change the portion', 'Please check your connection and try again.')
-            if (date === selectedDate) load()
+            if (date === selectedRef.current) load(date)
           }
         }}
         expandedId={expandedId}
@@ -835,7 +924,7 @@ function LogPane({ user }) {
       <AddMealFlows
         flow={flow}
         section={activeSection}
-        userId={user.id}
+        userId={userId}
         onFlow={setFlow}
         onAdd={handleMealAdded}
         onClose={closeAll}
@@ -849,7 +938,7 @@ function LogPane({ user }) {
 function PlanPane({ user }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
-  const todayStr = today()
+  const todayStr = useToday()
   const todayKey = dayKeyOf(todayStr)
   const [dayKey, setDayKey] = useState(todayKey)
   const [plan, setPlan] = useState(null)      // { days, notes }
@@ -864,6 +953,15 @@ function PlanPane({ user }) {
   // Whether a plan has been shown at all, so a failed refresh keeps it
   // instead of swapping in an error page.
   const loadedRef = useRef(false)
+
+  // Past midnight, a plan left on today's weekday moves on with it, so
+  // "Log this meal" stays on the day that can actually be logged.
+  const lastTodayKeyRef = useRef(todayKey)
+  useEffect(() => {
+    const was = lastTodayKeyRef.current
+    lastTodayKeyRef.current = todayKey
+    if (was !== todayKey && dayKey === was) { setDayKey(todayKey); setExpandedId(null) }
+  }, [todayKey])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const load = useCallback(async () => {
     if (!user) return
@@ -961,12 +1059,20 @@ function PlanPane({ user }) {
     source: derivedSource(meal),
   })
 
+  // One log at a time: a second tap while the first is saving logged the
+  // meal twice.
+  const loggingRef = useRef(false)
+
   async function logPlannedMeal(meal) {
+    if (loggingRef.current) return
+    loggingRef.current = true
     try {
       await saveMeal(user.id, todayStr, toLogged(meal))
       Alert.alert('Logged', `${meal.name} is on today's log.`)
     } catch {
       Alert.alert('Could not log meal', 'Please check your connection and try again.')
+    } finally {
+      loggingRef.current = false
     }
   }
 
@@ -978,11 +1084,15 @@ function PlanPane({ user }) {
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Log them', onPress: async () => {
+          if (loggingRef.current) return
+          loggingRef.current = true
           try {
             for (const meal of list) await saveMeal(user.id, todayStr, toLogged(meal))
             Alert.alert('Logged', 'Your planned meals are on the Log tab.')
           } catch {
             Alert.alert('Could not log everything', 'Some meals may not have been saved. Check the Log tab.')
+          } finally {
+            loggingRef.current = false
           }
         }},
       ],
@@ -1383,6 +1493,11 @@ function makeStyles(theme) { return StyleSheet.create({
   portionChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
   portionChip: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: theme.divider, backgroundColor: theme.card },
   portionChipText: { fontSize: 12.5, fontWeight: '700', color: theme.subtext },
+  doneBar: {
+    flexDirection: 'row', justifyContent: 'flex-end', paddingHorizontal: 18, paddingVertical: 10,
+    borderTopWidth: 1, borderTopColor: theme.divider,
+  },
+  doneBarText: { fontSize: 16, fontWeight: '700' },
   mealCalBox: { alignItems: 'center', minWidth: 44 },
   mealCalNum: { fontSize: 22, fontWeight: '800', lineHeight: 26 },
   mealCalUnit: { fontSize: 10, color: theme.muted, fontWeight: '700' },

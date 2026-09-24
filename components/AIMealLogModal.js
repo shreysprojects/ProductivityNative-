@@ -21,7 +21,10 @@ export default function AIMealLogModal({ section, sectionLabel, sectionColor, on
   return (
     <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
       <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+        {/* On iOS the scroll views below make room for the keyboard
+            themselves: they measure on screen, where this view's padding
+            came up short inside a page sheet. */}
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? undefined : 'height'} style={{ flex: 1 }}>
 
           <View style={d.header}>
             <Pressable onPress={onClose} hitSlop={10}>
@@ -32,7 +35,7 @@ export default function AIMealLogModal({ section, sectionLabel, sectionColor, on
           </View>
 
           {step === 'form' ? (
-            <ScrollView contentContainerStyle={d.scroll} keyboardShouldPersistTaps="handled">
+            <ScrollView contentContainerStyle={d.scroll} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
               <View style={[d.intro, { borderColor: sectionColor + '40', backgroundColor: sectionColor + '0d' }]}>
                 <Text style={d.introIcon}>✨</Text>
                 <Text style={d.introText}>

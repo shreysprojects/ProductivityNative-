@@ -1,17 +1,19 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image, ActivityIndicator, Animated } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import * as ImagePicker from 'expo-image-picker'
 import {
   uploadRoutinePhoto, deleteStepImage, countRoutinePhotos, MAX_ROUTINE_PHOTOS,
 } from '../lib/photoStorage'
-import { router, useLocalSearchParams } from 'expo-router'
+import { collectPhotoUris, isRemotePhoto } from '../lib/photoPaths'
+import { router, useLocalSearchParams, useNavigation } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
 import {
-  getRoutineTemplate, saveRoutineTemplate, markSetupDone,
-  addRoutine, getRoutineNames, getRoutineSettings, saveRoutineSettings,
-  renameRoutine, shiftRoutinesAfter, RESERVED_ROUTINES, altRoutineName,
+  loadRoutineTemplate, saveRoutineTemplate, markSetupDone,
+  addRoutine, getRoutineNames, loadRoutineNames, validateRoutineName,
+  getRoutineSettings, saveRoutineSettings,
+  renameRoutine, RESERVED_ROUTINES, altRoutineName,
   getRoutineGroupMap, saveRoutineGroupMap, getTodayRun,
   getRoutineTemplates, getHiddenDefaults,
 } from '../lib/storage'
@@ -239,30 +241,53 @@ export default function SetupRoutine() {
   const emojiDrag = useSheetDrag(() => { setShowEmojiPicker(false); setEmojiTargetId(null) }, { visible: showEmojiPicker })
   const copyDrag = useSheetDrag(() => { if (!copying) setCopyTask(null) }, { visible: !!copyTask })
 
+  // Nothing can be added or saved until the routine has loaded: a save from
+  // the empty placeholder list would replace the real one.
+  const [loaded, setLoaded] = useState(false)
+  // Set before Save's first await, so a double tap can't start a second save.
+  const savingRef = useRef(false)
+  // Photos. Nothing is deleted while editing: the photos the saved routine
+  // used (savedPhotosRef) and this visit's uploads (uploadsRef) are sorted
+  // out once a save lands, or on leaving without one — so backing out never
+  // leaves the saved routine pointing at a deleted picture.
+  const savedPhotosRef = useRef([])
+  const uploadsRef = useRef(new Set())
+  // Minutes each task added here asked the later routines to move by (see
+  // maybeShiftLater); applied on save, for the tasks still in the list.
+  const shiftForTaskRef = useRef({})
+
   // Whenever routines have no day/time schedule.
   const isWhenever = isNew ? newGroup === 'whenever' : routineGroup === 'whenever'
 
   useEffect(() => {
-    if (!user) return
+    if (!user?.id) return
     // A brand new routine starts blank; only first-time setup seeds from Morning.
     if (isNew) {
       setTasks([])
       setDescription('')
+      setLoaded(true)
       return
     }
     const target = routineName || 'Morning'
-    getRoutineTemplate(user.id, isAltVariant ? altRoutineName(target) : target).then(template =>
-      setTasks(template.map(t => ({ ...t, subTasks: t.subTasks || [], timeGoalSecs: t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60 })))
-    )
-    if (!isFirstTime) {
-      getRoutineSettings(user.id, target).then(settings => {
+    Promise.all([
+      // The strict read: offline on a device that never cached this routine
+      // it fails (and the editor stays disabled) instead of showing the
+      // stock tasks, which Save would then write over the real routine.
+      loadRoutineTemplate(user.id, isAltVariant ? altRoutineName(target) : target),
+      isFirstTime ? null : getRoutineSettings(user.id, target),
+    ]).then(([template, settings]) => {
+      const loadedTasks = template.map(t => ({ ...t, subTasks: t.subTasks || [], timeGoalSecs: t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60 }))
+      savedPhotosRef.current = collectPhotoUris(loadedTasks)
+      setTasks(loadedTasks)
+      if (settings) {
         setActiveDays(settings.activeDays)
         setStartTimeMinutes(settings.startTimeMinutes)
         setPerDayMode(settings.perDayMode)
         setDayTimes(settings.dayTimes)
         setDescription(settings.description ?? '')
-      })
-    }
+      }
+      setLoaded(true)
+    }).catch(() => Alert.alert('Could not load this routine', 'Go back and try again.'))
     if (routineName) {
       getRoutineGroupMap(user.id).then(m => setRoutineGroup(m[routineName] ?? 'everyday'))
     }
@@ -270,7 +295,84 @@ export default function SetupRoutine() {
     getTodayRun(user.id, isAltVariant ? altRoutineName(target) : target)
       .then(run => setRunInProgress(!!run && !run.finished))
       .catch(() => {})
-  }, [user, routineName, isFirstTime, isNew])
+  }, [user?.id, routineName, isFirstTime, isNew])
+
+  // ── Unsaved changes ────────────────────────────────────────────────────────
+  // Everything Save writes, compared with how it looked once loaded.
+  const draft = JSON.stringify([tasks, description, activeDays, startTimeMinutes, perDayMode, dayTimes, editName, customName, newGroup])
+  const loadedDraftRef = useRef(null)
+  useEffect(() => {
+    if (loaded && loadedDraftRef.current === null) loadedDraftRef.current = draft
+  }, [loaded])   // eslint-disable-line react-hooks/exhaustive-deps
+  const dirty = loadedDraftRef.current !== null && draft !== loadedDraftRef.current
+  const dirtyRef = useRef(false)
+  dirtyRef.current = dirty
+  // Set once leaving is settled (saved, or discarded on purpose) so the guard
+  // below lets the screen go.
+  const leavingRef = useRef(false)
+
+  const navigation = useNavigation()
+
+  // Leaving with unsaved changes (← Back, Android back, anything else that
+  // removes the screen) asks first. The iOS swipe-back can't be stopped once
+  // it has started, so it's switched off while there's something to lose.
+  useEffect(() => {
+    return navigation.addListener('beforeRemove', e => {
+      if (leavingRef.current) return
+      if (!dirtyRef.current) {
+        // Nothing to lose. (A save of an unchanged routine may still be
+        // finishing; it sees the screen has gone and doesn't navigate.)
+        leavingRef.current = true
+        releaseUploads()
+        return
+      }
+      e.preventDefault()
+      // Mid-save the screen stays; the save decides where to go.
+      if (savingRef.current) return
+      Alert.alert('Discard changes?', 'You have unsaved changes to this routine.', [
+        { text: 'Keep editing', style: 'cancel' },
+        {
+          text: 'Discard', style: 'destructive',
+          onPress: () => {
+            leavingRef.current = true
+            releaseUploads()
+            navigation.dispatch(e.data.action)
+          },
+        },
+      ])
+    })
+  }, [navigation])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    navigation.setOptions({ gestureEnabled: !dirty })
+  }, [navigation, dirty])
+
+  // Leaving without saving: this visit's uploads were never saved anywhere.
+  function releaseUploads() {
+    for (const uri of uploadsRef.current) {
+      if (!savedPhotosRef.current.includes(uri)) deleteStepImage(uri)
+    }
+    uploadsRef.current.clear()
+  }
+
+  // After a save lands: every photo the routine used or this visit uploaded
+  // that the saved tasks no longer show is freed — unless the other version
+  // of the routine (main or alternative, which "copy from main" can leave
+  // sharing a photo) still shows it.
+  async function releaseUnusedPhotos(savedTasks, otherVersion) {
+    const keep = new Set(collectPhotoUris(savedTasks))
+    if (otherVersion) {
+      // If the other version can't be read, nothing is deleted: a photo it
+      // shares would break. Truly unused ones are freed later by the slot
+      // sweep in photoStorage.
+      let other
+      try { other = await loadRoutineTemplate(user.id, otherVersion) } catch { return }
+      collectPhotoUris(other).forEach(uri => keep.add(uri))
+    }
+    for (const uri of new Set([...savedPhotosRef.current, ...uploadsRef.current])) {
+      if (!keep.has(uri)) deleteStepImage(uri)
+    }
+  }
 
   // How many of the account's photo slots are in use. The cap is enforced in
   // the database; this is what lets the button say so before the user picks.
@@ -284,12 +386,20 @@ export default function SetupRoutine() {
   useEffect(refreshPhotoCount, [user])
 
   const photoLimitReached = photoCount !== null && photoCount >= MAX_ROUTINE_PHOTOS
+  // A photo taken off here keeps its slot until the change is saved.
+  const inUsePhotos = new Set(collectPhotoUris(tasks))
+  const slotsFreedOnSave = [...savedPhotosRef.current, ...uploadsRef.current]
+    .some(uri => isRemotePhoto(uri) && !inUsePhotos.has(uri))
 
   // Label for the add-photo control, which doubles as the place the user finds
   // out how many slots are left.
   function addPhotoLabel(what) {
     if (uploadingPhoto) return 'Uploading…'
-    if (photoLimitReached) return `📷  ${MAX_ROUTINE_PHOTOS}/${MAX_ROUTINE_PHOTOS} photos used — remove one first`
+    if (photoLimitReached) {
+      return slotsFreedOnSave
+        ? `📷  ${MAX_ROUTINE_PHOTOS}/${MAX_ROUTINE_PHOTOS} photos used — save to free the ones you removed`
+        : `📷  ${MAX_ROUTINE_PHOTOS}/${MAX_ROUTINE_PHOTOS} photos used — remove one first`
+    }
     const used = photoCount === null ? '' : `  (${photoCount}/${MAX_ROUTINE_PHOTOS})`
     return `📷  Add photo${what}${used}`
   }
@@ -297,12 +407,13 @@ export default function SetupRoutine() {
   const totalGoalSecs = tasks.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
 
   function addTask() {
-    if (!text.trim()) return
+    if (!loaded || !text.trim()) return
     const mins = parseInt(goalMins, 10) || 0
     const secs = Math.min(parseInt(goalSecs, 10) || 0, 59)
     const totalSecs = mins * 60 + secs
+    const id = Date.now()
     setTasks(prev => [...prev, {
-      id: Date.now(), text: text.trim(), subTasks: [],
+      id, text: text.trim(), subTasks: [],
       timeGoalSecs: totalSecs,
       ...(taskEmoji ? { emoji: taskEmoji } : {}),
     }])
@@ -316,29 +427,44 @@ export default function SetupRoutine() {
     // the day, so neither shifts the schedule).
     const shiftMin = Math.round(totalSecs / 60)
     if (shiftMin >= 1 && !isNew && !isFirstTime && routineName && !isAltVariant && !isWhenever) {
-      maybeShiftLater(shiftMin)
+      maybeShiftLater(id, shiftMin)
     }
   }
 
-  function maybeShiftLater(shiftMin) {
+  // The shift waits for Save, like every other change here, and is tied to
+  // the task: remove the task before saving and the shift goes with it.
+  function maybeShiftLater(taskId, shiftMin) {
     Alert.alert(
       'Shift later routines?',
-      `This task adds ${shiftMin} min. Push every routine after “${routineName}” later by ${shiftMin} min so they don't overlap?`,
+      `This task adds ${shiftMin} min. When you save, push the routines that start after “${routineName}” later by ${shiftMin} min so they don't overlap?`,
       [
         { text: 'No', style: 'cancel' },
         {
           text: `Shift by ${shiftMin}m`,
-          onPress: async () => {
-            try {
-              const n = await shiftRoutinesAfter(user.id, routineName, shiftMin)
-              if (!n) Alert.alert('Nothing to shift', 'There are no routines after this one.')
-            } catch (e) {
-              Alert.alert('Could not shift', e.message)
-            }
-          },
+          onPress: () => { shiftForTaskRef.current[taskId] = shiftMin },
         },
       ],
     )
+  }
+
+  // Push the routines that start after this one — by the clock, not by list
+  // order — `delta` minutes later. Whenever and hidden routines have no slot
+  // in the day, so they stay put.
+  async function shiftLaterRoutines(name, from, delta) {
+    const [names, groupMap, hidden] = await Promise.all([
+      loadRoutineNames(user.id), getRoutineGroupMap(user.id), getHiddenDefaults(user.id),
+    ])
+    const wrap = v => (((v + delta) % 1440) + 1440) % 1440
+    for (const n of names) {
+      if (n === name || hidden.includes(n) || (groupMap[n] ?? 'everyday') !== 'everyday') continue
+      const prev = await getRoutineSettings(user.id, n)
+      if (prev.startTimeMinutes <= from) continue
+      await saveRoutineSettings(user.id, n, {
+        ...prev,
+        startTimeMinutes: wrap(prev.startTimeMinutes),
+        dayTimes: (prev.dayTimes ?? []).map(wrap),
+      })
+    }
   }
 
   function openEmojiPicker(targetId) {
@@ -367,14 +493,9 @@ export default function SetupRoutine() {
     setEmojiTargetId(null)
   }
 
+  // The task's photos (and its steps') are freed on save, not here.
   function removeTask(id) {
-    setTasks(prev => {
-      const gone = prev.find(t => t.id === id)
-      if (gone?.image) deleteStepImage(gone.image)
-      // The task's steps go with it, so their photos do too.
-      gone?.subTasks?.forEach(st => { if (st.image) deleteStepImage(st.image) })
-      return prev.filter(t => t.id !== id)
-    })
+    setTasks(prev => prev.filter(t => t.id !== id))
     setExpandedIds(prev => { const n = new Set(prev); n.delete(id); return n })
   }
 
@@ -421,7 +542,9 @@ export default function SetupRoutine() {
         subTasks: (copyTask.subTasks ?? []).map((st, i) => ({ id: stamp + 1 + i, text: st.text })),
         ...(copyTask.emoji ? { emoji: copyTask.emoji } : {}),
       }
-      const existing = await getRoutineTemplate(user.id, target.key)
+      // Strict: appending to a template that couldn't be read would save the
+      // stock tasks plus this copy over the real routine.
+      const existing = await loadRoutineTemplate(user.id, target.key)
       await saveRoutineTemplate(user.id, target.key, [...existing, copy])
       setCopyTask(null)
       Alert.alert('Copied', `“${copy.text}” is now the last task in ${target.label}.`)
@@ -432,19 +555,16 @@ export default function SetupRoutine() {
     }
   }
 
-  // Shared by task photos and step photos: ask for permission, let the user
-  // pick, and upload it. Returns the stored URL, or null if the user backed out
-  // or it could not be saved — in which case the reason has been shown already.
+  // Shared by task photos and step photos: let the user pick, and upload it.
+  // (The system picker needs no photo library permission.) Returns the stored
+  // URL, or null if the user backed out or it could not be saved — in which
+  // case the reason has been shown already.
   async function pickAndStoreImage() {
     if (!user?.id) {
       Alert.alert('Not signed in', 'Sign in to add photos to your routine.')
       return null
     }
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Photo library access is required.')
-      return null
-    }
+    if (savingRef.current) return null
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
       quality: 0.6,
@@ -454,7 +574,14 @@ export default function SetupRoutine() {
 
     setUploadingPhoto(true)
     try {
-      return await uploadRoutinePhoto(user.id, uri)
+      const stored = await uploadRoutinePhoto(user.id, uri)
+      // The screen was left while it uploaded: nothing will ever use it.
+      if (leavingRef.current) {
+        deleteStepImage(stored)
+        return null
+      }
+      uploadsRef.current.add(stored)
+      return stored
     } catch (err) {
       Alert.alert('Could not add photo', err?.message ?? 'Please try again.')
       return null
@@ -463,24 +590,17 @@ export default function SetupRoutine() {
     }
   }
 
+  // Replacing or removing a photo only changes the task; the old photo is
+  // freed on save (see releaseUnusedPhotos).
   async function pickTaskImage(taskId) {
     const stored = await pickAndStoreImage()
     if (!stored) return
-    setTasks(prev => prev.map(t => {
-      if (t.id !== taskId) return t
-      if (t.image) deleteStepImage(t.image)
-      return { ...t, image: stored }
-    }))
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, image: stored } : t))
     refreshPhotoCount()
   }
 
   function removeTaskImage(taskId) {
-    setTasks(prev => prev.map(t => {
-      if (t.id !== taskId) return t
-      if (t.image) deleteStepImage(t.image)
-      return { ...t, image: null }
-    }))
-    refreshPhotoCount()
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, image: null } : t))
   }
 
   // Each step inside a task carries its own photo, independent of the task's.
@@ -494,19 +614,12 @@ export default function SetupRoutine() {
   async function pickSubTaskImage(taskId, subId) {
     const stored = await pickAndStoreImage()
     if (!stored) return
-    mapSubTask(taskId, subId, st => {
-      if (st.image) deleteStepImage(st.image)
-      return { ...st, image: stored }
-    })
+    mapSubTask(taskId, subId, st => ({ ...st, image: stored }))
     refreshPhotoCount()
   }
 
   function removeSubTaskImage(taskId, subId) {
-    mapSubTask(taskId, subId, st => {
-      if (st.image) deleteStepImage(st.image)
-      return { ...st, image: null }
-    })
-    refreshPhotoCount()
+    mapSubTask(taskId, subId, st => ({ ...st, image: null }))
   }
 
   const subKey = (taskId, subId) => `${taskId}:${subId}`
@@ -552,12 +665,9 @@ export default function SetupRoutine() {
   }
 
   function removeSubTask(taskId, subId) {
-    setTasks(prev => prev.map(t => {
-      if (t.id !== taskId) return t
-      const gone = t.subTasks.find(st => st.id === subId)
-      if (gone?.image) deleteStepImage(gone.image)
-      return { ...t, subTasks: t.subTasks.filter(st => st.id !== subId) }
-    }))
+    setTasks(prev => prev.map(t =>
+      t.id !== taskId ? t : { ...t, subTasks: t.subTasks.filter(st => st.id !== subId) }
+    ))
     setExpandedSubKeys(prev => { const n = new Set(prev); n.delete(subKey(taskId, subId)); return n })
   }
 
@@ -585,51 +695,83 @@ export default function SetupRoutine() {
   }
 
   async function save() {
-    if (isNew && !customName.trim()) return Alert.alert('Enter a routine name')
-    if (canRename && !editName.trim()) return Alert.alert('Enter a routine name')
-    if (tasks.length === 0) return Alert.alert('Add at least one task')
+    if (savingRef.current || !loaded || uploadingPhoto) return
 
     const renaming = canRename && editName.trim() !== routineName
     const finalName = isNew ? customName.trim() : canRename ? editName.trim() : (routineName || 'Morning')
-
-    if (isNew) {
-      const existing = await getRoutineNames(user.id)
-      if (existing.includes(finalName)) return Alert.alert('A routine with that name already exists')
+    // A new or changed name meets the one naming rule. The parts that need
+    // no network (blank, too long, characters the app can't route, reserved
+    // words) are checked first.
+    const naming = isNew || renaming
+    if (naming) {
+      const invalid = validateRoutineName(finalName)
+      if (invalid) return Alert.alert(invalid)
     }
+    if (tasks.length === 0) return Alert.alert('Add at least one task')
 
+    savingRef.current = true
     setSaving(true)
     try {
+      if (naming) {
+        // Duplicates against a fresh read of the list: offline this refuses,
+        // where checking against a guess could save over an existing routine.
+        const invalid = validateRoutineName(finalName, await loadRoutineNames(user.id), { currentName: routineName })
+        if (invalid) return Alert.alert(invalid)
+      }
+
+      if (isNew) {
+        // Onto the list before anything is saved under the name.
+        await addRoutine(user.id, finalName)
+        const gMap = await getRoutineGroupMap(user.id)
+        await saveRoutineGroupMap(user.id, { ...gMap, [finalName]: newGroup })
+      }
       if (renaming) {
         try {
           await renameRoutine(user.id, routineName, finalName)
         } catch (e) {
-          setSaving(false)
           return Alert.alert('Could not rename', e.message)
         }
       }
+      // The schedule is device-local and the template is kept on the device
+      // (queued when offline), so a plain edit made offline is saved rather
+      // than failed.
+      if (!isFirstTime && !isAltVariant) {
+        await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes, description: description.trim() })
+      }
       await saveRoutineTemplate(user.id, isAltVariant ? altRoutineName(finalName) : finalName, tasks)
-      if (!isAltVariant) {
-        await addRoutine(user.id, finalName)
-        if (isNew) {
-          const gMap = await getRoutineGroupMap(user.id)
-          await saveRoutineGroupMap(user.id, { ...gMap, [finalName]: newGroup })
-        }
-        if (!isFirstTime) {
-          await saveRoutineSettings(user.id, finalName, { activeDays, startTimeMinutes, perDayMode, dayTimes, description: description.trim() })
+      if (isFirstTime) await markSetupDone(user.id)
+
+      const shiftBy = tasks.reduce((sum, t) => sum + (shiftForTaskRef.current[t.id] ?? 0), 0)
+      if (shiftBy > 0) {
+        try {
+          await shiftLaterRoutines(finalName, startTimeMinutes, shiftBy)
+        } catch (e) {
+          Alert.alert('Could not shift', e.message)
         }
       }
-      if (isFirstTime) await markSetupDone(user.id)
-      // First-time setup hands off to onboarding; a rename re-points to the new
-      // route; otherwise return to wherever the user opened this from.
+
+      const alreadyLeft = leavingRef.current
+      leavingRef.current = true
+      const otherVersion = isNew || isFirstTime ? null : isAltVariant ? finalName : altRoutineName(finalName)
+      releaseUnusedPhotos(tasks, otherVersion).catch(() => {})
+      if (alreadyLeft) return
+      // First-time setup hands off to onboarding; a rename goes back to Home
+      // and opens the renamed routine from there, so the old name's screen
+      // isn't left underneath; otherwise return to wherever the user opened
+      // this from.
       if (isFirstTime) router.replace('/onboarding')
-      else if (renaming) router.replace('/routine/' + encodeURIComponent(finalName))
+      else if (renaming) {
+        router.dismissTo('/(tabs)')
+        router.push({ pathname: '/routine/[name]', params: { name: finalName } })
+      }
       else if (router.canGoBack()) router.back()
       else router.replace('/(tabs)')
     } catch (e) {
       // addRoutine and friends refuse loudly when the routine list can't be
       // read safely — surface that instead of dying as an unhandled rejection.
-      return Alert.alert('Could not save', e.message)
+      return Alert.alert(renaming ? 'Could not rename' : 'Could not save', e.message)
     } finally {
+      savingRef.current = false
       setSaving(false)
     }
   }
@@ -1036,7 +1178,7 @@ export default function SetupRoutine() {
               </View>
               {totalGoalSecs > 0 && (
                 <Text style={s.endTimeText}>
-                  {fmtTime(startTimeMinutes)} – {fmtTime(startTimeMinutes + totalGoalSecs / 60)}
+                  {fmtTime(startTimeMinutes)} – {fmtTime(startTimeMinutes + Math.round(totalGoalSecs / 60))}
                   {'  ·  '}{fmtDuration(Math.round(totalGoalSecs / 60))} total
                 </Text>
               )}
@@ -1044,8 +1186,13 @@ export default function SetupRoutine() {
           )}
         </View>
       )}
+
+      {!loaded && <ActivityIndicator color={accent.color} style={{ paddingVertical: 24 }} />}
     </View>
   )
+
+  // Save waits for the routine to load and for any photo still uploading.
+  const saveBlocked = saving || uploadingPhoto || !loaded
 
   const listFooter = (
     <View>
@@ -1086,7 +1233,11 @@ export default function SetupRoutine() {
             onChangeText={setGoalSecs}
             maxLength={2}
           />
-          <Pressable style={[s.addBtn, { backgroundColor: accent.color }]} onPress={addTask}>
+          <Pressable
+            style={[s.addBtn, { backgroundColor: accent.color }, !loaded && { opacity: 0.6 }]}
+            onPress={addTask}
+            disabled={!loaded}
+          >
             <Text style={s.addBtnText}>+</Text>
           </Pressable>
         </View>
@@ -1097,18 +1248,30 @@ export default function SetupRoutine() {
           s.btn,
           { backgroundColor: accent.color },
           isFirstTime && s.btnFirst,
-          saving && { opacity: 0.6 },
+          saveBlocked && { opacity: 0.6 },
         ]}
         onPress={save}
-        disabled={saving}
+        disabled={saveBlocked}
       >
         <Text style={[s.btnText, isFirstTime && s.btnTextFirst]}>
-          {saving ? 'Saving…' : isFirstTime ? "Let's go! 🚀" : isNew ? 'Create Routine' : 'Save changes'}
+          {saving ? 'Saving…'
+            : !loaded ? 'Loading…'
+            : uploadingPhoto ? 'Uploading photo…'
+            : isFirstTime ? "Let's go! 🚀" : isNew ? 'Create Routine' : 'Save changes'}
         </Text>
       </Pressable>
 
       {isFirstTime && (
-        <Pressable style={s.skipBtn} onPress={async () => { try { await markSetupDone(user.id) } catch (e) { Alert.alert('Error', e.message); return } router.replace('/(tabs)') }}>
+        <Pressable
+          style={s.skipBtn}
+          onPress={async () => {
+            try { await markSetupDone(user.id) } catch (e) { Alert.alert('Error', e.message); return }
+            // Skipping leaves any edits (and this visit's uploads) behind on purpose.
+            leavingRef.current = true
+            releaseUploads()
+            router.replace('/(tabs)')
+          }}
+        >
           <Text style={s.skipText}>I'll do this later</Text>
         </Pressable>
       )}

@@ -1,4 +1,6 @@
 -- ============================================================
+-- HISTORICAL REFERENCE — the live schema is managed by supabase/migrations/.
+-- ============================================================
 -- Weekly rate-limit table for the workout screenshot import
 -- (extract_workout action in the openai-proxy edge function):
 -- 10 imports per week (Mon–Sun), separate from the 3/day

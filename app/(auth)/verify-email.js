@@ -9,7 +9,7 @@ import { useAuth } from '../../lib/AuthContext'
 const RESEND_COOLDOWN = 60
 
 export default function VerifyEmail() {
-  const { email } = useLocalSearchParams()
+  const { email, username } = useLocalSearchParams()
   const { confirmSignUp, resendSignUpCode } = useAuth()
   const [code, setCode] = useState('')
   const [loading, setLoading] = useState(false)
@@ -27,8 +27,15 @@ export default function VerifyEmail() {
     if (!code.trim()) return Alert.alert('Enter the code from your email')
     setLoading(true)
     try {
-      await confirmSignUp(String(email), code)
-      router.replace('/')
+      const res = await confirmSignUp(String(email), code)
+      // Verified, but the profile could not be finished (the username was
+      // refused or taken meanwhile, or the save failed): straight to setting
+      // it up, which says what went wrong, instead of into the app.
+      if (res?.profileIncomplete) {
+        router.replace({ pathname: '/(auth)/complete-profile', params: username ? { username: String(username) } : {} })
+      } else {
+        router.replace('/')
+      }
     } catch (e) {
       Alert.alert('Could not verify', e.message)
     } finally {

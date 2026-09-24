@@ -5,7 +5,7 @@ import {
   KeyboardAvoidingView, Platform, Share, Modal,
 } from 'react-native'
 import { Image } from 'expo-image'
-import { useFocusEffect } from 'expo-router'
+import { useFocusEffect, router } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import { getUserGoals, saveUserGoals } from '../../lib/goalsStorage'
@@ -23,6 +23,7 @@ import {
 import { muscleColor, muscleTextColor } from '../../lib/splitData'
 import {
   checkUsernameAvailable, upsertProfile, pickAndUploadAvatar,
+  updateAvatarUrl, updateVisibility,
 } from '../../lib/profileStorage'
 import { getSections, saveSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { getRoutinePrefs, saveRoutinePrefs, DEFAULT_ROUTINE_PREFS } from '../../lib/routinePrefs'
@@ -110,9 +111,18 @@ function friendlyError(e, fallback = 'Something went wrong. Please try again.') 
   return FRIENDLY_DB_ERRORS[e?.message] ?? e?.hint ?? e?.message ?? fallback
 }
 
+// A typed weight in the other unit, or the text as it was when it isn't one.
+// Switching units converts what is typed: 75 kg used to become "75 lbs".
+function convertWeight(text, toUnit) {
+  const w = parseFloat(text)
+  if (!(w > 0)) return text
+  return String(toUnit === 'kg' ? +(w * 0.453592).toFixed(1) : +(w / 0.453592).toFixed(1))
+}
+
 export default function SettingsScreen() {
-  const { user, profile, refreshProfile, signOut, deleteAccount } = useAuth()
+  const { user, profile, profileError, refreshProfile, signOut, deleteAccount } = useAuth()
   const { theme, toggleDark, unit: appUnit, toggleUnit } = useTheme()
+  const userId = user?.id ?? null
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -126,8 +136,17 @@ export default function SettingsScreen() {
   const [usernameStatus, setUsernameStatus] = useState(null)
   const [savingProfile, setSavingProfile] = useState(false)
   const [uploadingAvatar, setUploadingAvatar] = useState(false)
-  const profileInitialized = useRef(false)
+  const [retryingProfile, setRetryingProfile] = useState(false)
+  // Name, username or bio typed into since they were last loaded or saved.
+  const profileTouched = useRef(false)
+  const editProfile = set => v => { profileTouched.current = true; set(v) }
   const usernameTimerRef = useRef(null)
+  // What is in the username box now. A slow answer about an earlier spelling
+  // used to land late and mark the current one "available".
+  const latestUsername = useRef('')
+  // Only the newest privacy change may roll the switch back if it fails.
+  const visibilityReq = useRef(0)
+  const mounted = useRef(false)
 
   // Body stats
   const [weightVal, setWeightVal]   = useState('')
@@ -174,13 +193,29 @@ export default function SettingsScreen() {
   // How routines run once started (step-by-step timer vs checklist)
   const [routinePrefs, setRoutinePrefs] = useState({ ...DEFAULT_ROUTINE_PREFS })
 
+  // Goal fields changed since they were loaded or saved. Every visit to this
+  // tab reloads the stored goals (they change on other devices too), but only
+  // into fields the user hasn't touched: a reload used to put the spinner up,
+  // jump back to the top and throw away whatever was being edited.
+  const editedGoals = useRef(new Set())
+  // The stored goals as last loaded or saved, so an unchanged reload is a no-op.
+  const loadedGoals = useRef(null)
+  const goalsReq = useRef(0)
+  const markEdited = key => editedGoals.current.add(key)
+  const edit = (key, set) => v => { markEdited(key); set(v) }
+
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
   useFocusEffect(useCallback(() => {
-    if (user) {
-      getSections(user.id).then(setSections)
-      getLogSettings(user.id).then(setLogSettings)
-      getRoutinePrefs(user.id).then(setRoutinePrefs)
+    if (userId) {
+      getSections(userId).then(setSections)
+      getLogSettings(userId).then(setLogSettings)
+      getRoutinePrefs(userId).then(setRoutinePrefs)
     }
-  }, [user]))
+  }, [userId]))
 
   async function toggleSection(name) {
     const next = { ...sections, [name]: !sections[name] }
@@ -201,21 +236,25 @@ export default function SettingsScreen() {
     await saveLogSettings(user.id, next)
   }
 
-  // Load profile into local state once per session
+  // Load the profile into the form, and again whenever it changes (a retry
+  // that reached the account, a save), leaving name, username and bio alone
+  // while they're being edited. Loading it only once kept a stale device copy
+  // on screen after a retry, and Save Changes then wrote it back.
   useEffect(() => {
-    if (profile && !profileInitialized.current) {
+    if (!profile) return
+    if (!profileTouched.current) {
       setLocalName(profile.name ?? '')
       setLocalUsername(profile.username ?? '')
       setLocalBio(profile.bio ?? '')
-      setVisibility(profile.visibility ?? 'friends')
-      setAvatarUri(profile.avatar_url || null)
-      profileInitialized.current = true
     }
+    setVisibility(profile.visibility ?? 'friends')
+    setAvatarUri(profile.avatar_url || null)
   }, [profile])
 
   // Username availability check
   useEffect(() => {
     const normalized = localUsername.toLowerCase().trim()
+    latestUsername.current = normalized
     if (!normalized || (profile && normalized === profile.username?.toLowerCase())) {
       setUsernameStatus(profile && normalized === profile.username?.toLowerCase() ? 'available' : null)
       return
@@ -227,42 +266,48 @@ export default function SettingsScreen() {
     setUsernameStatus('checking')
     clearTimeout(usernameTimerRef.current)
     usernameTimerRef.current = setTimeout(async () => {
-      const ok = await checkUsernameAvailable(normalized, user?.id)
+      const ok = await checkUsernameAvailable(normalized, userId)
+      if (latestUsername.current !== normalized) return
       setUsernameStatus(ok ? 'available' : 'taken')
     }, 500)
     return () => clearTimeout(usernameTimerRef.current)
-  }, [localUsername, profile, user])
+  }, [localUsername, profile, userId])
 
+  // The spinner is for the first load only; later visits refresh in place.
   useFocusEffect(useCallback(() => {
-    if (!user) return
-    setLoading(true)
-    getUserGoals(user.id).then(goals => {
-      if (goals) {
+    if (!userId) return
+    const req = ++goalsReq.current
+    getUserGoals(userId).then(goals => {
+      // A save since this load began has put newer values on screen.
+      if (req !== goalsReq.current) return
+      const json = JSON.stringify(goals ?? null)
+      if (goals && json !== loadedGoals.current) {
+        const keep = key => editedGoals.current.has(key)
         const kg = goals.weightKg
-        if (kg) {
+        if (kg && !keep('weight')) {
           const unit = appUnit === 'kg' ? 'kg' : 'lbs'
           setWeightUnit(unit)
           setWeightVal(String(unit === 'lbs' ? +(kg / 0.453592).toFixed(1) : kg))
         }
-        if (goals.heightCm) {
+        if (goals.heightCm && !keep('height')) {
           setHeightMode('cm')
           setHeightCm(String(goals.heightCm))
         }
-        if (goals.age)           setAge(String(goals.age))
-        if (goals.sex)           setSex(goals.sex)
-        if (goals.fitnessGoal && goals.fitnessGoal !== 'none') setFitnessGoal(goals.fitnessGoal)
-        if (goals.targetWeightKg) {
+        if (goals.age && !keep('age')) setAge(String(goals.age))
+        if (goals.sex && !keep('sex')) setSex(goals.sex)
+        if (goals.fitnessGoal && goals.fitnessGoal !== 'none' && !keep('goal')) setFitnessGoal(goals.fitnessGoal)
+        if (goals.targetWeightKg && !keep('target')) {
           const unit = appUnit === 'kg' ? 'kg' : 'lbs'
           setTargetWeightUnit(unit)
           setTargetWeightVal(String(unit === 'lbs' ? +(goals.targetWeightKg / 0.453592).toFixed(1) : goals.targetWeightKg))
         }
-        if (goals.activityLevel) setActivityLevel(goals.activityLevel)
-        if (goals.workoutDaysPerWeek) {
+        if (goals.activityLevel && !keep('activity')) setActivityLevel(goals.activityLevel)
+        if (goals.workoutDaysPerWeek && !keep('days')) {
           setWorkoutDays(goals.workoutDaysPerWeek)
           setOrigWorkoutDays(goals.workoutDaysPerWeek)
         }
-        if (goals.gymSplit) setCurrentSplit(goals.gymSplit)
-        if (goals.isCustom) {
+        if (goals.gymSplit && !keep('split')) setCurrentSplit(goals.gymSplit)
+        if (goals.isCustom && !keep('nutrition')) {
           setIsCustom(true)
           setCustomCals(String(goals.calories ?? ''))
           setCustomProtein(String(goals.protein ?? ''))
@@ -270,9 +315,10 @@ export default function SettingsScreen() {
           setCustomFat(String(goals.fat ?? ''))
         }
       }
+      loadedGoals.current = json
       setLoading(false)
     })
-  }, [user]))
+  }, [userId]))
 
   const weightKg = useMemo(() => {
     const w = parseFloat(weightVal)
@@ -306,6 +352,7 @@ export default function SettingsScreen() {
   const finalFat     = isCustom ? (parseInt(customFat)     || null) : (calculated?.fat ?? null)
 
   function enableCustom() {
+    markEdited('nutrition')
     if (!isCustom) {
       setCustomCals(String(calculated?.calories ?? ''))
       setCustomProtein(String(calculated?.protein ?? ''))
@@ -326,6 +373,7 @@ export default function SettingsScreen() {
     return v == null ? '' : String(v)
   }
   function editGoalField(key, v) {
+    markEdited('nutrition')
     if (!isCustom) {
       setCustomCals(String(calculated?.calories ?? ''))
       setCustomProtein(String(calculated?.protein ?? ''))
@@ -337,31 +385,61 @@ export default function SettingsScreen() {
   }
 
   function handleWorkoutDaysChange(d) {
+    markEdited('days')
     setWorkoutDays(d)
     setPendingRegen(d !== origWorkoutDays || !currentSplit)
   }
 
   function regenSplit() {
     if (!workoutDays) return
+    markEdited('days')
+    markEdited('split')
     const newSplit = generateGymSplit(workoutDays)
     setCurrentSplit(newSplit)
     setOrigWorkoutDays(workoutDays)
     setPendingRegen(false)
   }
 
+  function switchWeightUnit(next) {
+    if (next === weightUnit) return
+    markEdited('weight')
+    setWeightVal(v => convertWeight(v, next))
+    setWeightUnit(next)
+  }
+
+  function switchTargetUnit(next) {
+    if (next === targetWeightUnit) return
+    markEdited('target')
+    setTargetWeightVal(v => convertWeight(v, next))
+    setTargetWeightUnit(next)
+  }
+
+  // Feet and inches are filled in from centimetres and back. Switching used
+  // to show empty boxes, and saving from them wrote no height (and so no
+  // calculated targets) at all.
+  function switchHeightMode(next) {
+    if (next === heightMode) return
+    markEdited('height')
+    if (next === 'ft') {
+      const inches = Math.round((parseFloat(heightCm) || 0) / 2.54)
+      setHeightFt(inches > 0 ? String(Math.floor(inches / 12)) : '')
+      setHeightIn(inches > 0 ? String(inches % 12) : '')
+    } else {
+      setHeightCm(heightCmVal ? String(Math.round(heightCmVal)) : '')
+    }
+    setHeightMode(next)
+  }
+
   async function handlePickAvatar() {
-    if (!user) return
+    if (!user || !profile) return
     setUploadingAvatar(true)
     try {
       const url = await pickAndUploadAvatar(user.id)
       if (!url) return
+      // Only the photo. This used to save the whole profile from the form,
+      // committing an unsaved (possibly invalid or taken) username with it.
+      await updateAvatarUrl(user.id, url)
       setAvatarUri(url)
-      await upsertProfile(user.id, {
-        username: localUsername || profile?.username || '',
-        bio: localBio,
-        avatar_url: url,
-        name: localName,
-      })
       await refreshProfile()
     } catch (e) {
       Alert.alert('Error', friendlyError(e, 'We could not update your photo. Please try again.'))
@@ -370,28 +448,71 @@ export default function SettingsScreen() {
     }
   }
 
+  // Saved the moment it is tapped, like the other switches on this screen.
+  // It used to wait for a Save that never included it, while saying "Saved".
+  async function changeVisibility(next) {
+    if (!user || !profile || next === visibility) return
+    const prev = visibility
+    const req = ++visibilityReq.current
+    setVisibility(next)
+    try {
+      await updateVisibility(user.id, next)
+      if (req === visibilityReq.current) refreshProfile()
+    } catch (e) {
+      if (req !== visibilityReq.current) return
+      setVisibility(prev)
+      Alert.alert('Error', friendlyError(e, 'We could not change who can see your activity. Please try again.'))
+    }
+  }
+
+  // Name, username and bio differ from the saved profile.
+  function profileEdited() {
+    if (!profile) return false
+    return localName.trim() !== (profile.name ?? '').trim()
+      || localUsername.toLowerCase().trim() !== (profile.username ?? '').toLowerCase()
+      || localBio.trim() !== (profile.bio ?? '').trim()
+  }
+
+  // Why the profile fields can't be saved as they are, or null.
+  function profileProblem() {
+    if (!profile) return "Your profile hasn't loaded yet. Check your connection and try again."
+    if (usernameStatus === 'checking') return 'Still checking that username. Try again in a moment.'
+    if (usernameStatus !== 'available') return 'Please choose a valid, available username.'
+    return null
+  }
+
+  async function writeProfile() {
+    await upsertProfile(user.id, {
+      username: localUsername.toLowerCase().trim(),
+      bio: localBio.trim(),
+      avatar_url: avatarUri ?? '',
+      name: localName.trim(),
+    })
+    profileTouched.current = false
+    await refreshProfile()
+  }
+
   async function saveProfile() {
-    if (!user || savingProfile) return
-    if (usernameStatus !== 'available') {
-      Alert.alert('Invalid username', 'Please choose a valid, available username.')
+    if (!user || savingProfile || saving) return
+    const problem = profileProblem()
+    if (problem) {
+      Alert.alert('Profile not saved', problem)
       return
     }
     setSavingProfile(true)
     try {
-      await upsertProfile(user.id, {
-        username: localUsername.toLowerCase().trim(),
-        bio: localBio.trim(),
-        avatar_url: avatarUri ?? '',
-        name: localName.trim(),
-        visibility,
-      })
-      await refreshProfile()
+      await writeProfile()
       Alert.alert('Saved', 'Profile updated.')
     } catch (e) {
       Alert.alert('Error', friendlyError(e, 'We could not save your profile. Please try again.'))
     } finally {
       setSavingProfile(false)
     }
+  }
+
+  async function retryProfile() {
+    setRetryingProfile(true)
+    try { await refreshProfile() } finally { setRetryingProfile(false) }
   }
 
   async function loadBlocked() {
@@ -494,13 +615,12 @@ export default function SettingsScreen() {
     }
   }
 
-  async function save() {
-    if (!user || saving) return
+  // Returns false when the goals were not saved (and says why).
+  async function saveGoals() {
     if (age && parseInt(age) < 13) {
       Alert.alert('Age requirement', 'You must be 13 or older to use this app.')
-      return
+      return false
     }
-    setSaving(true)
     const goals = {
       weightKg,
       heightCm: heightCmVal,
@@ -519,17 +639,69 @@ export default function SettingsScreen() {
       onboardingDone: true,
     }
     await saveUserGoals(user.id, goals)
+    // What is on screen is now what is stored: a load still in flight is
+    // older, and later visits may refresh every field again.
+    goalsReq.current++
+    loadedGoals.current = JSON.stringify(goals)
+    editedGoals.current.clear()
     if (currentSplit) await saveGymSplit(user.id, currentSplit).catch(() => {})
-    setSaving(false)
-    Alert.alert('Saved', 'Your goals have been updated.')
+    return true
+  }
+
+  // The Nutrition Goals card's button: goals only.
+  async function save() {
+    if (!user || saving) return
+    setSaving(true)
+    try {
+      if (await saveGoals()) Alert.alert('Saved', 'Your goals have been updated.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Save Changes at the bottom saves everything on the screen that changed.
+  // It used to save only the goals and still say "Saved", while a new name,
+  // username or bio typed above was quietly left behind.
+  async function saveChanges() {
+    if (!user || saving || savingProfile) return
+    const withProfile = profileEdited()
+    // Checked before anything is written, so the tap doesn't half-save.
+    const problem = withProfile ? profileProblem() : null
+    if (problem) {
+      Alert.alert('Profile not saved', problem)
+      return
+    }
+    setSaving(true)
+    try {
+      if (!(await saveGoals())) return
+      if (withProfile) {
+        setSavingProfile(true)
+        try {
+          await writeProfile()
+        } catch (e) {
+          Alert.alert('Profile not saved', `Your goals were saved, but your profile wasn't. ${friendlyError(e, 'Please try again.')}`)
+          return
+        } finally {
+          setSavingProfile(false)
+        }
+      }
+      Alert.alert('Saved', withProfile ? 'Your profile and goals have been updated.' : 'Your goals have been updated.')
+    } finally {
+      setSaving(false)
+    }
   }
 
   // Sign-out drops the offline write queue (deliberate — queued writes must
   // never replay into a different account), so when the flush can't land
   // everything, signOut refuses and reports what's at stake. Only an explicit
   // "anyway" from the user forces it through.
-  async function handleSignOut() {
-    const result = await signOut()
+  async function handleSignOut(force = false) {
+    const result = await signOut({ force })
+    if (result?.error) {
+      // Nothing was signed out or cleared; the app stays as it is.
+      Alert.alert("Couldn't sign out", "You're still signed in. Check your connection and try again.")
+      return
+    }
     if (result?.pendingSync) {
       const n = result.pendingSync
       Alert.alert(
@@ -537,10 +709,15 @@ export default function SettingsScreen() {
         `${n} ${n === 1 ? "change hasn't" : "changes haven't"} synced yet — signing out will discard ${n === 1 ? 'it' : 'them'}.`,
         [
           { text: 'Cancel', style: 'cancel' },
-          { text: 'Sign out anyway', style: 'destructive', onPress: () => signOut({ force: true }) },
+          { text: 'Sign out anyway', style: 'destructive', onPress: () => handleSignOut(true) },
         ]
       )
+      return
     }
+    // Signed out. The tabs send a signed-out user to the login screen as soon
+    // as they re-render, and usually already have; this covers the moment
+    // before they do.
+    if (mounted.current) router.replace('/(auth)/login')
   }
 
   if (loading) {
@@ -562,6 +739,29 @@ export default function SettingsScreen() {
         {/* ── Profile ───────────────────────────────────────────────── */}
         <SectionHeader title="PROFILE" theme={theme} />
         <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+          {/* Nothing to edit until the profile is known: saving these fields
+              blank over a profile that couldn't be read would wipe it. */}
+          {!profile ? (
+            profileError ? (
+              <View style={st.profileMissing}>
+                <Text style={[st.profileMissingTitle, { color: theme.text }]}>We couldn't load your profile</Text>
+                <Text style={[st.profileMissingSub, { color: theme.muted }]}>
+                  Check your connection and try again.
+                </Text>
+                <Pressable
+                  style={[st.profileSaveBtn, { backgroundColor: ACCENT, alignSelf: 'stretch' }, retryingProfile && { opacity: 0.6 }]}
+                  onPress={retryProfile}
+                  disabled={retryingProfile}
+                >
+                  {retryingProfile
+                    ? <ActivityIndicator color="#fff" size="small" />
+                    : <Text style={st.profileSaveBtnText}>Retry</Text>}
+                </Pressable>
+              </View>
+            ) : (
+              <ActivityIndicator color={ACCENT} style={{ marginVertical: 18 }} />
+            )
+          ) : (<>
 
           {/* Avatar */}
           <Pressable style={st.avatarWrap} onPress={handlePickAvatar} disabled={uploadingAvatar}>
@@ -596,7 +796,7 @@ export default function SettingsScreen() {
             placeholderTextColor={theme.muted}
             autoCapitalize="words"
             value={localName}
-            onChangeText={setLocalName}
+            onChangeText={editProfile(setLocalName)}
             maxLength={40}
           />
 
@@ -615,7 +815,7 @@ export default function SettingsScreen() {
             autoCapitalize="none"
             autoCorrect={false}
             value={localUsername}
-            onChangeText={setLocalUsername}
+            onChangeText={editProfile(setLocalUsername)}
             maxLength={20}
           />
           {localUsername ? (
@@ -649,7 +849,7 @@ export default function SettingsScreen() {
             placeholderTextColor={theme.muted}
             multiline
             value={localBio}
-            onChangeText={setLocalBio}
+            onChangeText={editProfile(setLocalBio)}
             maxLength={200}
           />
 
@@ -663,7 +863,7 @@ export default function SettingsScreen() {
               <Pressable
                 key={val}
                 style={[st.visBtn, visibility === val && { backgroundColor: ACCENT }]}
-                onPress={() => setVisibility(val)}
+                onPress={() => changeVisibility(val)}
               >
                 <Text style={[st.visBtnText, { color: visibility === val ? '#fff' : theme.subtext }]}>{label}</Text>
               </Pressable>
@@ -686,6 +886,7 @@ export default function SettingsScreen() {
               ? <ActivityIndicator color="#fff" size="small" />
               : <Text style={st.profileSaveBtnText}>Save Profile</Text>}
           </Pressable>
+          </>)}
         </View>
 
         {/* ── Body Stats ─────────────────────────────────────────────── */}
@@ -699,15 +900,15 @@ export default function SettingsScreen() {
               placeholder={weightUnit === 'lbs' ? 'e.g. 165' : 'e.g. 75'}
               placeholderTextColor={theme.muted}
               value={weightVal}
-              onChangeText={setWeightVal}
+              onChangeText={edit('weight', setWeightVal)}
               keyboardType="decimal-pad"
             />
-            <UnitToggle value={weightUnit} options={['lbs', 'kg']} onChange={setWeightUnit} theme={theme} />
+            <UnitToggle value={weightUnit} options={['lbs', 'kg']} onChange={switchWeightUnit} theme={theme} />
           </View>
 
           <FieldLabel theme={theme}>Height</FieldLabel>
           <View style={[st.inputRow, { marginBottom: 6 }]}>
-            <UnitToggle value={heightMode} options={['ft', 'cm']} onChange={setHeightMode} theme={theme} />
+            <UnitToggle value={heightMode} options={['ft', 'cm']} onChange={switchHeightMode} theme={theme} />
           </View>
           {heightMode === 'ft' ? (
             <View style={st.inputRow}>
@@ -717,7 +918,7 @@ export default function SettingsScreen() {
                   placeholder="ft"
                   placeholderTextColor={theme.muted}
                   value={heightFt}
-                  onChangeText={setHeightFt}
+                  onChangeText={edit('height', setHeightFt)}
                   keyboardType="number-pad"
                   maxLength={1}
                 />
@@ -729,7 +930,7 @@ export default function SettingsScreen() {
                   placeholder="in"
                   placeholderTextColor={theme.muted}
                   value={heightIn}
-                  onChangeText={setHeightIn}
+                  onChangeText={edit('height', setHeightIn)}
                   keyboardType="number-pad"
                   maxLength={2}
                 />
@@ -742,7 +943,7 @@ export default function SettingsScreen() {
               placeholder="e.g. 175"
               placeholderTextColor={theme.muted}
               value={heightCm}
-              onChangeText={setHeightCm}
+              onChangeText={edit('height', setHeightCm)}
               keyboardType="decimal-pad"
             />
           )}
@@ -753,7 +954,7 @@ export default function SettingsScreen() {
             placeholder="e.g. 24"
             placeholderTextColor={theme.muted}
             value={age}
-            onChangeText={setAge}
+            onChangeText={edit('age', setAge)}
             keyboardType="number-pad"
             maxLength={3}
           />
@@ -772,7 +973,7 @@ export default function SettingsScreen() {
                   borderColor: sex === val ? ACCENT : theme.inputBorder,
                   borderWidth: sex === val ? 2 : 1,
                 }]}
-                onPress={() => setSex(val)}
+                onPress={edit('sex', () => setSex(val))}
               >
                 <Text style={[st.sexBtnText, { color: sex === val ? ACCENT : theme.text }]}>{label}</Text>
               </Pressable>
@@ -794,7 +995,7 @@ export default function SettingsScreen() {
               label={opt.label}
               sub={opt.sub}
               selected={fitnessGoal === opt.key}
-              onPress={() => setFitnessGoal(opt.key)}
+              onPress={edit('goal', () => setFitnessGoal(opt.key))}
               theme={theme}
             />
           ))}
@@ -811,10 +1012,10 @@ export default function SettingsScreen() {
                 placeholder={targetWeightUnit === 'lbs' ? 'e.g. 150' : 'e.g. 68'}
                 placeholderTextColor={theme.muted}
                 value={targetWeightVal}
-                onChangeText={setTargetWeightVal}
+                onChangeText={edit('target', setTargetWeightVal)}
                 keyboardType="decimal-pad"
               />
-              <UnitToggle value={targetWeightUnit} options={['lbs', 'kg']} onChange={setTargetWeightUnit} theme={theme} />
+              <UnitToggle value={targetWeightUnit} options={['lbs', 'kg']} onChange={switchTargetUnit} theme={theme} />
             </View>
             {targetWeightKg ? (
               <Text style={[st.targetNote, { color: theme.muted }]}>
@@ -838,7 +1039,7 @@ export default function SettingsScreen() {
               label={ACTIVITY_LABELS[lvl].short}
               sub={ACTIVITY_LABELS[lvl].long}
               selected={activityLevel === lvl}
-              onPress={() => setActivityLevel(lvl)}
+              onPress={edit('activity', () => setActivityLevel(lvl))}
               theme={theme}
             />
           ))}
@@ -1157,7 +1358,7 @@ export default function SettingsScreen() {
         {/* ── Save ──────────────────────────────────────────────────── */}
         <Pressable
           style={[st.saveBtn, { backgroundColor: ACCENT }, saving && { opacity: 0.6 }]}
-          onPress={save}
+          onPress={saveChanges}
           disabled={saving}
         >
           <Text style={st.saveBtnText}>{saving ? 'Saving…' : 'Save Changes'}</Text>
@@ -1167,7 +1368,7 @@ export default function SettingsScreen() {
           style={[st.signOutBtn, { borderColor: theme.cardBorder }]}
           onPress={() => Alert.alert('Sign out', 'Are you sure?', [
             { text: 'Cancel', style: 'cancel' },
-            { text: 'Sign out', style: 'destructive', onPress: handleSignOut },
+            { text: 'Sign out', style: 'destructive', onPress: () => handleSignOut() },
           ])}
         >
           <Text style={[st.signOutText, { color: '#ef4444' }]}>Sign Out</Text>
@@ -1418,6 +1619,9 @@ const st = StyleSheet.create({
     borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginTop: 12,
   },
   profileSaveBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  profileMissing: { alignItems: 'center', paddingVertical: 6 },
+  profileMissingTitle: { fontSize: 16, fontWeight: '700', textAlign: 'center' },
+  profileMissingSub: { fontSize: 13, fontWeight: '500', textAlign: 'center', marginTop: 4, lineHeight: 18 },
 
   visRow: { flexDirection: 'row', borderRadius: 12, borderWidth: 1, padding: 3, gap: 3 },
   visBtn: { flex: 1, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },

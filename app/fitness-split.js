@@ -1,35 +1,63 @@
-import { useState, useEffect } from 'react'
-import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native'
+import { useState, useEffect, useRef } from 'react'
+import { View, Text, Pressable, StyleSheet, ScrollView, ActivityIndicator } from 'react-native'
 import { router } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
-import { getGymSplit, saveGymSplit } from '../lib/storage'
+import { loadGymSplit, saveGymSplit } from '../lib/storage'
 import {
   SPLIT_PRESETS, MUSCLE_GROUPS, DAY_LABELS,
   muscleColor, muscleTextColor, todaySplitIndex, normalizeDay,
 } from '../lib/splitData'
 
 const PRESETS = Object.keys(SPLIT_PRESETS)
-const todayIdx = todaySplitIndex()
 
 export default function FitnessSplit() {
   const { user } = useAuth()
+  const userId = user?.id
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const [preset, setPreset] = useState('PPL')
   const [days, setDays] = useState(SPLIT_PRESETS['PPL'].days.map(d => [...d]))
   const [openDay, setOpenDay] = useState(null)
   const [saving, setSaving] = useState(false)
+  // The planner saves the whole split back, so it only opens on the real
+  // one: a failed read used to show (and then save) the stock PPL split.
+  const [status, setStatus] = useState('loading')   // loading | ready | error
+  const [loadError, setLoadError] = useState(null)
+  const loadReq = useRef(0)
+  const edited = useRef(false)
+  // Worked out on every render, so a planner left open past midnight moves on.
+  const todayIdx = todaySplitIndex()
+
+  function load() {
+    const req = ++loadReq.current
+    setStatus('loading')
+    loadGymSplit(userId)
+      .then(split => {
+        if (req !== loadReq.current) return
+        // A read that lands after the user started editing never reverts them.
+        if (!edited.current) {
+          setPreset(split.preset)
+          setDays(split.days.map(d => normalizeDay(d)))
+        }
+        setStatus('ready')
+      })
+      .catch(e => {
+        if (req !== loadReq.current) return
+        setLoadError(e?.message ?? 'Could not load your split.')
+        setStatus('error')
+      })
+  }
 
   useEffect(() => {
-    if (!user) return
-    getGymSplit(user.id).then(split => {
-      setPreset(split.preset)
-      setDays(split.days.map(d => normalizeDay(d)))
-    })
-  }, [user])
+    if (userId) load()
+  }, [userId])
 
   function applyPreset(name) {
+    // Custom is where the edits live: tapping it again must not wipe every
+    // day back to Rest.
+    if (name === 'Custom' && preset === 'Custom') return
+    edited.current = true
     setPreset(name)
     setDays(SPLIT_PRESETS[name].days.map(d => [...d]))
     setOpenDay(null)
@@ -49,6 +77,7 @@ export default function FitnessSplit() {
         next = [...withoutRest, muscle]
       }
     }
+    edited.current = true
     setDays(prev => {
       const copy = [...prev]
       copy[dayIdx] = next
@@ -58,9 +87,10 @@ export default function FitnessSplit() {
   }
 
   async function handleSave() {
+    if (status !== 'ready') return
     setSaving(true)
     try {
-      await saveGymSplit(user.id, { preset, days })
+      await saveGymSplit(userId, { preset, days })
       router.back()
     } finally {
       setSaving(false)
@@ -74,8 +104,22 @@ export default function FitnessSplit() {
       </Pressable>
 
       <Text style={s.title}>Gym Split Planner</Text>
-      <Text style={s.subtitle}>Tap a preset to auto-fill, then tap any day to customise. Long-press to add multiple muscle groups.</Text>
+      <Text style={s.subtitle}>Tap a preset to auto-fill, then tap any day to customise. A day can train more than one muscle group.</Text>
 
+      {status === 'loading' && <ActivityIndicator color="#10b981" style={{ marginTop: 32 }} />}
+
+      {status === 'error' && (
+        <View style={s.errorWrap}>
+          <Text style={s.errorEmoji}>⚠️</Text>
+          <Text style={s.errorTitle}>Couldn't load your split</Text>
+          <Text style={s.errorSub}>{loadError}</Text>
+          <Pressable style={s.retryBtn} onPress={load}>
+            <Text style={s.retryText}>Retry</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {status === 'ready' && (<>
       {/* Preset chips */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.presetScroll} contentContainerStyle={s.presetRow}>
         {PRESETS.map(name => {
@@ -159,6 +203,7 @@ export default function FitnessSplit() {
       >
         <Text style={s.saveBtnText}>{saving ? 'Saving…' : 'Save Split'}</Text>
       </Pressable>
+      </>)}
     </ScrollView>
   )
 }
@@ -170,6 +215,13 @@ function makeStyles(theme) { return StyleSheet.create({
   backText: { color: '#10b981', fontSize: 15, fontWeight: '600' },
   title: { fontSize: 26, fontWeight: '800', color: theme.text, marginBottom: 6 },
   subtitle: { fontSize: 13, color: theme.subtext, marginBottom: 22, lineHeight: 18 },
+
+  errorWrap: { alignItems: 'center', paddingVertical: 32, paddingHorizontal: 12 },
+  errorEmoji: { fontSize: 40, marginBottom: 10 },
+  errorTitle: { fontSize: 17, fontWeight: '800', color: theme.text, marginBottom: 6 },
+  errorSub: { fontSize: 13, color: theme.subtext, textAlign: 'center', lineHeight: 18, marginBottom: 18 },
+  retryBtn: { backgroundColor: '#10b981', borderRadius: 14, paddingHorizontal: 24, paddingVertical: 12 },
+  retryText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 
   presetScroll: { marginBottom: 18, marginHorizontal: -4 },
   presetRow: { paddingHorizontal: 4, gap: 8 },

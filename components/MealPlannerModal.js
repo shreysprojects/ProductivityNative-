@@ -89,11 +89,15 @@ export default function MealPlannerModal({ visible, onClose, userId, goals, onAp
   const [loadingLine, setLoadingLine] = useState(0)
   // Bumped when the sheet closes so a reply from a run the user abandoned is ignored.
   const runRef = useRef(0)
+  // The request in flight, cancelled when the sheet closes or unmounts.
+  const abortRef = useRef(null)
 
   const currentQ = SURVEY[step]
 
+  useEffect(() => () => abortRef.current?.abort(), [])
+
   useEffect(() => {
-    if (!visible) { runRef.current++; return }
+    if (!visible) { runRef.current++; abortRef.current?.abort(); return }
     setPhase('intro')
     setStep(0)
     setAnswers({})
@@ -155,15 +159,18 @@ export default function MealPlannerModal({ visible, onClose, userId, goals, onAp
 
   async function submit(finalAnswers) {
     const run = ++runRef.current
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
     setPhase('loading')
     try {
-      const data = await generateMealPlan({ goals, answers: toQA(finalAnswers) })
+      const data = await generateMealPlan({ goals, answers: toQA(finalAnswers) }, { signal: ctrl.signal })
       if (run !== runRef.current) return
       saveMealPlanPrefs(userId, finalAnswers)
       setPrefs(finalAnswers)
       showResult(data)
     } catch (e) {
-      if (run !== runRef.current) return
+      // Cancelled because the sheet went away: nothing to tell anyone.
+      if (run !== runRef.current || e?.name === 'AbortError') return
       setPhase('survey')
       setStep(SURVEY.length - 1)
       Alert.alert('Could not build a plan', e.message ?? 'Please try again.')
@@ -174,16 +181,18 @@ export default function MealPlannerModal({ visible, onClose, userId, goals, onAp
     const text = request.trim()
     if (!text || !result) return
     const run = ++runRef.current
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
     setPhase('loading')
     try {
       const data = await reviseMealPlan({
         goals, answers: toQA(answers), plan: compactPlan(week), request: text,
-      })
+      }, { signal: ctrl.signal })
       if (run !== runRef.current) return
       setRequest('')
       showResult(data)
     } catch (e) {
-      if (run !== runRef.current) return
+      if (run !== runRef.current || e?.name === 'AbortError') return
       setPhase('revise')
       Alert.alert('Could not update the plan', e.message ?? 'Please try again.')
     }
@@ -204,7 +213,18 @@ export default function MealPlannerModal({ visible, onClose, userId, goals, onAp
     onApply(week)
   }
 
-  const drag = useSheetDrag(onClose, { visible })
+  // A week being built has already used one of today's plans. A stray tap on
+  // the backdrop can't throw it away, and a pull or the back button asks
+  // first (the sheet springs back if the user keeps waiting).
+  function requestClose() {
+    if (phase !== 'loading') { onClose(); return }
+    Alert.alert('Stop building the plan?', "It still counts toward today's meal plan limit.", [
+      { text: 'Keep waiting', style: 'cancel' },
+      { text: 'Stop', style: 'destructive', onPress: onClose },
+    ])
+  }
+
+  const drag = useSheetDrag(requestClose, { visible })
   const hasGoals = goals?.calories > 0
   const canGoBack = phase === 'survey'
 
@@ -212,7 +232,7 @@ export default function MealPlannerModal({ visible, onClose, userId, goals, onAp
     <Modal visible={visible} transparent animationType="slide" onRequestClose={drag.close}>
       <KeyboardAvoidingView style={m.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <Animated.View pointerEvents="none" style={[m.bg, { opacity: drag.backdrop }]} />
-        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} disabled={phase === 'loading'} />
         <Animated.View style={[m.sheet, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
           <View {...drag.handlePan.panHandlers} style={[m.grab, drag.grabStyle]}>
             <View style={[m.handle, { backgroundColor: theme.divider }]} />

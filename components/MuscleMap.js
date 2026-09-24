@@ -44,6 +44,8 @@ const MUSCLE_TO_REGIONS = {
   'Neck':                           ['f_neck', 'b_neck'],
   'Traps':                          ['b_trap_l', 'b_trap_r'],
   'Upper Traps':                    ['b_trap_l', 'b_trap_r'],
+  // Runs from the neck down to the top of the shoulder blade.
+  'Levator Scapulae':               ['b_neck', 'b_trap_l', 'b_trap_r'],
   'Upper Back':                     ['b_upper_back', 'b_trap_l', 'b_trap_r'],
   'Thoracic Spine':                 ['b_upper_back', 'b_lower_back'],
   'Spine':                          ['b_upper_back', 'b_lower_back'],
@@ -76,6 +78,8 @@ const MUSCLE_TO_REGIONS = {
   'Hip Rotators':                   ['b_glute_l', 'b_glute_r', 'f_hip_l', 'f_hip_r'],
   'Groin':                          ['f_hip_l', 'f_hip_r'],
   'Adductors':                      ['f_hip_l', 'f_hip_r'],
+  // Hip abduction is mostly the side of the glutes (gluteus medius).
+  'Abductors':                      ['b_glute_l', 'b_glute_r'],
   'Glutes':                         ['b_glute_l', 'b_glute_r'],
   'Piriformis':                     ['b_glute_l', 'b_glute_r'],
   'Hip External Rotators':          ['b_glute_l', 'b_glute_r'],
@@ -96,10 +100,15 @@ function toTitleCase(str) {
   return str.replace(/\b\w/g, c => c.toUpperCase())
 }
 
+// Own keys only: a name from someone else's plan such as "constructor" would
+// otherwise find Object's built-ins and crash the map.
+const regionsFor = name =>
+  Object.prototype.hasOwnProperty.call(MUSCLE_TO_REGIONS, name) ? MUSCLE_TO_REGIONS[name] : null
+
 function getHighlightedIds(muscles) {
   const ids = new Set()
   muscles.forEach(m => {
-    const regions = MUSCLE_TO_REGIONS[m] ?? MUSCLE_TO_REGIONS[toTitleCase(m)] ?? []
+    const regions = regionsFor(m) ?? regionsFor(toTitleCase(m)) ?? []
     regions.forEach(id => ids.add(id))
   })
   return ids
@@ -128,8 +137,16 @@ function BodyMap({ width, primary, secondary }) {
   )
 }
 
-export default function MuscleMap({ muscles = [], secondaryMuscles = [], size = 160, interactive = true }) {
+// Muscle names come from plans other people wrote (a friend's workout), so
+// anything that is not a name is dropped before it reaches toTitleCase, and
+// repeats are dropped so the chips keep unique keys.
+const muscleNames = list =>
+  [...new Set((Array.isArray(list) ? list : []).filter(m => typeof m === 'string' && m.trim()))]
+
+export default function MuscleMap({ muscles: musclesIn = [], secondaryMuscles: secondaryIn = [], size = 160, interactive = true }) {
   const [expanded, setExpanded] = useState(false)
+  const muscles          = muscleNames(musclesIn)
+  const secondaryMuscles = muscleNames(secondaryIn)
   const primary   = getHighlightedIds(muscles)
   const secondary = getHighlightedIds(secondaryMuscles)
 

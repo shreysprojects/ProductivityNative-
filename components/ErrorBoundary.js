@@ -4,6 +4,10 @@ import { View, Text, Pressable, ScrollView, StyleSheet } from 'react-native'
 // A crash anywhere below this renders a blank screen otherwise — React unmounts
 // the whole tree and there is nothing left to draw. Showing the error means a
 // broken build is reportable instead of just "the app won't open".
+//
+// Given a `fallback` (null included) it guards one piece instead of the whole
+// app: the fallback takes the place of the piece that crashed, and everything
+// around it carries on — one malformed feed post no longer takes the app down.
 export default class ErrorBoundary extends Component {
   state = { error: null }
 
@@ -14,6 +18,7 @@ export default class ErrorBoundary extends Component {
   render() {
     const { error } = this.state
     if (!error) return this.props.children
+    if (this.props.fallback !== undefined) return this.props.fallback
 
     return (
       <View style={s.page}>

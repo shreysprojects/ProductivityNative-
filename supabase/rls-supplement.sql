@@ -1,4 +1,7 @@
 -- ============================================================
+-- HISTORICAL REFERENCE — DO NOT RUN AGAINST THE LIVE DATABASE.
+-- The live schema is managed by supabase/migrations/.
+-- ============================================================
 -- RLS Supplement — run in Supabase SQL Editor after schema.sql
 -- Adds missing tables (user_goals, tasks, journal_entries, etc.)
 -- and the ai_rate_limits table for server-side AI rate limiting.
