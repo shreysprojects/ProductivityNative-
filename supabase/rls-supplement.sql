@@ -122,6 +122,18 @@ DROP POLICY IF EXISTS "day_todos_own" ON public.day_todos;
 CREATE POLICY "day_todos_own" ON public.day_todos
   FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
+-- ── weekly_routines ────────────────────────────────────────────────────────
+-- Weekly routines (with their lists): full array as JSONB per user.
+CREATE TABLE IF NOT EXISTS public.weekly_routines (
+  user_id  UUID  PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  routines JSONB NOT NULL DEFAULT '[]'
+);
+
+ALTER TABLE public.weekly_routines ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "weekly_routines_own" ON public.weekly_routines;
+CREATE POLICY "weekly_routines_own" ON public.weekly_routines
+  FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
 -- ── day_rules ──────────────────────────────────────────────────────────────
 -- Dashboard "Rules for today": [{id, text}] per user, persists until edited.
 CREATE TABLE IF NOT EXISTS public.day_rules (
