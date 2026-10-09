@@ -17,11 +17,13 @@ import { todaySplitIndex, DAY_LABELS, muscleColor, muscleTextColor, normalizeDay
 import {
   getRoutineTemplate, saveRoutineTemplate, getTodayRun, startRun, advanceRun, completeRun,
   saveRun, resetTodayRun, getGymSplit, getWorkoutRoutineList, deleteWorkoutPlan, renameWorkoutPlan, getWorkoutPlan,
-  getDayTodos, saveDayTodos, getWorkoutLogsRange, getAllWorkoutLogs, today, getRoutineSettings,
+  getDayTodos, saveDayTodos, getWorkoutLogsRange, getAllWorkoutLogs, deleteWorkoutLog, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
   setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine, taskGoalSecs,
   stepImageUnlocked, subStepImageUnlocked, runWithAdjustedStart,
+  recordRunCompletion, skipRunStep, reopenRunStep, toggleLaterItem, withoutPendingLater,
+  laterItems, pendingLater,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import ImageViewerModal from '../../components/ImageViewerModal'
@@ -32,6 +34,7 @@ import { supabase } from '../../lib/supabase'
 import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
 import { autoLogSpan } from '../../lib/timeLogging'
 import { maybePromptReview } from '../../lib/review'
+import { getRoutinePrefs, saveRoutinePrefs } from '../../lib/routinePrefs'
 import {
   getSleep, startSleep, cancelSleep, wakeUp, sleepDurationShort, clockLabel,
 } from '../../lib/sleepStorage'
@@ -52,6 +55,53 @@ function fmtGoalSecs(s) {
   if (m > 0 && sec > 0) return `${m}m ${sec}s`
   if (m > 0) return `${m}m`
   return `${sec}s`
+}
+
+// Clock-style elapsed time: 04:32, or 1:04:32 once an hour has passed.
+function fmtElapsedSecs(secs) {
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = secs % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+// Running total for checklist mode: how long the whole routine has taken so
+// far, counted from the moment it was started. Lives in its own component so
+// the once-a-second tick re-renders this card only, not the task list.
+function ChecklistTimer({ startedAt, doneCount, totalCount, goalSecs, color, theme }) {
+  const [elapsed, setElapsed] = useState(() => Math.max(0, Math.floor((Date.now() - (startedAt || Date.now())) / 1000)))
+
+  useEffect(() => {
+    const base = startedAt || Date.now()
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - base) / 1000)))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [startedAt])
+
+  const hasGoal = goalSecs > 0
+  const over = hasGoal && elapsed > goalSecs
+  const timeColor = over ? '#ef4444' : color
+
+  return (
+    <View style={[s.clTimerCard, { backgroundColor: theme.card, borderColor: over ? '#ef444455' : color + '33' }]}>
+      <View style={{ flex: 1 }}>
+        <Text style={[s.clTimerLabel, { color: theme.muted }]}>TOTAL TIME</Text>
+        <Text style={[s.clTimerBig, { color: timeColor }]}>{fmtElapsedSecs(elapsed)}</Text>
+        {hasGoal && (
+          <Text style={[s.clTimerSub, { color: over ? '#ef4444' : theme.subtext }]}>
+            {over ? `+${fmtElapsedSecs(elapsed - goalSecs)} over the ${fmtGoalSecs(goalSecs)} goal` : `goal ${fmtGoalSecs(goalSecs)}`}
+          </Text>
+        )}
+      </View>
+      <View style={[s.clTimerCountPill, { backgroundColor: color + '14' }]}>
+        <Text style={[s.clTimerCountText, { color }]}>{doneCount} / {totalCount}</Text>
+        <Text style={[s.clTimerCountSub, { color: theme.subtext }]}>done</Text>
+      </View>
+    </View>
+  )
 }
 
 function taskIcon(text) {
@@ -1328,6 +1378,28 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
   const [detailMuscles, setDetailMuscles] = useState({ primary: [], secondary: [] })
   const [monthCount, setMonthCount] = useState(12)
 
+  // Remove the workout shown in the detail sheet from that day's history.
+  function confirmDeleteDetail() {
+    const log = detailLog
+    if (!log?.date) return
+    Alert.alert(
+      'Delete this workout?',
+      `${log.muscleGroup || 'This workout'} on ${fmtDate(log.date)} will be removed from your history.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: async () => {
+          try {
+            await deleteWorkoutLog(userId, log.date)
+            setLogMap(prev => { const next = { ...prev }; delete next[log.date]; return next })
+            setDetailLog(null)
+          } catch {
+            Alert.alert('Could not delete', 'Please check your connection and try again.')
+          }
+        } },
+      ],
+    )
+  }
+
   useEffect(() => {
     if (!visible) return
     setLoading(true)
@@ -1503,6 +1575,9 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
               <Pressable style={[wcs.closeBtn, { backgroundColor: accentColor }]} onPress={() => setDetailLog(null)}>
                 <Text style={wcs.closeBtnText}>Close</Text>
               </Pressable>
+              <Pressable style={wcs.deleteBtn} onPress={confirmDeleteDetail} hitSlop={6}>
+                <Text style={wcs.deleteBtnText}>Delete this workout from history</Text>
+              </Pressable>
             </Animated.View>
           </>
         )}
@@ -1519,6 +1594,28 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
   const [detailMuscles, setDetailMuscles] = useState({ primary: [], secondary: [] })
   const [historyVisible, setHistoryVisible] = useState(false)
   const { unit } = useTheme()
+
+  // Remove the workout shown in the sheet from that day's history.
+  function confirmDeleteDetail() {
+    const log = detailLog
+    if (!log?.date) return
+    Alert.alert(
+      'Delete this workout?',
+      `${log.muscleGroup || 'This workout'} on ${fmtDetailDate(log.date)} will be removed from your history.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: async () => {
+          try {
+            await deleteWorkoutLog(userId, log.date)
+            setWeekLogs(prev => prev.map(d => d.date === log.date ? { ...d, log: null } : d))
+            setDetailLog(null)
+          } catch {
+            Alert.alert('Could not delete', 'Please check your connection and try again.')
+          }
+        } },
+      ],
+    )
+  }
 
   useEffect(() => {
     if (!detailLog) { setDetailMuscles({ primary: [], secondary: [] }); return }
@@ -1714,6 +1811,11 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
             <Pressable style={[wcs.closeBtn, { backgroundColor: accentColor }]} onPress={detailDrag.close}>
               <Text style={wcs.closeBtnText}>Close</Text>
             </Pressable>
+            {!!detailLog && (
+              <Pressable style={wcs.deleteBtn} onPress={confirmDeleteDetail} hitSlop={6}>
+                <Text style={wcs.deleteBtnText}>Delete this workout from history</Text>
+              </Pressable>
+            )}
           </Animated.View>
         </View>
       </Modal>
@@ -1800,6 +1902,8 @@ const wcs = StyleSheet.create({
 
   closeBtn: { borderRadius: 14, padding: 14, alignItems: 'center', marginTop: 16 },
   closeBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  deleteBtn: { alignItems: 'center', paddingVertical: 12, marginTop: 4 },
+  deleteBtnText: { color: '#ef4444', fontWeight: '700', fontSize: 14 },
 })
 
 // Single-field name prompt. `prompt` is { title, message, placeholder,
@@ -1897,7 +2001,30 @@ export default function RoutineScreen() {
     return [...set]
   }, [previewExercises])
   const [previewExDetail, setPreviewExDetail] = useState(null)
+  // Step-by-step vs checklist while a run is underway. Starts from the saved
+  // preference; once the user taps the toggle on this visit, that choice wins
+  // over any re-read of the preference (screen focus, variant switch).
   const [viewMode, setViewMode] = useState('steps')
+  const [defaultRunMode, setDefaultRunMode] = useState('steps')
+  const viewModeChosen = useRef(false)
+  // Fitness only: the workout features (My Workouts, week calendar, gym split)
+  // can be tucked away for people who use the routine without the tracker.
+  const [hideWorkouts, setHideWorkouts] = useState(false)
+
+  async function setWorkoutsHidden(hidden) {
+    const saved = await saveRoutinePrefs(user.id, { hideWorkouts: hidden })
+    setHideWorkouts(saved.hideWorkouts)
+  }
+
+  function chooseViewMode(mode) {
+    viewModeChosen.current = true
+    setViewMode(mode)
+  }
+
+  async function makeViewModeDefault() {
+    const saved = await saveRoutinePrefs(user.id, { runMode: viewMode })
+    setDefaultRunMode(saved.runMode)
+  }
 
   // Pull-down-to-dismiss for the workout preview sheet: the handle strip and
   // the title header are grab areas; a long pull or a quick flick closes the
@@ -1906,13 +2033,15 @@ export default function RoutineScreen() {
   const previewBackdrop = useRef(previewDragY.interpolate({
     inputRange: [0, 260], outputRange: [1, 0], extrapolate: 'clamp',
   })).current
+  // The offset is reset when the preview opens, not here: on iOS the Modal
+  // stays mounted through its own dismiss animation, so resetting now would
+  // flash the sheet back onto the screen before it slides away a second time.
   const closePreview = () => {
     Animated.timing(previewDragY, {
       toValue: Dimensions.get('window').height, duration: 180, useNativeDriver: true,
     }).start(() => {
       setPreviewRoutine(null)
       setPreviewExDetail(null)
-      previewDragY.setValue(0)
     })
   }
   const previewHandlePan = useRef(PanResponder.create({
@@ -1998,6 +2127,20 @@ export default function RoutineScreen() {
 
   useFocusEffect(useCallback(() => { load() }, [load]))
 
+  // The preferred run mode can change under us in Settings, so re-read it on
+  // every focus — but never override a mode the user picked on this visit.
+  useFocusEffect(useCallback(() => {
+    if (!user) return
+    let cancelled = false
+    getRoutinePrefs(user.id).then(p => {
+      if (cancelled) return
+      setDefaultRunMode(p.runMode)
+      setHideWorkouts(p.hideWorkouts)
+      if (!viewModeChosen.current) setViewMode(p.runMode)
+    })
+    return () => { cancelled = true }
+  }, [user]))
+
   function switchVariant(v) {
     if (v === variant) return
     // Dim the current content while the other variant loads; load() fades it
@@ -2071,16 +2214,29 @@ export default function RoutineScreen() {
     setTimeout(() => { maybePromptReview() }, 1200)
   }
 
+  // Skip the current task: it goes on today's do-later list and the routine
+  // moves on. Reaching the end this way still leaves the routine short of
+  // fully complete until the list is cleared.
+  async function handleSkipStep(elapsedMs) {
+    const updated = skipRunStep(run, run.currentStep, Date.now(), elapsedMs)
+    await saveRun(user.id, storageName, updated)
+    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
+    setRun(updated)
+  }
+
+  // Tick a do-later item (or untick it). The history row and streak follow.
+  async function handleLaterToggle(id) {
+    const updated = toggleLaterItem(run, id, Date.now())
+    await saveRun(user.id, storageName, updated)
+    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
+    setRun(updated)
+  }
+
+  // Reopening a step also clears its skip mark and pulls it off the do-later
+  // list, since the user is doing it now.
   async function handleGoBack() {
     if (!run || run.currentStep === 0) return
-    const prev = run.currentStep - 1
-    const updated = {
-      ...run,
-      currentStep: prev,
-      steps: run.steps.map((s, i) =>
-        i === prev ? { ...s, completedAt: null, elapsedMs: 0, startedAt: Date.now() } : s
-      ),
-    }
+    const updated = reopenRunStep(run, run.currentStep - 1, Date.now())
     await saveRun(user.id, storageName, updated)
     setRun(updated)
   }
@@ -2089,13 +2245,7 @@ export default function RoutineScreen() {
   // prompt on Finish). Same reopening semantics as handleGoBack.
   async function handleJumpTo(idx) {
     if (!run || idx < 0 || idx >= run.steps.length) return
-    const updated = {
-      ...run,
-      currentStep: idx,
-      steps: run.steps.map((s, i) =>
-        i === idx ? { ...s, completedAt: null, elapsedMs: 0, startedAt: Date.now() } : s
-      ),
-    }
+    const updated = reopenRunStep(run, idx, Date.now())
     await saveRun(user.id, storageName, updated)
     setRun(updated)
   }
@@ -2148,17 +2298,29 @@ export default function RoutineScreen() {
     const updatedSteps = run.steps.map((s, i) =>
       i !== stepIdx ? s : nowDone
         ? { ...s, completedAt: Date.now(), elapsedMs: Math.max(0, Date.now() - run.startedAt) }
-        : { ...s, completedAt: null, elapsedMs: 0, startedAt: null }
+        : { ...s, completedAt: null, elapsedMs: 0, startedAt: null, skipped: false }
     )
     const allDone = updatedSteps.every(s => !!s.completedAt)
     const firstUndone = updatedSteps.findIndex(s => !s.completedAt)
+    // Unticking a skipped step means doing it now: its do-later entry goes.
+    const base = nowDone ? run : withoutPendingLater(run, step.id)
     const updated = {
-      ...run,
+      ...base,
       steps: updatedSteps,
       currentStep: allDone ? run.steps.length - 1 : Math.max(firstUndone, 0),
       ...(allDone ? { finished: true, completedAt: Date.now() } : {}),
     }
     await saveRun(user.id, storageName, updated)
+    if (allDone) await recordRunCompletion(user.id, storageName, updated)
+    setRun(updated)
+  }
+
+  // Checklist mode's skip: the row is handled, the task waits on the list.
+  async function handleChecklistSkip(stepIdx) {
+    const now = Date.now()
+    const updated = skipRunStep(run, stepIdx, now, Math.max(0, now - run.startedAt))
+    await saveRun(user.id, storageName, updated)
+    if (updated.finished) await recordRunCompletion(user.id, storageName, updated)
     setRun(updated)
   }
 
@@ -2314,24 +2476,34 @@ export default function RoutineScreen() {
   }
 
   function renderModeToggle() {
+    const modeLabel = viewMode === 'checklist' ? 'checklist' : 'step-by-step'
     return (
-      <View style={[s.modeToggleWrap, { backgroundColor: theme.isDark ? '#1a1a2e' : '#f1f5f9', borderColor: theme.cardBorder }]}>
-        <Pressable
-          style={[s.modeBtn, viewMode === 'steps' && { backgroundColor: card.color }]}
-          onPress={() => setViewMode('steps')}
-        >
-          <Text style={[s.modeBtnText, { color: viewMode === 'steps' ? '#fff' : theme.subtext }]}>
-            Step-by-step
-          </Text>
-        </Pressable>
-        <Pressable
-          style={[s.modeBtn, viewMode === 'checklist' && { backgroundColor: card.color }]}
-          onPress={() => setViewMode('checklist')}
-        >
-          <Text style={[s.modeBtnText, { color: viewMode === 'checklist' ? '#fff' : theme.subtext }]}>
-            Checklist
-          </Text>
-        </Pressable>
+      <View style={s.modeToggleBlock}>
+        <View style={[s.modeToggleWrap, { backgroundColor: theme.isDark ? '#1a1a2e' : '#f1f5f9', borderColor: theme.cardBorder }]}>
+          <Pressable
+            style={[s.modeBtn, viewMode === 'steps' && { backgroundColor: card.color }]}
+            onPress={() => chooseViewMode('steps')}
+          >
+            <Text style={[s.modeBtnText, { color: viewMode === 'steps' ? '#fff' : theme.subtext }]}>
+              Step-by-step
+            </Text>
+          </Pressable>
+          <Pressable
+            style={[s.modeBtn, viewMode === 'checklist' && { backgroundColor: card.color }]}
+            onPress={() => chooseViewMode('checklist')}
+          >
+            <Text style={[s.modeBtnText, { color: viewMode === 'checklist' ? '#fff' : theme.subtext }]}>
+              Checklist
+            </Text>
+          </Pressable>
+        </View>
+        {/* One tap to keep this mode for every routine from now on. Also
+            switchable under Settings → App Preferences. */}
+        {viewMode !== defaultRunMode && (
+          <Pressable onPress={makeViewModeDefault} hitSlop={8} style={s.modeDefaultBtn}>
+            <Text style={[s.modeDefaultText, { color: card.color }]}>Make {modeLabel} my default</Text>
+          </Pressable>
+        )}
       </View>
     )
   }
@@ -2363,7 +2535,7 @@ export default function RoutineScreen() {
 
   // Muscle-focus banner (or split setup card). Rendered below the hero banner
   // in the preview, and at the top while a run is in progress or finished.
-  const fitnessSplitBanner = isFitness && !isAlt && (gymSplit ? (
+  const fitnessSplitBanner = isFitness && !isAlt && !hideWorkouts && (gymSplit ? (
     <View style={[s.splitBanner, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
       <View style={{ flex: 1 }}>
         <Text style={[s.splitDay, { color: theme.subtext }]}>{DAY_LABELS[todayIdx]} · Muscle Focus</Text>
@@ -2462,16 +2634,21 @@ export default function RoutineScreen() {
               backgroundColor: theme.isDark ? theme.card : card.bg,
               borderColor: theme.isDark ? theme.cardBorder : card.border,
             }]}>
-              <Text style={s.doneEmoji}>🎉</Text>
-              <View>
-                <Text style={[s.doneTitle, { color: card.color }]}>All done!</Text>
-                <Text style={[s.doneSub, { color: theme.subtext }]}>Total time: {fmtMs(run.completedAt - run.startedAt)}</Text>
+              <Text style={s.doneEmoji}>{pendingLater(run) > 0 ? '⏭' : '🎉'}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[s.doneTitle, { color: pendingLater(run) > 0 ? '#f59e0b' : card.color }]}>
+                  {pendingLater(run) > 0 ? 'Almost there' : 'All done!'}
+                </Text>
+                <Text style={[s.doneSub, { color: theme.subtext }]}>
+                  Total time: {fmtMs(run.completedAt - run.startedAt)}
+                  {pendingLater(run) > 0 ? `  ·  ${pendingLater(run)} to do later` : ''}
+                </Text>
               </View>
             </View>
             {run.steps.map(step => (
               <View key={step.id} style={[s.doneStep, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-                <View style={[s.doneCheck, { backgroundColor: card.color }]}>
-                  <Text style={s.doneCheckMark}>✓</Text>
+                <View style={[s.doneCheck, { backgroundColor: step.skipped ? '#f59e0b' : card.color }]}>
+                  <Text style={s.doneCheckMark}>{step.skipped ? '→' : '✓'}</Text>
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={[s.doneStepText, { color: theme.text }]}>{step.text}</Text>
@@ -2479,9 +2656,46 @@ export default function RoutineScreen() {
                     <Text key={st.id} style={[s.doneSubText, { color: theme.muted }]}>· {st.text}</Text>
                   ))}
                 </View>
-                <Text style={[s.doneTime, { color: theme.subtext }]}>{fmtMs(step.elapsedMs)}</Text>
+                <Text style={[s.doneTime, { color: step.skipped ? '#f59e0b' : theme.subtext }]}>
+                  {step.skipped ? 'later' : fmtMs(step.elapsedMs)}
+                </Text>
               </View>
             ))}
+            {/* Skipped steps wait here. Tick one whenever it gets done; the
+                time it was ticked stays beside it, and the routine only
+                counts as complete once the list is clear. */}
+            {laterItems(run).length > 0 && (
+              <View style={[s.laterCard, {
+                backgroundColor: theme.card,
+                borderColor: pendingLater(run) > 0 ? '#f59e0b66' : theme.cardBorder,
+              }]}>
+                <Text style={[s.laterTitle, { color: pendingLater(run) > 0 ? '#f59e0b' : theme.muted }]}>
+                  DO LATER  ·  {laterItems(run).length - pendingLater(run)} / {laterItems(run).length} DONE
+                </Text>
+                {laterItems(run).map(item => (
+                  <Pressable key={item.id} style={s.laterRow} onPress={() => handleLaterToggle(item.id)}>
+                    <View style={[s.laterCheck, { borderColor: item.doneAt ? card.color : '#d1d5db' }, item.doneAt && { backgroundColor: card.color }]}>
+                      {item.doneAt && <Text style={s.clCheckMark}>✓</Text>}
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.laterText, { color: theme.text }, item.doneAt && { textDecorationLine: 'line-through', opacity: 0.55 }]}>
+                        {item.text}
+                      </Text>
+                      <Text style={[s.laterMeta, { color: item.doneAt ? card.color : theme.muted }]}>
+                        {item.doneAt
+                          ? `Done at ${clockLabel(item.doneAt)}`
+                          : `Skipped at ${clockLabel(item.skippedAt)}  ·  tap when done`}
+                      </Text>
+                    </View>
+                  </Pressable>
+                ))}
+                <Text style={[s.laterHint, { color: theme.muted }]}>
+                  {pendingLater(run) > 0
+                    ? 'The routine counts as complete once these are ticked off.'
+                    : 'Everything on the list is done.'}
+                </Text>
+              </View>
+            )}
             <Pressable
               style={[s.editTmrBtn, { borderColor: theme.cardBorder, backgroundColor: theme.card }]}
               onPress={() => router.push(editHref)}
@@ -2508,9 +2722,18 @@ export default function RoutineScreen() {
                 onToggleSubTask={handleToggleSubTask}
                 onJumpTo={handleJumpTo}
                 onAdjustStart={handleAdjustStart}
+                onSkip={handleSkipStep}
               />
             ) : (
               <View>
+                <ChecklistTimer
+                  startedAt={run.startedAt}
+                  doneCount={run.steps.filter(st => st.completedAt).length}
+                  totalCount={run.steps.length}
+                  goalSecs={run.steps.reduce((sum, st) => sum + taskGoalSecs(st), 0)}
+                  color={card.color}
+                  theme={theme}
+                />
                 {run.steps.map((step, i) => {
                   const done = !!step.completedAt
                   return (
@@ -2518,18 +2741,28 @@ export default function RoutineScreen() {
                       key={step.id}
                       style={[s.clItem, {
                         backgroundColor: theme.card,
-                        borderColor: done ? card.color : theme.cardBorder,
+                        borderColor: done ? (step.skipped ? '#f59e0b' : card.color) : theme.cardBorder,
                         shadowColor: done ? card.color : '#000',
                       }]}
                       onPress={() => handleChecklistToggle(i)}
                     >
-                      <View style={[s.clCheck, { borderColor: done ? card.color : '#d1d5db' }, done && { backgroundColor: card.color }]}>
-                        {done && <Text style={s.clCheckMark}>✓</Text>}
+                      <View style={[s.clCheck, { borderColor: done ? (step.skipped ? '#f59e0b' : card.color) : '#d1d5db' }, done && { backgroundColor: step.skipped ? '#f59e0b' : card.color }]}>
+                        {done && <Text style={s.clCheckMark}>{step.skipped ? '→' : '✓'}</Text>}
                       </View>
                       <View style={{ flex: 1 }}>
-                        <Text style={[s.clItemText, { color: theme.text }, done && s.clItemDone]}>
-                          {step.text}
-                        </Text>
+                        <View style={s.clItemTitleRow}>
+                          <Text style={[s.clItemText, { color: theme.text, flexShrink: 1 }, done && s.clItemDone]}>
+                            {step.text}
+                          </Text>
+                          {done && step.skipped && <Text style={s.clLaterTag}>LATER</Text>}
+                          {/* Skip: the row is handled for today's flow and the
+                              task waits on the do-later list at the end. */}
+                          {!done && (
+                            <Pressable onPress={() => handleChecklistSkip(i)} hitSlop={8} style={s.clLaterBtn}>
+                              <Text style={[s.clLaterBtnText, { color: theme.muted }]}>Later →</Text>
+                            </Pressable>
+                          )}
+                        </View>
                         {step.subTasks?.length > 0 && (
                           <Pressable
                             onPress={() => setClExpanded(m => ({ ...m, [step.id]: !m[step.id] }))}
@@ -2699,18 +2932,34 @@ export default function RoutineScreen() {
                 </View>
               </View>
             )}
+          </>
+        )}
 
-        {/* ── Fitness: My Workouts section ── */}
-        {isFitness && !isAlt && (
+        {/* ── Fitness: My Workouts section. Rendered in every state, so a
+            workout can be started while the routine is running: the run is
+            saved as it goes and picks up again when the workout screen is
+            left. ── */}
+        {isFitness && !isAlt && !hideWorkouts && (
           <View style={[s.workoutSection, { borderTopColor: theme.divider }]}>
             <View style={s.workoutHeader}>
               <Text style={[s.workoutTitle, { color: theme.text }]}>💪 My Workouts</Text>
-              <Pressable onPress={createNewRoutine}>
-                <Text style={[s.workoutEditLink, { color: card.color }]}>+ New</Text>
-              </Pressable>
+              <View style={s.workoutHeaderActions}>
+                <Pressable onPress={() => setWorkoutsHidden(true)} hitSlop={8}>
+                  <Text style={[s.workoutHideLink, { color: theme.muted }]}>Hide</Text>
+                </Pressable>
+                <Pressable onPress={createNewRoutine} hitSlop={8}>
+                  <Text style={[s.workoutEditLink, { color: card.color }]}>+ New</Text>
+                </Pressable>
+              </View>
             </View>
 
-            <WorkoutWeekCalendar userId={user.id} theme={theme} accentColor={card.color} />
+            {(!run || run.quick) ? (
+              <WorkoutWeekCalendar userId={user.id} theme={theme} accentColor={card.color} />
+            ) : !run.finished ? (
+              <Text style={[s.workoutRunHint, { color: theme.subtext }]}>
+                Your routine keeps running while you train. Start a workout here and come back to it after.
+              </Text>
+            ) : null}
 
             {allRoutines.length === 0 ? (
               <Pressable style={[s.workoutEmptyCard, { backgroundColor: theme.card, borderColor: theme.isDark ? '#28284a' : '#c7d2fe' }]} onPress={createNewRoutine}>
@@ -2919,6 +3168,20 @@ export default function RoutineScreen() {
           </View>
         )}
 
+        {/* Fitness: workouts tucked away — one tap brings them back */}
+        {isFitness && !isAlt && hideWorkouts && (
+          <View style={s.hiddenPillsRow}>
+            <Pressable
+              style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
+              onPress={() => setWorkoutsHidden(false)}
+            >
+              <Text style={[s.hiddenPillText, { color: card.color }]}>+ Show workouts</Text>
+            </Pressable>
+          </View>
+        )}
+
+        {(!run || run.quick) && (
+          <>
             {/* Section label */}
             {!altIsEmpty && (
               <View style={s.previewSectionRow}>
@@ -3315,6 +3578,19 @@ const s = StyleSheet.create({
   doneStepText: { fontSize: 15, fontWeight: '500' },
   doneSubText: { fontSize: 12, marginTop: 3 },
   doneTime: { fontSize: 13, fontWeight: '500' },
+  // Do-later list on the summary
+  laterCard: { borderRadius: 16, borderWidth: 1.5, padding: 14, marginTop: 6, marginBottom: 8 },
+  laterTitle: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, marginBottom: 4 },
+  laterRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 },
+  laterCheck: { width: 26, height: 26, borderRadius: 9, borderWidth: 2, alignItems: 'center', justifyContent: 'center' },
+  laterText: { fontSize: 15, fontWeight: '600' },
+  laterMeta: { fontSize: 12, marginTop: 2, fontWeight: '500' },
+  laterHint: { fontSize: 12, marginTop: 6 },
+  // Checklist rows: skip affordance and the skipped tag
+  clItemTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  clLaterTag: { fontSize: 9.5, fontWeight: '800', letterSpacing: 0.6, color: '#f59e0b' },
+  clLaterBtn: { paddingVertical: 4, paddingHorizontal: 6, marginLeft: 'auto' },
+  clLaterBtnText: { fontSize: 12, fontWeight: '700' },
   editTmrBtn: {
     borderRadius: 14, padding: 14, alignItems: 'center',
     borderWidth: 1.5, marginTop: 8,
@@ -3421,7 +3697,10 @@ const s = StyleSheet.create({
   },
   workoutHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   workoutTitle: { fontSize: 17, fontWeight: '700' },
+  workoutRunHint: { fontSize: 13, lineHeight: 18, fontWeight: '500', marginBottom: 12 },
   workoutEditLink: { fontSize: 13, fontWeight: '600' },
+  workoutHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 16 },
+  workoutHideLink: { fontSize: 13, fontWeight: '600' },
   workoutEmptyCard: {
     borderRadius: 14, padding: 16,
     borderWidth: 1.5, borderStyle: 'dashed',
@@ -3525,12 +3804,32 @@ const s = StyleSheet.create({
 
   modeToggleWrap: {
     flexDirection: 'row', borderRadius: 14, padding: 4,
-    marginBottom: 16, borderWidth: 1,
+    borderWidth: 1,
   },
   modeBtn: {
     flex: 1, paddingVertical: 9, borderRadius: 10, alignItems: 'center',
   },
   modeBtnText: { fontSize: 13, fontWeight: '700' },
+  modeToggleBlock: { marginBottom: 16 },
+  modeDefaultBtn: { alignSelf: 'center', marginTop: 6, paddingVertical: 4, paddingHorizontal: 8 },
+  modeDefaultText: { fontSize: 12, fontWeight: '700' },
+
+  // Checklist mode: running total at the top of the list
+  clTimerCard: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    borderRadius: 16, borderWidth: 1.5, padding: 14, marginBottom: 12,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05, shadowRadius: 6, elevation: 2,
+  },
+  clTimerLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8 },
+  clTimerBig: { fontSize: 34, fontWeight: '300', marginTop: 2, fontVariant: ['tabular-nums'] },
+  clTimerSub: { fontSize: 12, fontWeight: '600', marginTop: 2 },
+  clTimerCountPill: {
+    alignItems: 'center', justifyContent: 'center',
+    borderRadius: 12, paddingVertical: 8, paddingHorizontal: 14, minWidth: 68,
+  },
+  clTimerCountText: { fontSize: 16, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  clTimerCountSub: { fontSize: 11, fontWeight: '600', marginTop: 1 },
 
   clItem: {
     flexDirection: 'row', alignItems: 'center',

@@ -43,6 +43,31 @@ const EXERCISE_MUSCLES = [
   'Hip Flexors', 'Adductors', 'Glutes', 'Quads', 'Hamstrings', 'Calves', 'Neck',
 ]
 
+// ── AI meal planner (the Plan tab on the Meals page) ─────────────────────────
+// A generation and each revision cost one unit of this daily cap.
+const MAX_MEALPLAN_PER_DAY = 6
+const PLAN_MODEL = 'gpt-5.6-luna'
+// What the planner estimates per meal: the macros plus the vitamins and
+// minerals most likely to fall short on a restricted diet. A subset of
+// FOOD_NUTRIENTS, same keys and units, so a planned meal logs like any other.
+const PLAN_NUTRIENTS: Array<[string, string]> = [
+  ['calories', 'kcal'], ['protein', 'g'], ['carbs', 'g'], ['fat', 'g'],
+  ['fiber', 'g'], ['sugar', 'g'], ['saturatedFat', 'g'],
+  ['sodium', 'mg'], ['potassium', 'mg'], ['calcium', 'mg'], ['iron', 'mg'], ['magnesium', 'mg'], ['zinc', 'mg'],
+  ['vitaminA', 'mcg'], ['vitaminC', 'mg'], ['vitaminD', 'mcg'], ['vitaminB12', 'mcg'], ['folate', 'mcg'],
+]
+const PLAN_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+const PLAN_DAY_ALIASES: Record<string, string> = {
+  mon: 'Mon', monday: 'Mon', tue: 'Tue', tues: 'Tue', tuesday: 'Tue', wed: 'Wed', wednesday: 'Wed',
+  thu: 'Thu', thur: 'Thu', thurs: 'Thu', thursday: 'Thu', fri: 'Fri', friday: 'Fri',
+  sat: 'Sat', saturday: 'Sat', sun: 'Sun', sunday: 'Sun',
+}
+const PLAN_SECTION_ALIASES: Record<string, string> = {
+  morning: 'morning', breakfast: 'morning', brunch: 'morning',
+  lunch: 'lunch', dinner: 'dinner', supper: 'dinner',
+  snacks: 'snacks', snack: 'snacks', dessert: 'snacks',
+}
+
 // Actions that consume the daily generative rate limit.
 // extract_workout has its own weekly cap (ai_workout_limits) instead.
 const GENERATIVE = new Set(['create_routine', 'advise_routine', 'analyze_looks'])
@@ -145,7 +170,7 @@ Deno.serve(async (req) => {
           429,
         )
       }
-    } else if (action === 'food_clarify' || action === 'food_estimate') {
+    } else if (action === 'food_clarify' || action === 'food_estimate' || action === 'food_scan') {
       const rl = await consumeLimit('food', MAX_FOOD_PER_DAY)
       if (!rl) return limitUnavailable()
       if (!rl.allowed) {
@@ -154,12 +179,21 @@ Deno.serve(async (req) => {
           429,
         )
       }
-    } else if (action === 'exercise_muscles') {
+    } else if (action === 'exercise_muscles' || action === 'meal_coach') {
       const rl = await consumeLimit('light', MAX_LIGHT_PER_DAY)
       if (!rl) return limitUnavailable()
       if (!rl.allowed) {
         return json(
           { error: 'daily_limit', reason: `Daily limit of ${MAX_LIGHT_PER_DAY} AI helper uses reached. Try again tomorrow.` },
+          429,
+        )
+      }
+    } else if (action === 'meal_plan_generate' || action === 'meal_plan_revise') {
+      const rl = await consumeLimit('mealplan', MAX_MEALPLAN_PER_DAY)
+      if (!rl) return limitUnavailable()
+      if (!rl.allowed) {
+        return json(
+          { error: 'daily_limit', reason: `Daily limit of ${MAX_MEALPLAN_PER_DAY} meal plans reached. Try again tomorrow.` },
           429,
         )
       }
@@ -595,20 +629,30 @@ Deno.serve(async (req) => {
     if (action === 'food_clarify') {
       const query = String(body.query ?? '').trim().slice(0, 200)
       if (!query) return json({ error: 'missing_query' }, 400)
+      const details = foodDetails(body)
 
-      const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: query })
+      const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+        input: [query, ...details.map(d => d.a)].join('\n').slice(0, 3000),
+      })
       if (mod.results?.[0]?.flagged) {
         return json({ error: 'flagged', reason: 'That text could not be processed.' }, 422)
       }
 
-      const prompt =
-        `A user of a nutrition-tracking app wants to log this food: "${query}"\n\n` +
-        'Before its nutrition is estimated, ask ONLY the questions whose answers would materially change the numbers. ' +
-        'The usual gaps: the specific type or variety, the amount eaten (cups, grams, pieces, or a plate or bowl description), ' +
-        'how it was prepared or cooked, and any oil, sauce, sugar or toppings added. Skip anything the description already answers. ' +
-        'Ask at most 3 questions. If the description already pins down both the type and the amount, ask nothing.\n\n' +
-        'Return ONLY valid JSON: {"questions":[{"id":"q1","text":"short question","hint":"example answer"}]}\n' +
-        'Keep each question under 12 words and each hint under 8. Never use em dashes.'
+      const prompt = details.length
+        ? `A user of a nutrition-tracking app described a meal they ate:\n${foodDetailBlock(query, details)}\n\n` +
+          'Before its nutrition is estimated, ask ONLY the questions whose answers would materially change the numbers. ' +
+          'The usual gaps: an ingredient listed without an amount, how much of the whole dish they ate (if it was a recipe, its total yield and the share eaten), ' +
+          'how it was cooked, and any oil, sauce, sugar or toppings not mentioned. Skip anything the description already answers. ' +
+          'Ask at most 3 questions. If the amounts and the share eaten are already pinned down, ask nothing.\n\n' +
+          'Return ONLY valid JSON: {"questions":[{"id":"q1","text":"short question","hint":"example answer"}]}\n' +
+          'Keep each question under 14 words and each hint under 8. Never use em dashes.'
+        : `A user of a nutrition-tracking app wants to log this food: "${query}"\n\n` +
+          'Before its nutrition is estimated, ask ONLY the questions whose answers would materially change the numbers. ' +
+          'The usual gaps: the specific type or variety, the amount eaten (cups, grams, pieces, or a plate or bowl description), ' +
+          'how it was prepared or cooked, and any oil, sauce, sugar or toppings added. Skip anything the description already answers. ' +
+          'Ask at most 3 questions. If the description already pins down both the type and the amount, ask nothing.\n\n' +
+          'Return ONLY valid JSON: {"questions":[{"id":"q1","text":"short question","hint":"example answer"}]}\n' +
+          'Keep each question under 12 words and each hint under 8. Never use em dashes.'
 
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
         model: FOOD_MODEL,
@@ -630,9 +674,87 @@ Deno.serve(async (req) => {
       return json({ questions })
     }
 
+    // ── Scan a meal photo: name it and what is on the plate, or ask what the
+    //    photo cannot show. The client then runs food_estimate with the same
+    //    photo attached, so a scan costs two food units like a described meal.
+    if (action === 'food_scan') {
+      const base64 = typeof body.base64 === 'string' ? body.base64 : ''
+      if (!base64) return json({ error: 'missing_photo', reason: 'Take a photo of the meal first.' }, 400)
+      const oversize = checkImageSize(base64)
+      if (oversize) return oversize
+      const note = String(body.note ?? '').trim().slice(0, 300)
+
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+          model: 'omni-moderation-latest',
+          input: [
+            ...(note ? [{ type: 'text', text: note }] : []),
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+          ],
+        })
+        if (mod.results?.[0]?.flagged === true) {
+          return json({ error: 'flagged', reason: 'That photo could not be processed.' }, 422)
+        }
+      } catch (e) {
+        console.error('food_scan moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'We could not check that photo right now. Please try again.' },
+          503,
+        )
+      }
+
+      const prompt =
+        'A user of a nutrition-tracking app photographed a meal they are about to log. Identify it from the photo' +
+        (note ? ` (they added: "${note}")` : '') + '.\n\n' +
+        'Return ONLY valid JSON:\n' +
+        '{"name":"short meal name","contents":"one line listing what you can see on the plate, with rough amounts","portion":"the portion visible, e.g. 1 plate (about 350 g)","confidence":"low|medium|high","questions":[{"id":"q1","text":"short question","hint":"example answer"}]}\n\n' +
+        'Rules:\n' +
+        '- If the photo is not of food or drink, set name to an empty string and say why in contents.\n' +
+        '- Ask ONLY the questions whose answers would materially change the nutrition and that the photo cannot answer: a hidden ingredient or sauce, how it was cooked, whether the whole plate is being eaten, a drink or dressing out of frame. Skip anything the photo already shows. At most 3 questions; ask nothing when the photo is clear enough.\n' +
+        '- Keep each question under 12 words and each hint under 8. Never use em dashes.'
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: FOOD_MODEL,
+        reasoning_effort: 'low',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' } },
+          ],
+        }],
+        max_completion_tokens: 3000,
+        response_format: { type: 'json_object' },
+      })
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const parsed = JSON.parse(choice?.message?.content ?? '{}') as Record<string, unknown>
+      const str = (v: unknown, max: number) => noEmDash(String(v ?? '').trim()).slice(0, max)
+      const rawQ = (Array.isArray(parsed.questions) ? parsed.questions : []) as Array<Record<string, unknown>>
+      const questions = rawQ
+        .map((q, i) => ({ id: `q${i + 1}`, text: str(q?.text, 120), hint: str(q?.hint, 60) }))
+        .filter(q => q.text)
+        .slice(0, 3)
+      const name = str(parsed.name, 80)
+      if (!name) {
+        return json({ error: 'not_food', reason: str(parsed.contents, 200) || 'That does not look like a meal. Try another photo.' }, 422)
+      }
+      const confidenceRaw = str(parsed.confidence, 10).toLowerCase()
+      return json({
+        name,
+        contents: str(parsed.contents, 300) || null,
+        portion: str(parsed.portion, 80) || null,
+        confidence: ['low', 'medium', 'high'].includes(confidenceRaw) ? confidenceRaw : 'medium',
+        questions,
+      })
+    }
+
     if (action === 'food_estimate') {
       const query = String(body.query ?? '').trim().slice(0, 200)
       if (!query) return json({ error: 'missing_query' }, 400)
+      const details = foodDetails(body)
       const answers: Array<{ q: string; a: string }> = (Array.isArray(body.answers) ? body.answers : [])
         .map((x: Record<string, unknown>) => ({
           q: String(x?.q ?? '').trim().slice(0, 160),
@@ -648,7 +770,7 @@ Deno.serve(async (req) => {
 
       // Text and (if present) the photo go through moderation first. Like the
       // other photo features this fails closed: no verdict, no estimate.
-      const text = [query, ...answers.map(x => x.a)].join('\n').slice(0, 3000)
+      const text = [query, ...details.map(d => d.a), ...answers.map(x => x.a)].join('\n').slice(0, 3000)
       try {
         const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
           model: 'omni-moderation-latest',
@@ -673,10 +795,16 @@ Deno.serve(async (req) => {
       const qa = answers.map(x => `Q: ${x.q}\nA: ${x.a}`).join('\n')
       const prompt =
         'You estimate nutrition for a food-logging app, with the care of a registered dietitian using standard food-composition data (USDA-style values).\n\n' +
-        `Food as described by the user: "${query}"\n` +
+        (details.length
+          ? `Meal as described by the user:\n${foodDetailBlock(query, details)}\n`
+          : `Food as described by the user: "${query}"\n`) +
         (qa ? `Clarifying answers:\n${qa}\n` : '') +
         (base64 ? 'A photo of the food is attached: use it to judge the type, the portion size and the preparation, and prefer what you can see over assumptions.\n' : '') +
-        '\nEstimate the nutrition for the WHOLE portion the user ate (not per 100 g). State the exact portion you assumed.\n\n' +
+        '\nEstimate the nutrition for the WHOLE portion the user ate (not per 100 g). ' +
+        (details.length
+          ? 'Work from the ingredient amounts; if they gave a recipe yield and the share they ate, scale to that share. Keep the meal name they gave. '
+          : '') +
+        'State the exact portion you assumed.\n\n' +
         'Return ONLY valid JSON:\n' +
         `{"name":"short food name","portion":"the amount you estimated for, e.g. 1 cup (170 g), cooked","contents":"one line on what is in it and how it was prepared","confidence":"low|medium|high","notes":"one short sentence on the biggest uncertainty, or an empty string","macros":{${macroTemplate}}}\n\n` +
         'Rules:\n' +
@@ -730,7 +858,9 @@ Deno.serve(async (req) => {
         .insert({
           user_id: user.id,
           query,
-          answers,
+          // The described ingredients and servings ride along in answers so
+          // the record needs no new columns.
+          answers: [...details, ...answers],
           had_photo: !!base64,
           name: estimate.name,
           portion: estimate.portion,
@@ -800,12 +930,531 @@ Deno.serve(async (req) => {
       return json({ primary, secondary, note, video })
     }
 
+    // ── AI meal planner ─────────────────────────────────────────────────────
+    // generate: goals + survey answers in, a week of meals out.
+    // revise: the same plus the current week and what to change.
+
+    if (action === 'meal_plan_generate' || action === 'meal_plan_revise') {
+      const answers = planAnswers(body.answers)
+      const request = action === 'meal_plan_revise' ? String(body.request ?? '').trim().slice(0, 600) : ''
+      if (action === 'meal_plan_revise' && !request) {
+        return json({ error: 'missing_request', reason: 'Say what you would like changed first.' }, 400)
+      }
+
+      // Everything the user typed goes through moderation first. Fails closed.
+      const userText = [...answers.map(x => x.a), request].filter(Boolean).join('\n').slice(0, 4000)
+      if (userText) {
+        try {
+          const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: userText })
+          if (mod.results?.[0]?.flagged) {
+            return json({ error: 'flagged', reason: 'That text could not be processed.' }, 422)
+          }
+        } catch (e) {
+          console.error('meal plan moderation failed:', e)
+          return json(
+            { error: 'moderation_unavailable', reason: 'We could not check that request right now. Please try again.' },
+            503,
+          )
+        }
+      }
+
+      const prompt = action === 'meal_plan_generate'
+        ? mealPlanPrompt(body, answers)
+        : mealPlanRevisePrompt(body, answers, request)
+
+      // A whole week takes the model a minute or more. The reply is streamed
+      // with a keep-alive byte every few seconds so the app's idle timeout
+      // (60 s on iOS) cannot fire while it thinks; see streamJson.
+      return streamJson(async () => {
+        // Balancing seven days of macros needs more thought than a food
+        // estimate, and the reply is 20 to 30 meals of JSON, so both effort
+        // and the token budget are higher than the other text actions.
+        const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+          model: PLAN_MODEL,
+          reasoning_effort: 'medium',
+          messages: [{ role: 'user', content: prompt }],
+          max_completion_tokens: 40000,
+          response_format: { type: 'json_object' },
+        })
+        const choice = chat.choices?.[0]
+        if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+          return { error: 'inappropriate' }
+        }
+        let parsed: Record<string, unknown> = {}
+        try { parsed = JSON.parse(choice?.message?.content ?? '{}') } catch { parsed = {} }
+        const plan = normalizeMealPlan(parsed)
+        if (!plan.meals.length || !plan.days.some(d => d.mealIds.length)) {
+          console.error('meal plan came back empty; finish_reason:', choice?.finish_reason)
+          return { error: 'empty_plan', reason: 'The planner came back empty. Please try again.' }
+        }
+        return plan
+      })
+    }
+
+    // ── Meal coach: a chat about the user's plan and what they eat ──────────
+
+    if (action === 'meal_coach') {
+      const messages = coachMessages(body.messages)
+      if (!messages.length || messages[messages.length - 1].role !== 'user') {
+        return json({ error: 'missing_query', reason: 'Type a question first.' }, 400)
+      }
+
+      // Everything the user typed in this conversation goes through
+      // moderation first. Fails closed.
+      const userText = messages.filter(m => m.role === 'user').map(m => m.content).join('\n').slice(0, 4000)
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: userText })
+        if (mod.results?.[0]?.flagged) {
+          return json({ error: 'flagged', reason: 'That message could not be processed.' }, 422)
+        }
+      } catch (e) {
+        console.error('meal_coach moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'We could not check that message right now. Please try again.' },
+          503,
+        )
+      }
+
+      // The live numbers go in right before the latest question, not only at
+      // the top: models lean on the most recent context, and an earlier turn
+      // in the conversation may quote totals that have since changed.
+      const history = messages.slice(0, -1)
+      const latest = messages[messages.length - 1]
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: PLAN_MODEL,
+        reasoning_effort: 'low',
+        messages: [
+          { role: 'system', content: mealCoachRules() },
+          ...history,
+          { role: 'system', content: mealCoachData(body) },
+          latest,
+        ],
+        max_completion_tokens: 4000,
+      })
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const reply = noEmDash(String(choice?.message?.content ?? '').trim()).slice(0, 4000)
+      if (!reply) return json({ error: 'empty_reply', reason: 'The coach had nothing to say. Please try again.' }, 502)
+      return json({ reply })
+    }
+
     return json({ error: 'unknown_action' }, 400)
   } catch (e) {
     console.error('openai-proxy error:', e)
     return json({ error: 'internal_error' }, 500)
   }
 })
+
+// ── Meal coach helpers ────────────────────────────────────────────────────────
+
+type CoachMessage = { role: 'user' | 'assistant'; content: string }
+
+// The last few turns of the conversation, each trimmed; roles other than the
+// two chat roles are dropped so the client cannot inject a system message.
+function coachMessages(raw: unknown): CoachMessage[] {
+  return (Array.isArray(raw) ? raw : [])
+    .map((m: Record<string, unknown>) => ({
+      role: m?.role === 'assistant' ? 'assistant' : m?.role === 'user' ? 'user' : null,
+      content: String(m?.content ?? '').trim().slice(0, 1500),
+    }))
+    .filter((m): m is CoachMessage => !!m.role && !!m.content)
+    .slice(-12)
+}
+
+const macroNum = (v: unknown) => { const n = Number(v); return Number.isFinite(n) ? n : 0 }
+
+// Every tracked nutrient summed over a list of meals.
+function sumNutrients(meals: Array<Record<string, unknown>>): Record<string, number> {
+  const t: Record<string, number> = {}
+  for (const m of meals) {
+    const macros = (m?.macros && typeof m.macros === 'object' ? m.macros : {}) as Record<string, unknown>
+    for (const [k] of FOOD_NUTRIENTS) {
+      const n = macroNum(macros[k])
+      if (n) t[k] = (t[k] ?? 0) + n
+    }
+  }
+  return t
+}
+
+const fmtNutrient = (k: string, v: number) => (k === 'calories' ? String(Math.round(v)) : String(Math.round(v * 10) / 10))
+
+// One food, with every nutrient it was logged with, on its own line. The
+// coach answers a question about a single food from this, so nothing is
+// folded into a day total. Keys that are present but zero are listed at the
+// end so "0 mg" and "not tracked" stay distinguishable.
+function mealLine(m: Record<string, unknown>, withSection = true): string {
+  const s = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max)
+  const macros = (m?.macros && typeof m.macros === 'object' ? m.macros : {}) as Record<string, unknown>
+  const tracked = FOOD_NUTRIENTS.filter(([k]) => macros[k] !== undefined && macros[k] !== null && macros[k] !== '' && Number.isFinite(Number(macros[k])))
+  const nonzero = tracked.filter(([k]) => macroNum(macros[k]) !== 0)
+  const zero = tracked.filter(([k]) => macroNum(macros[k]) === 0).map(([k]) => k)
+  const values = nonzero.map(([k, u]) => `${k} ${fmtNutrient(k, macroNum(macros[k]))} ${u}`).join(', ') || 'nothing tracked'
+  const section = withSection ? s(m.section, 10) : ''
+  const contents = s(m.contents, 140)
+  const flag = m.source === 'ai' ? ' (AI estimate)' : ''
+  return `- ${section ? section + ': ' : ''}${s(m.name, 60)}${flag}${contents ? ` [${contents}]` : ''} | ${values}${zero.length ? `; zero: ${zero.join(', ')}` : ''}`
+}
+
+// The headline five, the way the app shows a day.
+function dayTotals(meals: Array<Record<string, unknown>>): string {
+  const t = sumNutrients(meals)
+  return `${Math.round(t.calories ?? 0)} kcal, ${Math.round(t.protein ?? 0)} g protein, ${Math.round(t.carbs ?? 0)} g carbs, ${Math.round(t.fat ?? 0)} g fat, ${Math.round(t.fiber ?? 0)} g fiber`
+}
+
+// Everything else that was tracked (sugars, fats by type, sodium, minerals,
+// vitamins), in the app's units, skipping what is zero.
+function nutrientLine(t: Record<string, number>): string {
+  const skip = new Set(['calories', 'protein', 'carbs', 'fat', 'fiber'])
+  return FOOD_NUTRIENTS
+    .filter(([k]) => !skip.has(k) && (t[k] ?? 0) > 0)
+    .map(([k, u]) => `${k} ${fmtNutrient(k, t[k])} ${u}`)
+    .join(', ') || 'none tracked'
+}
+
+// The daily values the app's micronutrient bars grade against (FDA, 2,000
+// kcal reference). Must match MICRO_DV in app/(tabs)/meals.js.
+const DAILY_VALUES =
+  'Daily values the app grades against (limits, stay under): saturatedFat 20 g, transFat 2 g, cholesterol 300 mg, sodium 2300 mg, addedSugar 50 g. ' +
+  'Targets: fiber 28 g, potassium 4700 mg, calcium 1300 mg, iron 18 mg, magnesium 420 mg, zinc 11 mg, phosphorus 1250 mg, selenium 55 mcg, copper 0.9 mg, manganese 2.3 mg, chromium 35 mcg, iodine 150 mcg, ' +
+  'vitaminA 900 mcg, vitaminC 90 mg, vitaminD 20 mcg, vitaminE 15 mg, vitaminK 120 mcg, vitaminB6 1.7 mg, vitaminB12 2.4 mcg, folate 400 mcg, thiamin 1.2 mg, riboflavin 1.3 mg, niacin 16 mg, pantothenicAcid 5 mg, biotin 30 mcg. ' +
+  'A nutrient missing from a day\'s line was not tracked for those foods (many entries only carry the main macros), so say "not tracked" rather than "zero".'
+
+// Who the coach is and how it answers. The data it answers from is a
+// separate system message (mealCoachData) placed just before the latest
+// question.
+function mealCoachRules(): string {
+  return [
+    'You are the meal coach inside a nutrition-tracking app. The user asks about their weekly meal plan and what they eat: whether it is good, whether they are hitting their targets, how healthy it is, what to add or change, or ideas they are considering.',
+    'Answer like a knowledgeable, friendly registered dietitian who has their numbers in front of them. Be specific to THEIR data: name the meals, cite the numbers, say what is on track and what falls short (calories, protein, fiber, and the vitamins and minerals likely to be low for their eating pattern). Give concrete, realistic suggestions.',
+    'The data arrives in a system message right before their latest question and is current as of that question. It overrides any figure quoted earlier in the conversation, including your own earlier replies: if the numbers moved, use the new ones and say so.',
+    'Every food in the data has its own line with everything tracked for it: calories, macros, sugars, fats by type, sodium, minerals and vitamins in the app\'s units (logged today, logged earlier this week, and every planned meal). Each day also has totals, and the daily values the app grades against are listed. For a question about one food, find that food\'s line and quote the number from it; never estimate a value its line already gives. A nutrient absent from a food\'s line was not tracked for that entry: say so, and if you add a typical figure from general knowledge, label it clearly as a general estimate rather than their data. Use the nutrient lines for any question about micronutrients, vitamins, minerals, sodium or sugar, and compare against the daily values.',
+    'Two different things are in the data: what they have LOGGED (actually eaten) and what they have PLANNED for the week. When they ask about what they ate, use the logged totals and quote the exact "Today so far" line. When they ask about the plan, or when nothing is logged today and the foods they mention are in the plan, they mean the plan: use the planned day they mean (today\'s weekday is marked; otherwise the day they name) and quote its exact "planned day total" line. Never add the per-meal numbers up yourself; the totals are given. Say which one you are talking about ("in your plan for Monday" or "logged today") whenever it could be unclear.',
+    'Keep replies short: under 150 words unless they ask for detail. Plain text, short paragraphs or a few short bullet lines, no headings. Never use em dashes.',
+    'This is general nutrition guidance, not medical advice. For a health condition, medication, pregnancy, an eating disorder, or before starting a supplement, tell them to speak to a doctor or registered dietitian. Never diagnose. If asked about something unrelated to food, nutrition, cooking or their plan, steer back briefly.',
+  ].join('\n')
+}
+
+// What the coach knows, most relevant first: today's log with its totals,
+// targets and stats, the last seven days, then the weekly plan (meals per
+// day with day totals). Each block is capped so a big plan cannot blow up
+// the prompt, and the plan comes last so it is what gets cut if anything is.
+function mealCoachData(body: Record<string, unknown>): string {
+  const s = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max)
+  const parts: string[] = ['CURRENT DATA (as of the latest message; overrides anything earlier in the conversation)']
+
+  const today = (body.today && typeof body.today === 'object' ? body.today : null) as Record<string, unknown> | null
+  const todayMeals = (Array.isArray(today?.meals) ? today!.meals : []).slice(0, 30) as Array<Record<string, unknown>>
+  if (todayMeals.length) {
+    parts.push('', `LOGGED TODAY (${s(today?.date, 10)}), actually eaten, one line per food with everything tracked for it:`,
+      ...todayMeals.map(m => mealLine(m)),
+      `Today so far: ${dayTotals(todayMeals)}`,
+      `Today's other nutrients: ${nutrientLine(sumNutrients(todayMeals))}`)
+  } else {
+    parts.push('', 'LOGGED TODAY: nothing yet.')
+  }
+
+  parts.push('', planUserBlock(body, []), DAILY_VALUES)
+
+  const week = (Array.isArray(body.week) ? body.week : []).slice(0, 7) as Array<Record<string, unknown>>
+  if (week.length) {
+    parts.push('', 'LOGGED TOTALS, last 7 days (today included):',
+      ...week.map(d => {
+        const totals: Record<string, number> = {}
+        for (const [k] of FOOD_NUTRIENTS) { const n = macroNum(d[k]); if (n) totals[k] = n }
+        return `${s(d.date, 10)}: ${Math.round(totals.calories ?? 0)} kcal, ${Math.round(totals.protein ?? 0)} g protein, ${Math.round(totals.carbs ?? 0)} g carbs, ${Math.round(totals.fat ?? 0)} g fat, ${Math.round(totals.fiber ?? 0)} g fiber${macroNum(d.meals) ? ` (${Math.round(macroNum(d.meals))} meals)` : ''}; nutrients: ${nutrientLine(totals)}`
+      }))
+  }
+
+  // Which plan day is today, so "today" questions about the plan land on
+  // the right day. Dates are the app's local YYYY-MM-DD.
+  const todayIso = s(today?.date, 10)
+  const todayDow = /^\d{4}-\d{2}-\d{2}$/.test(todayIso)
+    ? PLAN_DAYS[(new Date(`${todayIso}T12:00:00Z`).getUTCDay() + 6) % 7]
+    : ''
+
+  const plan = (body.plan && typeof body.plan === 'object' ? body.plan : null) as Record<string, unknown> | null
+  if (plan) {
+    const mealsById = new Map<string, Record<string, unknown>>()
+    // A hand-built day can hold far more meals than the planner makes, so
+    // the caps here are generous: every meal must count, or the totals lie.
+    const planMeals = (Array.isArray(plan.meals) ? plan.meals : []).slice(0, 120) as Array<Record<string, unknown>>
+    for (const m of planMeals) {
+      const id = s(m?.id, 12)
+      if (id) mealsById.set(id, m)
+    }
+    const dayLines: string[] = []
+    for (const d of (Array.isArray(plan.days) ? plan.days : []).slice(0, 7)) {
+      const day = s((d as Record<string, unknown>)?.day, 3)
+      const ids = (Array.isArray((d as Record<string, unknown>)?.mealIds) ? (d as Record<string, unknown>).mealIds as unknown[] : []).slice(0, 25)
+      const meals = ids.map(id => mealsById.get(String(id))).filter(Boolean) as Array<Record<string, unknown>>
+      if (!day) continue
+      const names = meals.map(m => `${s(m.name, 60)} (${Math.round(macroNum((m.macros as Record<string, unknown>)?.calories))} kcal)`).join('; ')
+      dayLines.push(`${day}${day === todayDow ? ' (today)' : ''}: ${names || 'nothing planned'}${meals.length ? ` | planned day total ${dayTotals(meals)} | nutrients: ${nutrientLine(sumNutrients(meals))}` : ''}`)
+    }
+    if (dayLines.length) parts.push('', 'WEEKLY PLAN (what they intend to eat; repeats every week; NOT what was logged):', ...dayLines)
+    const notes = plan.nutritionNotes
+    if (Array.isArray(notes) && notes.length) {
+      parts.push('Notes the planner gave with it:', ...notes.slice(0, 6).map(n => `- ${s(n, 300)}`))
+    }
+    // Every distinct planned meal once, with everything tracked for it, so a
+    // question about one planned food is answered from that food's own line.
+    if (planMeals.length) {
+      parts.push('', 'PLANNED MEALS, full nutrition per meal (the plan days above refer to these by name):',
+        ...planMeals.slice(0, 80).map(m => mealLine(m)))
+    }
+  } else {
+    parts.push('', 'WEEKLY PLAN: none yet.')
+  }
+
+  // Foods logged on earlier days this week, one line each. Last, and the
+  // biggest block, so it is what gets cut if the prompt has to be trimmed.
+  const recent = (Array.isArray(body.recent) ? body.recent : []).slice(-6) as Array<Record<string, unknown>>
+  const recentLines: string[] = []
+  for (const d of recent) {
+    const date = s(d?.date, 10)
+    const meals = (Array.isArray(d?.meals) ? d.meals : []).slice(0, 20) as Array<Record<string, unknown>>
+    if (!date || date === todayIso || !meals.length) continue
+    recentLines.push(`${date}:`, ...meals.map(m => mealLine(m)))
+  }
+  if (recentLines.length) parts.push('', 'LOGGED EARLIER THIS WEEK, actually eaten, one line per food:', ...recentLines)
+
+  return parts.join('\n').slice(0, 64000)
+}
+
+// ── Food estimator helpers ────────────────────────────────────────────────────
+
+// The "Describe to AI" meal logger sends the meal's ingredients, how much was
+// eaten and any notes alongside the name. Each becomes a labelled line for
+// the prompts (and a { q, a } pair for the record). A plain search query has
+// none of these and reads exactly as before.
+function foodDetails(body: Record<string, unknown>): Array<{ q: string; a: string }> {
+  const fields: Array<[string, string, number]> = [
+    ['ingredients', 'Ingredients', 1200],
+    ['servings', 'Amount eaten', 120],
+    ['notes', 'Notes', 400],
+  ]
+  const out: Array<{ q: string; a: string }> = []
+  for (const [key, label, max] of fields) {
+    const v = String(body[key] ?? '').trim().slice(0, max)
+    if (v) out.push({ q: label, a: v })
+  }
+  return out
+}
+
+function foodDetailBlock(query: string, details: Array<{ q: string; a: string }>): string {
+  return [`Meal: ${query}`, ...details.map(d => `${d.q}: ${d.a}`)].join('\n')
+}
+
+// ── Meal planner helpers ──────────────────────────────────────────────────────
+
+// A 200 whose body arrives as: a space every few seconds while `work` runs,
+// then the JSON. Leading whitespace is valid JSON, so the client parses it as
+// usual, and the trickle keeps idle timeouts from closing the connection on a
+// long generation. Because the status is committed up front, failures inside
+// `work` are reported in the body ({ error, reason }), which the app's proxy
+// helper already treats the same as a non-2xx reply.
+function streamJson(work: () => Promise<unknown>): Response {
+  const enc = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const tick = setInterval(() => {
+        try { controller.enqueue(enc.encode(' ')) } catch {}
+      }, 8000)
+      let body: unknown
+      try {
+        body = await work()
+      } catch (e) {
+        console.error('openai-proxy stream error:', e)
+        body = { error: 'internal_error' }
+      }
+      clearInterval(tick)
+      try {
+        controller.enqueue(enc.encode(JSON.stringify(body)))
+        controller.close()
+      } catch {}
+    },
+  })
+  return new Response(stream, { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } })
+}
+
+type PlanAnswer = { q: string; a: string }
+
+function planAnswers(raw: unknown): PlanAnswer[] {
+  return (Array.isArray(raw) ? raw : [])
+    .map((x: Record<string, unknown>) => ({
+      q: String(x?.q ?? '').trim().slice(0, 160),
+      a: String(x?.a ?? '').trim().slice(0, 400),
+    }))
+    .filter((x: PlanAnswer) => x.q && x.a)
+    .slice(0, 16)
+}
+
+// Who the plan is for: the targets and body stats the app computed at
+// onboarding, the week, and the survey answers.
+function planUserBlock(body: Record<string, unknown>, answers: PlanAnswer[]): string {
+  const g = (body.goals ?? {}) as Record<string, unknown>
+  const num = (v: unknown) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : null }
+  const str = (v: unknown, max = 40) => String(v ?? '').trim().slice(0, max)
+  const lines: string[] = []
+  const cal = num(g.calories)
+  if (cal) {
+    lines.push(`Daily targets: ${cal} kcal, ${num(g.protein) ?? '?'} g protein, ${num(g.carbs) ?? '?'} g carbs, ${num(g.fat) ?? '?'} g fat.`)
+  } else {
+    lines.push('Daily targets: none set. Use a sensible maintenance estimate from the stats below (or about 2000 kcal with 100 g protein if there are none) and say in the summary what you assumed.')
+  }
+  const stats: string[] = []
+  if (str(g.sex)) stats.push(`sex ${str(g.sex)}`)
+  if (num(g.age)) stats.push(`age ${num(g.age)}`)
+  if (num(g.weightKg)) stats.push(`weight ${num(g.weightKg)} kg`)
+  if (num(g.heightCm)) stats.push(`height ${num(g.heightCm)} cm`)
+  if (str(g.activityLevel)) stats.push(`activity ${str(g.activityLevel)}`)
+  if (str(g.fitnessGoal) && str(g.fitnessGoal) !== 'none') stats.push(`goal: ${str(g.fitnessGoal)} weight`)
+  if (num(g.targetWeightKg)) stats.push(`target weight ${num(g.targetWeightKg)} kg`)
+  if (stats.length) lines.push(`About them: ${stats.join(', ')}.`)
+  const weekStart = String(body.weekStart ?? '')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(weekStart)) lines.push(`The week starts Monday ${weekStart}.`)
+  if (answers.length) lines.push('Their answers:\n' + answers.map(x => `- ${x.q} ${x.a}`).join('\n'))
+  return lines.join('\n')
+}
+
+function planOutputSpec(): string {
+  const nutrientList = PLAN_NUTRIENTS.map(([k, u]) => `${k} (${u})`).join(', ')
+  const macroTemplate = PLAN_NUTRIENTS.map(([k]) => `"${k}":0`).join(',')
+  return (
+    'Return ONLY valid JSON in exactly this shape:\n' +
+    '{"summary":"2 or 3 sentences on the approach and how it fits their targets",' +
+    '"meals":[{"id":"m1","section":"morning","name":"short meal name","contents":"what is in it with amounts, e.g. 1 cup cooked rice (200 g), 150 g paneer, 1 cup mixed vegetables, 1 tsp oil","prepMinutes":10,"prepNote":"how and when to prep it, or an empty string",' +
+    `"macros":{${macroTemplate}}}],` +
+    '"days":[{"day":"Mon","mealIds":["m1","m2","m3","m4"]}],' +
+    '"prepPlan":["concrete batch-cooking steps with the day and quantities"],' +
+    '"nutritionNotes":["one finding per string"],' +
+    '"grocery":[{"item":"Greek yogurt","amount":"1 kg tub"}]}\n\n' +
+    'Rules:\n' +
+    '- section is one of morning, lunch, dinner, snacks. Every day gets a morning, a lunch and a dinner; add snacks only if their meals-per-day answer includes them.\n' +
+    '- days must list all seven days Mon, Tue, Wed, Thu, Fri, Sat, Sun in order, each with 3 to 5 mealIds that exist in meals.\n' +
+    '- Describe each distinct meal ONCE in meals and reuse its id on other days. Repeat meals freely when their time or prep answers call for it; give more variety when they asked for it.\n' +
+    `- macros are for the WHOLE portion described in contents, estimated like a registered dietitian using standard food-composition data, with EVERY key above as a plain number in these units: ${nutrientList}. Use 0 only when genuinely negligible.\n` +
+    '- Each day\'s total calories must land within 5% of the daily target and protein within 10%; carbs and fat close to target. Add up each day before answering.\n' +
+    '- Respect every dietary restriction, allergy and dislike absolutely.\n' +
+    '- prepPlan: 3 to 8 steps that fit their prep style and kitchen, naming the day, what to cook, how much, and how long it keeps.\n' +
+    '- nutritionNotes: 3 to 6 short findings. Cover fiber, and the vitamins and minerals most likely to fall short for this eating pattern (for vegetarian or vegan: vitamin B12, iron, vitamin D, calcium, zinc, iodine and omega-3; for everyone: vitamin D, potassium, and sodium if it runs high). Say what in the plan covers each, and where intake may still be low say a supplement could be worth considering and to speak to a doctor or registered dietitian before starting one. Never diagnose or claim to treat a condition.\n' +
+    '- grocery: one consolidated list for the whole week with realistic amounts, 15 to 50 items.\n' +
+    '- Plain, friendly wording. Never use em dashes anywhere.'
+  )
+}
+
+function mealPlanPrompt(body: Record<string, unknown>, answers: PlanAnswer[]): string {
+  return (
+    'You plan a week of meals for a user of a nutrition-tracking app, with the care of a registered dietitian. ' +
+    'Build a practical, affordable 7-day plan they will actually follow, matched to their targets, restrictions, time and kitchen.\n\n' +
+    planUserBlock(body, answers) + '\n\n' + planOutputSpec()
+  )
+}
+
+function mealPlanRevisePrompt(body: Record<string, unknown>, answers: PlanAnswer[], request: string): string {
+  const current = JSON.stringify(compactPlanInput(body.plan)).slice(0, 60000)
+  return (
+    'You plan a week of meals for a user of a nutrition-tracking app, with the care of a registered dietitian. ' +
+    'They have a plan and want changes. Apply the request below, keep everything they did not ask to change exactly as it is (same meals, same ids), and re-check every day\'s totals afterwards.\n\n' +
+    planUserBlock(body, answers) + '\n\n' +
+    `Their request: "${request}"\n\n` +
+    `Current plan:\n${current}\n\n` +
+    'Return the COMPLETE updated plan (all seven days), not just the changed parts.\n' +
+    planOutputSpec()
+  )
+}
+
+// The client's copy of the current week, trimmed to what the prompt needs.
+function compactPlanInput(raw: unknown): Record<string, unknown> {
+  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const s = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max)
+  // Generous caps: a hand-built day can hold many more meals than the planner
+  // makes, and a revision must see all of them or it silently drops some.
+  const meals = (Array.isArray(p.meals) ? p.meals : []).slice(0, 120).map((m: Record<string, unknown>) => {
+    const rawMacros = (m?.macros && typeof m.macros === 'object' ? m.macros : {}) as Record<string, unknown>
+    const macros: Record<string, number> = {}
+    for (const [k] of PLAN_NUTRIENTS) {
+      const n = Number(rawMacros[k])
+      if (Number.isFinite(n) && n > 0) macros[k] = n
+    }
+    return {
+      id: s(m?.id, 12), section: s(m?.section, 12), name: s(m?.name, 80), contents: s(m?.contents, 240),
+      prepMinutes: Number(m?.prepMinutes) || 0, prepNote: s(m?.prepNote, 160), macros,
+    }
+  })
+  const days = (Array.isArray(p.days) ? p.days : []).slice(0, 7).map((d: Record<string, unknown>) => ({
+    day: s(d?.day, 3),
+    mealIds: (Array.isArray(d?.mealIds) ? d.mealIds : []).slice(0, 25).map((x: unknown) => s(x, 12)),
+  }))
+  const list = (v: unknown, max: number, len: number) =>
+    (Array.isArray(v) ? v : []).slice(0, max).map((x: unknown) => s(x, len)).filter(Boolean)
+  return {
+    meals, days,
+    summary: s(p.summary, 600),
+    prepPlan: list(p.prepPlan, 10, 300),
+    nutritionNotes: list(p.nutritionNotes, 8, 400),
+    grocery: (Array.isArray(p.grocery) ? p.grocery : []).slice(0, 80)
+      .map((g: Record<string, unknown>) => ({ item: s(g?.item, 60), amount: s(g?.amount, 40) }))
+      .filter((g: { item: string }) => g.item),
+  }
+}
+
+// The model's reply, reduced to the shape the app stores. Unknown ids,
+// sections and days are dropped rather than trusted; every macro key is
+// present as a number.
+function normalizeMealPlan(parsed: Record<string, unknown>) {
+  const str = (v: unknown, max: number) => noEmDash(String(v ?? '').trim()).slice(0, max)
+  const meals = (Array.isArray(parsed.meals) ? parsed.meals : []).slice(0, 120)
+    .map((m: Record<string, unknown>) => {
+      const section = PLAN_SECTION_ALIASES[str(m?.section, 20).toLowerCase()] ?? ''
+      const rawMacros = (m?.macros && typeof m.macros === 'object' ? m.macros : {}) as Record<string, unknown>
+      const macros: Record<string, number> = {}
+      for (const [k] of PLAN_NUTRIENTS) {
+        const n = Number(rawMacros[k])
+        const safe = Number.isFinite(n) && n > 0 ? n : 0
+        macros[k] = k === 'calories' ? Math.round(safe) : Math.round(safe * 10) / 10
+      }
+      return {
+        id: str(m?.id, 12),
+        section,
+        name: str(m?.name, 80),
+        contents: str(m?.contents, 240),
+        prepMinutes: Math.min(240, Math.max(0, Math.round(Number(m?.prepMinutes) || 0))),
+        prepNote: str(m?.prepNote, 160),
+        macros,
+      }
+    })
+    .filter((m: { id: string; name: string; section: string }) => m.id && m.name && m.section)
+  const ids = new Set(meals.map((m: { id: string }) => m.id))
+  const byDay = new Map<string, string[]>()
+  for (const d of Array.isArray(parsed.days) ? parsed.days : []) {
+    const key = PLAN_DAY_ALIASES[str((d as Record<string, unknown>)?.day, 12).toLowerCase()]
+    if (!key || byDay.has(key)) continue
+    const rawIds = (d as Record<string, unknown>)?.mealIds
+    const mealIds = (Array.isArray(rawIds) ? rawIds : [])
+      .map((x: unknown) => String(x ?? '').trim())
+      .filter((x: string) => ids.has(x))
+      .slice(0, 25)
+    byDay.set(key, mealIds)
+  }
+  const days = PLAN_DAYS.map(day => ({ day, mealIds: byDay.get(day) ?? [] }))
+  const list = (v: unknown, max: number, len: number) =>
+    (Array.isArray(v) ? v : []).map((x: unknown) => str(x, len)).filter(Boolean).slice(0, max)
+  const grocery = (Array.isArray(parsed.grocery) ? parsed.grocery : [])
+    .map((g: Record<string, unknown>) => ({ item: str(g?.item, 60), amount: str(g?.amount, 40) }))
+    .filter((g: { item: string }) => g.item)
+    .slice(0, 80)
+  return {
+    summary: str(parsed.summary, 600),
+    meals,
+    days,
+    prepPlan: list(parsed.prepPlan, 10, 300),
+    nutritionNotes: list(parsed.nutritionNotes, 8, 400),
+    grocery,
+  }
+}
 
 // First video result for "<exercise> exercise how to" on YouTube, read from the
 // search page's embedded data. No API key needed; best effort, null on any

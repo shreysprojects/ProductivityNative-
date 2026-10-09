@@ -561,6 +561,21 @@ export default function SetupRoutine() {
     setExpandedSubKeys(prev => { const n = new Set(prev); n.delete(subKey(taskId, subId)); return n })
   }
 
+  // Step order is the order they are ticked (and their photos revealed) in a
+  // run, so each step gets up/down arrows. delta is -1 (up) or +1 (down); a
+  // move past either end is a no-op.
+  function moveSubTask(taskId, subId, delta) {
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t
+      const from = t.subTasks.findIndex(st => st.id === subId)
+      const to = from + delta
+      if (from < 0 || to < 0 || to >= t.subTasks.length) return t
+      const subTasks = [...t.subTasks]
+      ;[subTasks[from], subTasks[to]] = [subTasks[to], subTasks[from]]
+      return { ...t, subTasks }
+    }))
+  }
+
   function toggleDay(i) {
     setActiveDays(prev => prev.map((v, j) => j === i ? !v : v))
   }
@@ -766,14 +781,37 @@ export default function SetupRoutine() {
                 </Pressable>
               )}
 
-              {task.subTasks.map(st => {
+              {task.subTasks.map((st, si) => {
                 const subOpen = expandedSubKeys.has(subKey(task.id, st.id))
+                const isFirst = si === 0
+                const isLast = si === task.subTasks.length - 1
                 return (
                   <View key={st.id}>
                     <View style={s.subRow}>
                       <View style={[s.subDot, { backgroundColor: accent.color + '66' }]} />
                       <Text style={s.subText}>{st.text}</Text>
                       {!!st.image && <Text style={s.subPhotoFlag}>📷</Text>}
+                      {/* Reorder: up and down swap with the neighbouring step */}
+                      {task.subTasks.length > 1 && (
+                        <View style={s.subMoveGroup}>
+                          <Pressable
+                            onPress={() => moveSubTask(task.id, st.id, -1)}
+                            disabled={isFirst}
+                            hitSlop={{ top: 6, bottom: 2, left: 6, right: 4 }}
+                            style={s.subMoveBtn}
+                          >
+                            <Text style={[s.subMoveText, { color: isFirst ? theme.divider : accent.color }]}>▲</Text>
+                          </Pressable>
+                          <Pressable
+                            onPress={() => moveSubTask(task.id, st.id, 1)}
+                            disabled={isLast}
+                            hitSlop={{ top: 2, bottom: 6, left: 4, right: 6 }}
+                            style={s.subMoveBtn}
+                          >
+                            <Text style={[s.subMoveText, { color: isLast ? theme.divider : accent.color }]}>▼</Text>
+                          </Pressable>
+                        </View>
+                      )}
                       <Pressable onPress={() => toggleSubExpand(task.id, st.id)} hitSlop={8}>
                         <Text style={[s.subExpand, { color: accent.color }]}>{subOpen ? '▲' : '⊕'}</Text>
                       </Pressable>
@@ -1361,6 +1399,9 @@ function makeStyles(theme) { return StyleSheet.create({
   subDot: { width: 7, height: 7, borderRadius: 4 },
   subText: { flex: 1, fontSize: 14, color: theme.subtext },
   subPhotoFlag: { fontSize: 12 },
+  subMoveGroup: { flexDirection: 'row', alignItems: 'center', gap: 2, marginRight: 2 },
+  subMoveBtn: { paddingHorizontal: 3, paddingVertical: 2 },
+  subMoveText: { fontSize: 11, fontWeight: '800' },
   subExpand: { fontSize: 15, fontWeight: '800' },
   subPhotoBox: { marginLeft: 12, paddingLeft: 12, borderLeftWidth: 2, marginBottom: 4 },
   subAddRow: { flexDirection: 'row', gap: 8, marginTop: 8, paddingLeft: 8 },

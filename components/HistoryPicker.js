@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { isAiFood, derivedSource } from '../lib/foodSource'
 import {
   Modal, View, Text, Pressable, ScrollView,
   StyleSheet, ActivityIndicator, SafeAreaView,
@@ -31,6 +32,7 @@ export default function HistoryPicker({ section, sectionLabel, sectionColor, loa
       contents: meal.contents,
       section,
       macros: meal.macros || {},
+      source: derivedSource(meal),
     })
   }
 
@@ -53,11 +55,11 @@ export default function HistoryPicker({ section, sectionLabel, sectionColor, loa
           <View style={h.centered}>
             <Text style={h.emptyEmoji}>🕐</Text>
             <Text style={h.emptyTitle}>No history yet</Text>
-            <Text style={h.emptyDesc}>Meals you log will appear here so you can quickly re-add them.</Text>
+            <Text style={h.emptyDesc}>Meals and ingredients you add anywhere appear here right away so you can quickly re-add them.</Text>
           </View>
         ) : (
           <ScrollView contentContainerStyle={h.list}>
-            <Text style={h.subheader}>RECENTLY LOGGED</Text>
+            <Text style={h.subheader}>RECENTLY ADDED</Text>
             {meals.map(meal => {
               const cal = meal.macros?.calories || 0
               const prot = meal.macros?.protein || 0
@@ -66,7 +68,12 @@ export default function HistoryPicker({ section, sectionLabel, sectionColor, loa
               return (
                 <View key={meal.id} style={h.card}>
                   <View style={h.cardLeft}>
-                    <Text style={h.mealName}>{meal.name}</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <Text style={h.mealName}>{meal.name}</Text>
+                      {isAiFood(meal) && (
+                        <Text style={{ fontSize: 10.5, fontWeight: '800', letterSpacing: 0.3, marginLeft: 6, color: sectionColor }}>✦ AI</Text>
+                      )}
+                    </View>
                     {!!meal.contents && (
                       <Text style={h.mealContents} numberOfLines={1}>{meal.contents}</Text>
                     )}

@@ -25,6 +25,7 @@ import {
   checkUsernameAvailable, upsertProfile, pickAndUploadAvatar,
 } from '../../lib/profileStorage'
 import { getSections, saveSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import { getRoutinePrefs, saveRoutinePrefs, DEFAULT_ROUTINE_PREFS } from '../../lib/routinePrefs'
 import {
   getLogSettings, saveLogSettings, slotStarts, timeLabel,
   LOG_INTERVALS, DEFAULT_LOG_SETTINGS,
@@ -170,10 +171,14 @@ export default function SettingsScreen() {
   const [blockedLoading, setBlockedLoading] = useState(false)
   const [exporting, setExporting]           = useState(false)
 
+  // How routines run once started (step-by-step timer vs checklist)
+  const [routinePrefs, setRoutinePrefs] = useState({ ...DEFAULT_ROUTINE_PREFS })
+
   useFocusEffect(useCallback(() => {
     if (user) {
       getSections(user.id).then(setSections)
       getLogSettings(user.id).then(setLogSettings)
+      getRoutinePrefs(user.id).then(setRoutinePrefs)
     }
   }, [user]))
 
@@ -181,6 +186,13 @@ export default function SettingsScreen() {
     const next = { ...sections, [name]: !sections[name] }
     setSections(next)
     await saveSections(user.id, next)
+  }
+
+  async function setChecklistDefault(on) {
+    const runMode = on ? 'checklist' : 'steps'
+    setRoutinePrefs(p => ({ ...p, runMode }))
+    // Patch, not the whole object: hideWorkouts is owned by the Fitness screen.
+    setRoutinePrefs(await saveRoutinePrefs(user.id, { runMode }))
   }
 
   async function updateLogSettings(patch) {
@@ -1042,6 +1054,22 @@ export default function SettingsScreen() {
             >
               <Text style={[st.unitPillText, { color: theme.accent }]}>{appUnit.toUpperCase()}</Text>
             </Pressable>
+          </View>
+
+          <View style={[st.prefRow, { marginTop: 14 }]}>
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>Checklist by default</Text>
+              <Text style={[st.tlHint, { color: theme.muted }]}>
+                Open routines as a tick-off list with a total timer, instead of one task at a time
+              </Text>
+            </View>
+            <Switch
+              value={routinePrefs.runMode === 'checklist'}
+              onValueChange={setChecklistDefault}
+              trackColor={{ false: '#e0e0f0', true: ACCENT }}
+              thumbColor="#ffffff"
+              ios_backgroundColor="#e0e0f0"
+            />
           </View>
 
           {/* SECTIONS + BOTTOM TABS toggle groups — HIDDEN for now via `false &&` (not deleted) */}

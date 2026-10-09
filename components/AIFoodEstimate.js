@@ -10,10 +10,12 @@ import * as ImagePicker from 'expo-image-picker'
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator'
 import { clarifyFood, estimateFood } from '../lib/aiFood'
 
-// The "Ask AI" path under the food search. Three screens in one component:
-// the model asks what it needs to know, the user answers (and may attach a
-// photo), the estimate comes back with every nutrient the app tracks and can
-// be added to the meal straight away.
+// The "Ask AI" path under the food search, also used by the "Describe to AI"
+// meal logger. Three screens in one component: the model asks what it needs
+// to know, the user answers (and may attach a photo), the estimate comes back
+// with every nutrient the app tracks and can be added to the meal straight
+// away. `details` ({ ingredients, servings, notes }) is what the meal logger
+// collected up front; the search path has none.
 
 const CHIPS = [
   ['fiber', 'Fiber', 'g'], ['sugar', 'Sugar', 'g'], ['saturatedFat', 'Sat fat', 'g'],
@@ -35,12 +37,19 @@ function scaleMacros(macros, servings) {
   return out
 }
 
-export default function AIFoodEstimate({ query, section, sectionLabel, sectionColor, onAdd, onBack }) {
+// `initialPhoto` ({ uri, base64 }) and `initialQuestions` come from the meal
+// scanner, which has already looked at the plate and asked what it needs:
+// they skip the clarify round-trip, and with `autoEstimate` an empty question
+// list goes straight to the estimate.
+export default function AIFoodEstimate({
+  query, details, section, sectionLabel, sectionColor, onAdd, onBack, backLabel = 'Back to search',
+  initialPhoto = null, initialQuestions = null, autoEstimate = false, kicker = '✨ ASK AI',
+}) {
   const [step, setStep] = useState('asking')     // asking | answer | estimating | result
   const [questions, setQuestions] = useState([])
   const [answers, setAnswers] = useState({})
   const [extra, setExtra] = useState('')
-  const [photo, setPhoto] = useState(null)       // { uri, base64 }
+  const [photo, setPhoto] = useState(initialPhoto)   // { uri, base64 }
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [servings, setServings] = useState('1')
@@ -52,8 +61,15 @@ export default function AIFoodEstimate({ query, section, sectionLabel, sectionCo
   async function ask() {
     setStep('asking')
     setError(null)
+    if (Array.isArray(initialQuestions)) {
+      // The scanner already asked; a clear photo goes straight to the numbers.
+      setQuestions(initialQuestions)
+      if (autoEstimate && initialQuestions.length === 0) { estimate(initialQuestions); return }
+      setStep('answer')
+      return
+    }
     try {
-      const data = await clarifyFood(query)
+      const data = await clarifyFood(query, details)
       if (!alive.current) return
       setQuestions(Array.isArray(data?.questions) ? data.questions : [])
       setStep('answer')
@@ -98,15 +114,15 @@ export default function AIFoodEstimate({ query, section, sectionLabel, sectionCo
     }
   }
 
-  async function estimate() {
+  async function estimate(qs = questions) {
     setStep('estimating')
     setError(null)
-    const qa = questions
+    const qa = qs
       .map(q => ({ q: q.text, a: (answers[q.id] ?? '').trim() }))
       .filter(x => x.a)
     if (extra.trim()) qa.push({ q: 'Anything else', a: extra.trim() })
     try {
-      const data = await estimateFood({ query, answers: qa, base64: photo?.base64 })
+      const data = await estimateFood({ query, answers: qa, base64: photo?.base64, details })
       if (!alive.current) return
       setResult(data)
       setServings('1')
@@ -130,6 +146,9 @@ export default function AIFoodEstimate({ query, section, sectionLabel, sectionCo
       section,
       macros: scaleMacros(result.macros, servings),
       aiEstimateId: result.estimateId ?? null,
+      // Marks the food as an AI estimate wherever it shows up (log, plan,
+      // history, saved meals) so the numbers are never mistaken for a label.
+      source: 'ai',
     })
   }
 
@@ -138,13 +157,16 @@ export default function AIFoodEstimate({ query, section, sectionLabel, sectionCo
   return (
     <View style={{ flex: 1 }}>
       <Pressable onPress={onBack} style={a.backRow}>
-        <Text style={a.backText}>‹  Back to search</Text>
+        <Text style={a.backText}>‹  {backLabel}</Text>
       </Pressable>
 
       <ScrollView contentContainerStyle={a.scroll} keyboardShouldPersistTaps="handled">
         <View style={a.queryCard}>
-          <Text style={a.queryKicker}>✨ ASK AI</Text>
+          <Text style={a.queryKicker}>{kicker}</Text>
           <Text style={a.queryText}>“{query}”</Text>
+          {!!details?.ingredients && <Text style={a.queryDetail} numberOfLines={4}>{details.ingredients}</Text>}
+          {!!details?.servings && <Text style={a.queryDetail}>Amount eaten: {details.servings}</Text>}
+          {!!details?.notes && <Text style={a.queryDetail} numberOfLines={3}>{details.notes}</Text>}
         </View>
 
         {step === 'asking' && (
@@ -226,7 +248,7 @@ export default function AIFoodEstimate({ query, section, sectionLabel, sectionCo
               </>
             )}
 
-            <Pressable style={[a.primaryBtn, { backgroundColor: sectionColor }]} onPress={estimate}>
+            <Pressable style={[a.primaryBtn, { backgroundColor: sectionColor }]} onPress={() => estimate()}>
               <Text style={a.primaryBtnText}>Get the macros</Text>
             </Pressable>
           </>
@@ -313,6 +335,7 @@ const a = StyleSheet.create({
   queryCard: { backgroundColor: '#f6f7fb', borderRadius: 14, padding: 14, marginBottom: 18 },
   queryKicker: { fontSize: 11, fontWeight: '800', color: '#6366f1', letterSpacing: 1, marginBottom: 4 },
   queryText: { fontSize: 18, fontWeight: '800', color: '#111' },
+  queryDetail: { fontSize: 13, color: '#666', lineHeight: 18, marginTop: 6 },
 
   centered: { alignItems: 'center', paddingTop: 48, paddingHorizontal: 24 },
   loadingText: { marginTop: 12, fontSize: 15, color: '#aaa', textAlign: 'center' },

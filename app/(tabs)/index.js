@@ -11,7 +11,7 @@ import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
 import ClubsSection from '../../components/ClubsSection'
 import { useSheetDrag } from '../../lib/useSheetDrag'
-import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
+import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules, runFullyDone, pendingLater } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { getSleep, wakeUp, cancelSleep, sleepDurationText, sleepDurationShort, clockLabel } from '../../lib/sleepStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
@@ -181,7 +181,8 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
   }, [user?.id]))
 
   const visible   = routines.filter(r => !hiddenSet.has(r.name))
-  const doneCount = visible.filter(r => r.run?.finished).length
+  // A routine with skipped steps still on its do-later list is not done yet.
+  const doneCount = visible.filter(r => runFullyDone(r.run)).length
   const total     = visible.length
   const pct       = total > 0 ? doneCount / total : 0
   const arcDash   = pct * CIRC_CIRCUM
@@ -192,7 +193,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
 
   // Whenever routines stay out of the X/Y circle (they're optional), but a
   // finished one still deserves a mention up here.
-  const wheneverDone = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && r.run?.finished)
+  const wheneverDone = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && runFullyDone(r.run))
 
   const displayName = (profile?.name?.trim() || user?.name || 'there').split(' ')[0]
   const dateLabel   = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
@@ -431,9 +432,10 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
   let btnColor   = card.color
 
   if (isDone) {
-    statusText = `Done in ${fmtMs(run.completedAt - run.startedAt)}`
-    btnLabel   = 'View Summary  →'
-    btnColor   = '#10b981'
+    const left = pendingLater(run)
+    statusText = `Done in ${fmtMs(run.completedAt - run.startedAt)}${left > 0 ? `  ·  ${left} to do later` : ''}`
+    btnLabel   = left > 0 ? 'Finish later tasks  →' : 'View Summary  →'
+    btnColor   = left > 0 ? '#f59e0b' : '#10b981'
   } else if (isRunning) {
     statusText = `Task ${run.currentStep + 1} of ${run.steps.length}`
     btnLabel   = 'Continue  →'
@@ -1185,9 +1187,9 @@ export default function RoutinesScreen() {
   // Only Every day routines count toward the daily "all done" celebration —
   // Whenever routines are optional by definition.
   const visibleEveryday = everydayRoutines.filter(r => !hiddenSet.has(r.name))
-  const doneCount = visibleEveryday.filter(r => r.run?.finished).length
+  const doneCount = visibleEveryday.filter(r => runFullyDone(r.run)).length
   const allDone = doneCount > 0 && doneCount === visibleEveryday.length
-  const wheneverDoneCount = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && r.run?.finished).length
+  const wheneverDoneCount = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && runFullyDone(r.run)).length
 
   return (
     <KeyboardAvoidingView

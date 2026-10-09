@@ -77,7 +77,7 @@ function motivationalMsg(step, total) {
   return 'Last one! 🎯'
 }
 
-export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinish, onGoBack, onToggleSubTask, onJumpTo, onAdjustStart }) {
+export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinish, onGoBack, onToggleSubTask, onJumpTo, onAdjustStart, onSkip }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const { currentStep, steps } = run
@@ -285,6 +285,13 @@ export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinis
           </Text>
         </Pressable>
       </Animated.View>
+
+      {/* ── Skip for later: the task joins today's do-later list ── */}
+      {onSkip && (
+        <Pressable style={s.backBtn} onPress={() => onSkip(elapsedRef.current * 1000)} hitSlop={6}>
+          <Text style={[s.backBtnText, { color: '#f59e0b' }]}>Skip, do later  ⏭</Text>
+        </Pressable>
+      )}
 
       {/* ── Go back ──────────────────────────────────────────── */}
       {currentStep > 0 && (

@@ -1,20 +1,28 @@
-import { useState, useCallback, useMemo, useRef } from 'react'
-import { View, Text, Pressable, ScrollView, StyleSheet, Alert } from 'react-native'
-import { useFocusEffect } from 'expo-router'
+import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react'
+import { View, Text, Pressable, TextInput, StyleSheet, Alert } from 'react-native'
+import { useFocusEffect, useNavigation } from 'expo-router'
+import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import { supabase } from '../../lib/supabase'
 import {
-  saveMeal, deleteMeal, today,
-  getSavedMeals, upsertSavedMeal, deleteSavedMeal, getRecentMealHistory,
+  saveMeal, saveDayMeals, deleteMeal, today,
+  getSavedMeals, upsertSavedMeal, deleteSavedMeal, getRecentMealHistory, recordMealHistory,
 } from '../../lib/storage'
 import { getUserGoals } from '../../lib/goalsStorage'
+import { PLAN_DAYS, DAY_NAMES, dayKeyOf, sumPlanMacros, planMealCount, emptyDays } from '../../lib/mealPlan'
+import { getMealPlan, addPlannedMeal, deletePlannedMeal, setPlannedDay, replaceMealPlan } from '../../lib/mealPlanStorage'
+import { isAiFood, derivedSource } from '../../lib/foodSource'
+import ScanMealModal from '../../components/ScanMealModal'
 import AddMealModal from '../../components/AddMealModal'
 import MealPickerSheet from '../../components/MealPickerSheet'
 import BarcodeScanner from '../../components/BarcodeScanner'
-import FoodSearch from '../../components/FoodSearch'
 import HistoryPicker from '../../components/HistoryPicker'
 import SavedMealsPicker from '../../components/SavedMealsPicker'
+import SavedSnacksPicker from '../../components/SavedSnacksPicker'
+import AIMealLogModal from '../../components/AIMealLogModal'
+import MealPlannerModal from '../../components/MealPlannerModal'
+import MealCoachChat from '../../components/MealCoachChat'
 
 const SECTIONS = [
   { key: 'morning', label: 'Morning', emoji: '🌅', color: '#f97316', bg: '#fff7ed' },
@@ -116,8 +124,43 @@ function fmt(v) {
   return v % 1 === 0 ? String(Math.round(v)) : v.toFixed(1)
 }
 
+// ── Portions ───────────────────────────────────────────────────────────────
+// A logged meal can be resized after the fact. The macros it was logged with
+// are kept as `baseMacros` and `portion` is the multiplier on top, so every
+// nutrient is rescaled from the original each time and nothing drifts.
+const PORTION_MIN = 0.25
+const PORTION_MAX = 20
+
+function scaleMacros(base, mult) {
+  const out = {}
+  for (const [k, v] of Object.entries(base ?? {})) {
+    const n = (Number(v) || 0) * mult
+    out[k] = k === 'calories' ? Math.round(n) : Math.round(n * 10) / 10
+  }
+  return out
+}
+
+function applyPortion(meal, portion) {
+  const p = Math.min(PORTION_MAX, Math.max(PORTION_MIN, Math.round(portion * 100) / 100))
+  const base = meal.baseMacros ?? meal.macros ?? {}
+  return { ...meal, baseMacros: base, portion: p, macros: scaleMacros(base, p) }
+}
+
+function fmtPortion(p) {
+  if (p === 0.5) return '½'
+  if (p === 0.25) return '¼'
+  if (p === 0.75) return '¾'
+  return p % 1 === 0 ? String(p) : String(Math.round(p * 100) / 100)
+}
+
+const PORTION_CHIPS = [0.5, 1, 1.5, 2, 3]
+
 function localDateStr(d) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+}
+
+function newMealId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2)
 }
 
 const DAY_LABELS = ['M','T','W','T','F','S','S']
@@ -246,7 +289,8 @@ function MicronutrientBars({ totals }) {
   )
 }
 
-function DailySummary({ totals, goals, selectedDate }) {
+// `title` overrides the date heading (the Plan tab uses it for "MONDAY'S PLAN").
+function DailySummary({ totals, goals, selectedDate, title }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const [showMicro, setShowMicro] = useState(false)
@@ -256,9 +300,15 @@ function DailySummary({ totals, goals, selectedDate }) {
 
   const calPct = hasGoals ? Math.min(Math.round((cal / goals.calories) * 100), 999) : null
   const isToday = selectedDate === localDateStr(new Date())
-  const titleText = isToday
+  const titleText = title ?? (isToday
     ? "TODAY'S NUTRITION"
-    : new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase()
+    : new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase())
+  // How far today is from the calorie goal, next to the count.
+  const remaining = hasGoals ? goals.calories - cal : null
+  const toGo = !hasGoals ? null
+    : remaining > 0 ? { text: `${remaining.toLocaleString()} more calories to go!`, color: theme.accent }
+    : remaining === 0 ? { text: 'Goal reached!', color: '#10b981' }
+    : { text: `${Math.abs(remaining).toLocaleString()} calories over your goal`, color: '#ef4444' }
 
   return (
     <View style={s.summaryCard}>
@@ -269,6 +319,11 @@ function DailySummary({ totals, goals, selectedDate }) {
           <Text style={s.calUnit}>kcal</Text>
           {hasGoals && <Text style={s.calGoal}>/ {goals.calories.toLocaleString()}</Text>}
         </View>
+        {toGo && (
+          <View style={s.calToGoWrap}>
+            <Text style={[s.calToGo, { color: toGo.color }]}>{toGo.text}</Text>
+          </View>
+        )}
       </View>
 
       {hasGoals && (
@@ -360,17 +415,39 @@ function MacroDetail({ macros }) {
   )
 }
 
-function MealCard({ meal, color, expanded, onToggle, onDelete }) {
+// A logged or planned meal. Planned meals also show prep time and notes and,
+// for days that have arrived, a "Log this meal" action. Holding the card
+// starts a drag (onLongPress) when the list allows it. Expanded, the card
+// offers a portion control that rescales every nutrient.
+function MealCard({ meal, color, expanded, onToggle, onLongPress, dragging, onDelete, deleteLabel = 'Delete Meal', onLog, onPortion }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const [showDetail, setShowDetail] = useState(false)
+  const portion = meal.portion ?? 1
+  const [portionText, setPortionText] = useState(String(portion))
+  useEffect(() => { setPortionText(String(portion)) }, [portion])
+  const setPortion = p => { if (onPortion) onPortion(meal, p) }
+  const commitPortionText = () => {
+    const n = parseFloat(portionText)
+    if (Number.isFinite(n) && n > 0) setPortion(n)
+    else setPortionText(String(portion))
+  }
   const cal    = meal.macros?.calories || 0
   const prot   = meal.macros?.protein  || 0
   const carbs  = meal.macros?.carbs    || 0
   const fat    = meal.macros?.fat      || 0
+  const prepBits = []
+  if (meal.prepMinutes) prepBits.push(`⏱ ${meal.prepMinutes} min`)
+  if (meal.prepNote) prepBits.push(meal.prepNote)
 
   return (
-    <Pressable style={[s.mealCard, expanded && { borderColor: color + '55' }]} onPress={onToggle}>
+    <Pressable
+      style={[s.mealCard, expanded && { borderColor: color + '55' }, dragging && { borderColor: color }]}
+      onPress={onToggle}
+      onLongPress={onLongPress}
+      delayLongPress={200}
+      disabled={dragging}
+    >
       <View style={s.mealCardTop}>
         <View style={[s.mealColorBar, { backgroundColor: color }]} />
         <View style={{ flex: 1 }}>
@@ -378,12 +455,17 @@ function MealCard({ meal, color, expanded, onToggle, onDelete }) {
           {meal.contents ? (
             <Text style={s.mealContents} numberOfLines={expanded ? undefined : 1}>{meal.contents}</Text>
           ) : null}
+          {prepBits.length > 0 && (
+            <Text style={s.mealPrep} numberOfLines={expanded ? undefined : 1}>{prepBits.join('  ·  ')}</Text>
+          )}
           <View style={s.mealQuickRow}>
             <Text style={s.mealQuickItem}>{fmt(prot)}g protein</Text>
             <Text style={s.mealQuickDot}>·</Text>
             <Text style={s.mealQuickItem}>{fmt(carbs)}g carbs</Text>
             <Text style={s.mealQuickDot}>·</Text>
             <Text style={s.mealQuickItem}>{fmt(fat)}g fat</Text>
+            {portion !== 1 && <Text style={[s.mealPortionTag, { color, backgroundColor: color + '18' }]}>× {fmtPortion(portion)}</Text>}
+            {isAiFood(meal) && <Text style={[s.mealAiTag, { color }]}>✦ AI</Text>}
           </View>
         </View>
         <View style={s.mealCalBox}>
@@ -394,13 +476,53 @@ function MealCard({ meal, color, expanded, onToggle, onDelete }) {
 
       {expanded && (
         <>
+          {onPortion && (
+            <View style={s.portionBox}>
+              <Text style={s.portionTitle}>PORTION  ·  every nutrient scales with it</Text>
+              <View style={s.portionRow}>
+                <Pressable style={s.portionStep} onPress={() => setPortion(portion - 0.25)} hitSlop={6}>
+                  <Text style={s.portionStepText}>−</Text>
+                </Pressable>
+                <TextInput
+                  style={[s.portionInput, { borderColor: color + '66' }]}
+                  value={portionText}
+                  onChangeText={setPortionText}
+                  onEndEditing={commitPortionText}
+                  onSubmitEditing={commitPortionText}
+                  keyboardType="decimal-pad"
+                  returnKeyType="done"
+                  selectTextOnFocus
+                />
+                <Pressable style={s.portionStep} onPress={() => setPortion(portion + 0.25)} hitSlop={6}>
+                  <Text style={s.portionStepText}>+</Text>
+                </Pressable>
+                <Text style={s.portionLabel}>× what was logged</Text>
+              </View>
+              <View style={s.portionChips}>
+                {PORTION_CHIPS.map(p => (
+                  <Pressable
+                    key={p}
+                    style={[s.portionChip, portion === p && { backgroundColor: color, borderColor: color }]}
+                    onPress={() => setPortion(p)}
+                  >
+                    <Text style={[s.portionChipText, portion === p && { color: '#fff' }]}>{fmtPortion(p)}×</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          )}
           <Pressable style={s.macroToggle} onPress={() => setShowDetail(v => !v)}>
             <Text style={s.macroToggleLabel}>All nutrition details</Text>
             <Text style={s.macroToggleArrow}>{showDetail ? '▲' : '▼'}</Text>
           </Pressable>
           {showDetail && <MacroDetail macros={meal.macros || {}} />}
+          {onLog && (
+            <Pressable style={[s.logBtn, { backgroundColor: color }]} onPress={onLog}>
+              <Text style={s.logBtnText}>Log this meal</Text>
+            </Pressable>
+          )}
           <Pressable style={s.deleteBtn} onPress={onDelete}>
-            <Text style={s.deleteBtnText}>Delete Meal</Text>
+            <Text style={s.deleteBtnText}>{deleteLabel}</Text>
           </Pressable>
         </>
       )}
@@ -408,65 +530,182 @@ function MealCard({ meal, color, expanded, onToggle, onDelete }) {
   )
 }
 
-function MealSection({ section, meals, onAdd, onDelete, expandedId, onToggleExpand, isViewOnly }) {
+// ── A day's meals as one draggable list ────────────────────────────────────
+// The four sections are a single list so a meal can be held and dragged from
+// one part of the day into another. Header and footer rows mark each
+// section's bounds, and after a drop a meal belongs to whichever section's
+// header sits above it. Rows are rebuilt from the meals on every render, so
+// the list can never drift from the data.
+
+function dayRows(meals) {
+  const rows = []
+  for (const sec of SECTIONS) {
+    const own = meals.filter(m => m.section === sec.key)
+    rows.push({ key: `h:${sec.key}`, type: 'header', sec, meals: own })
+    own.forEach(meal => rows.push({ key: `m:${meal.id}`, type: 'meal', sec, meal }))
+    rows.push({ key: `f:${sec.key}`, type: 'footer', sec, empty: own.length === 0 })
+  }
+  return rows
+}
+
+function mealsFromRows(rows) {
+  let current = SECTIONS[0].key
+  const out = []
+  for (const row of rows) {
+    if (row.type === 'header' || row.type === 'footer') current = row.sec.key
+    else if (row.type === 'meal') out.push(row.meal.section === current ? row.meal : { ...row.meal, section: current })
+  }
+  return out
+}
+
+function DayList({
+  meals, header, canEdit, canDrag, emptyText, deleteLabel, onLogMeal, onPortion,
+  onAdd, onDelete, onReorder, expandedId, onToggleExpand,
+}) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
-  const sectionCal = Math.round(sumMacros(meals).calories || 0)
+  const rows = useMemo(() => dayRows(meals), [meals])
 
-  return (
-    <View style={[s.section, { borderLeftColor: section.color, borderLeftWidth: 4 }]}>
-      <View style={s.sectionHeader}>
-        <View style={s.sectionLeft}>
-          <View style={[s.sectionIconWrap, { backgroundColor: section.bg }]}>
-            <Text style={s.sectionEmoji}>{section.emoji}</Text>
-          </View>
-          <View>
-            <Text style={s.sectionLabel}>{section.label}</Text>
-            {meals.length > 0 && (
-              <Text style={[s.sectionCal, { color: section.color }]}>{sectionCal} kcal · {meals.length} meal{meals.length > 1 ? 's' : ''}</Text>
+  const renderItem = ({ item: row, drag, isActive }) => {
+    const { sec } = row
+    if (row.type === 'header') {
+      const sectionCal = Math.round(sumMacros(row.meals).calories || 0)
+      return (
+        <View style={[s.secTop, { borderLeftColor: sec.color }]}>
+          <View style={[s.sectionHeader, { marginBottom: 6 }]}>
+            <View style={s.sectionLeft}>
+              <View style={[s.sectionIconWrap, { backgroundColor: sec.bg }]}>
+                <Text style={s.sectionEmoji}>{sec.emoji}</Text>
+              </View>
+              <View>
+                <Text style={s.sectionLabel}>{sec.label}</Text>
+                {row.meals.length > 0 && (
+                  <Text style={[s.sectionCal, { color: sec.color }]}>{sectionCal} kcal · {row.meals.length} meal{row.meals.length > 1 ? 's' : ''}</Text>
+                )}
+              </View>
+            </View>
+            {canEdit && (
+              <Pressable style={[s.addBtn, { backgroundColor: sec.color }]} onPress={() => onAdd(sec.key)}>
+                <Text style={s.addBtnText}>+ Add</Text>
+              </Pressable>
             )}
           </View>
         </View>
-        {!isViewOnly && (
-          <Pressable
-            style={[s.addBtn, { backgroundColor: section.color }]}
-            onPress={onAdd}
-          >
-            <Text style={s.addBtnText}>+ Add</Text>
-          </Pressable>
-        )}
-      </View>
-
-      {meals.length === 0 ? (
-        <View style={s.emptyRow}>
-          <Text style={s.emptyText}>Nothing logged yet</Text>
+      )
+    }
+    if (row.type === 'footer') {
+      return (
+        <View style={[s.secBottom, { borderLeftColor: sec.color }]}>
+          {row.empty && (
+            <View style={s.emptyRow}>
+              <Text style={s.emptyText}>{emptyText}</Text>
+            </View>
+          )}
         </View>
-      ) : (
-        <View style={{ gap: 8 }}>
-          {meals.map(meal => (
-            <MealCard
-              key={meal.id}
-              meal={meal}
-              color={section.color}
-              expanded={expandedId === meal.id}
-              onToggle={() => onToggleExpand(meal.id)}
-              onDelete={() => onDelete(meal.id)}
-            />
-          ))}
+      )
+    }
+    return (
+      <ScaleDecorator activeScale={0.97}>
+        <View style={[s.secBody, { borderLeftColor: sec.color }, isActive && s.secBodyActive]}>
+          <MealCard
+            meal={row.meal}
+            color={sec.color}
+            expanded={expandedId === row.meal.id}
+            onToggle={() => onToggleExpand(row.meal.id)}
+            onLongPress={canDrag ? drag : undefined}
+            dragging={isActive}
+            onDelete={() => onDelete(row.meal.id)}
+            deleteLabel={deleteLabel}
+            onLog={onLogMeal ? () => onLogMeal(row.meal) : null}
+            onPortion={onPortion}
+          />
+        </View>
+      </ScaleDecorator>
+    )
+  }
+
+  return (
+    <DraggableFlatList
+      data={rows}
+      keyExtractor={row => row.key}
+      renderItem={renderItem}
+      onDragEnd={({ data }) => {
+        const next = mealsFromRows(data)
+        const changed = next.length !== meals.length
+          || next.some((m, i) => m.id !== meals[i].id || m.section !== meals[i].section)
+        if (changed) onReorder(next)
+      }}
+      ListHeaderComponent={(
+        <View>
+          {header}
+          {canDrag && meals.length > 0 && (
+            <Text style={s.dragHint}>Hold a meal to drag it into another part of the day.</Text>
+          )}
         </View>
       )}
-    </View>
+      contentContainerStyle={s.content}
+      containerStyle={{ flex: 1 }}
+      keyboardShouldPersistTaps="handled"
+      showsVerticalScrollIndicator={false}
+    />
   )
 }
 
-export default function MealsScreen() {
-  const { user } = useAuth()
+// The add-a-meal flows, shared by the Log and Plan tabs: pick how to add,
+// then scan, describe to AI, history, saved meals, saved snacks or manual
+// entry. Every step is a modal, so where this renders does not matter.
+function AddMealFlows({ flow, section, userId, onFlow, onAdd, onClose }) {
+  if (!flow || !section) return null
+  // Whatever is added, and wherever it lands, is in "From History" at once.
+  const add = meal => { recordMealHistory(userId, meal); onAdd(meal) }
+  const common = { section: section.key, sectionLabel: section.label, sectionColor: section.color, onClose }
+  if (flow === 'picker') {
+    return <MealPickerSheet sectionLabel={section.label} sectionColor={section.color} onSelect={onFlow} onClose={onClose} />
+  }
+  if (flow === 'scan')    return <ScanMealModal {...common} onAdd={add} />
+  if (flow === 'ai')      return <AIMealLogModal {...common} onAdd={add} />
+  if (flow === 'barcode') return <BarcodeScanner {...common} onAdd={add} onSearchInstead={() => onFlow('ai')} />
+  if (flow === 'history') return <HistoryPicker {...common} loadHistory={() => getRecentMealHistory(userId)} onAdd={add} />
+  if (flow === 'saved') {
+    return (
+      <SavedMealsPicker
+        {...common}
+        userId={userId}
+        loadSaved={() => getSavedMeals(userId)}
+        loadHistory={() => getRecentMealHistory(userId)}
+        onIngredientPicked={item => recordMealHistory(userId, item)}
+        onSaveTemplate={meal => upsertSavedMeal(userId, meal).catch(e => Alert.alert('Could not save meal', e.message))}
+        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(e => Alert.alert('Could not delete meal', e.message))}
+        onAdd={add}
+      />
+    )
+  }
+  if (flow === 'snacks') {
+    return (
+      <SavedSnacksPicker
+        {...common}
+        userId={userId}
+        loadSaved={() => getSavedMeals(userId)}
+        loadHistory={() => getRecentMealHistory(userId)}
+        onSaveTemplate={snack => upsertSavedMeal(userId, snack).catch(e => Alert.alert('Could not save snack', e.message))}
+        onDeleteTemplate={id => deleteSavedMeal(userId, id).catch(e => Alert.alert('Could not delete snack', e.message))}
+        onAdd={add}
+      />
+    )
+  }
+  if (flow === 'manual') return <AddMealModal {...common} onSave={add} />
+  return null
+}
+
+// ── Log tab: what was eaten ────────────────────────────────────────────────
+
+function LogPane({ user }) {
   const { theme } = useTheme()
   const s = makeStyles(theme)
   const [meals, setMeals] = useState([])
   const [goals, setGoals] = useState(null)
   const [addingTo, setAddingTo] = useState(null)
-  const [flow, setFlow] = useState(null)  // 'picker'|'barcode'|'history'|'saved'|'manual'
+  const [flow, setFlow] = useState(null)  // 'picker'|'barcode'|'ai'|'history'|'saved'|'snacks'|'manual'
   const [expandedId, setExpandedId] = useState(null)
   const [selectedDate, setSelectedDate] = useState(today())
   const [weekOffset, setWeekOffset] = useState(0)
@@ -530,9 +769,11 @@ export default function MealsScreen() {
     }
   }
 
-  const isViewOnly = selectedDate !== today()
+  // Any day up to today can be logged to (the week strip already blocks the
+  // future), so a forgotten meal can be added after the fact.
+  const isViewOnly = false
   return (
-    <View style={s.page}>
+    <View style={s.pane}>
       <WeekNav
         selectedDate={selectedDate}
         onSelect={setSelectedDate}
@@ -548,109 +789,493 @@ export default function MealsScreen() {
           </Pressable>
         </View>
       ) : (
-      <ScrollView contentContainerStyle={s.content}>
-      <DailySummary totals={totals} goals={goals} selectedDate={selectedDate} />
-
-      {SECTIONS.map(sec => (
-        <MealSection
-          key={sec.key}
-          section={sec}
-          meals={meals.filter(m => m.section === sec.key)}
-          onAdd={() => openAdd(sec.key)}
-          onDelete={async id => {
-            const date = selectedDate
-            setMeals(prev => prev.filter(m => m.id !== id))
-            try {
-              await deleteMeal(user.id, date, id)
-            } catch (e) {
-              Alert.alert('Could not delete meal', 'Please try again.')
-              if (date === selectedDate) load()
-            }
-          }}
-          expandedId={expandedId}
-          onToggleExpand={id => setExpandedId(expandedId === id ? null : id)}
-          isViewOnly={isViewOnly}
-        />
-      ))}
-
-      {/* Step 1: pick how to add */}
-      {flow === 'picker' && activeSection && (
-        <MealPickerSheet
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          onSelect={f => setFlow(f)}
-          onClose={closeAll}
-        />
+      <DayList
+        meals={meals}
+        canEdit={!isViewOnly}
+        canDrag={!isViewOnly}
+        emptyText="Nothing logged yet"
+        header={<DailySummary totals={totals} goals={goals} selectedDate={selectedDate} />}
+        onAdd={openAdd}
+        onDelete={async id => {
+          const date = selectedDate
+          setMeals(prev => prev.filter(m => m.id !== id))
+          try {
+            await deleteMeal(user.id, date, id)
+          } catch (e) {
+            Alert.alert('Could not delete meal', 'Please try again.')
+            if (date === selectedDate) load()
+          }
+        }}
+        onReorder={async next => {
+          const date = selectedDate
+          setMeals(next)
+          try {
+            await saveDayMeals(user.id, date, next)
+          } catch (e) {
+            Alert.alert('Could not move meal', 'Please check your connection and try again.')
+            if (date === selectedDate) load()
+          }
+        }}
+        onPortion={async (meal, portion) => {
+          const date = selectedDate
+          const updated = applyPortion(meal, portion)
+          setMeals(prev => prev.map(m => (m.id === updated.id ? updated : m)))
+          try {
+            await saveMeal(user.id, date, updated)
+          } catch (e) {
+            Alert.alert('Could not change the portion', 'Please check your connection and try again.')
+            if (date === selectedDate) load()
+          }
+        }}
+        expandedId={expandedId}
+        onToggleExpand={id => setExpandedId(expandedId === id ? null : id)}
+      />
       )}
 
-      {/* Step 2a: barcode scanner */}
-      {flow === 'barcode' && activeSection && (
-        <BarcodeScanner
-          section={addingTo}
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          onAdd={handleMealAdded}
-          onClose={closeAll}
-          onSearchInstead={() => setFlow('search')}
+      <AddMealFlows
+        flow={flow}
+        section={activeSection}
+        userId={user.id}
+        onFlow={setFlow}
+        onAdd={handleMealAdded}
+        onClose={closeAll}
+      />
+    </View>
+  )
+}
+
+// ── Plan tab: one weekly plan that repeats, like the class schedule ────────
+
+function PlanPane({ user }) {
+  const { theme } = useTheme()
+  const s = makeStyles(theme)
+  const todayStr = today()
+  const todayKey = dayKeyOf(todayStr)
+  const [dayKey, setDayKey] = useState(todayKey)
+  const [plan, setPlan] = useState(null)      // { days, notes }
+  const [goals, setGoals] = useState(null)
+  const [loadError, setLoadError] = useState(false)
+  const [addingTo, setAddingTo] = useState(null)
+  const [flow, setFlow] = useState(null)
+  const [expandedId, setExpandedId] = useState(null)
+  const [plannerOpen, setPlannerOpen] = useState(false)
+  const [notesOpen, setNotesOpen] = useState(false)
+  const [groceryOpen, setGroceryOpen] = useState(false)
+  // Whether a plan has been shown at all, so a failed refresh keeps it
+  // instead of swapping in an error page.
+  const loadedRef = useRef(false)
+
+  const load = useCallback(async () => {
+    if (!user) return
+    try {
+      const [p, g] = await Promise.all([getMealPlan(user.id), getUserGoals(user.id)])
+      setPlan(p)
+      setGoals(g)
+      setLoadError(false)
+      loadedRef.current = true
+    } catch {
+      if (!loadedRef.current) setLoadError(true)
+    }
+  }, [user])
+
+  useFocusEffect(useCallback(() => { load() }, [load]))
+
+  const days = plan?.days ?? emptyDays()
+  const dayMeals = days[dayKey] ?? []
+  const totals = useMemo(() => sumPlanMacros(dayMeals), [dayMeals])
+  const weekCount = planMealCount(days)
+  const isToday = dayKey === todayKey
+  const activeSection = SECTIONS.find(sec => sec.key === addingTo)
+  const notes = plan?.notes
+  const hasNotes = !!(notes && (notes.summary || notes.nutrition?.length || notes.prep?.length || notes.grocery?.length))
+  const dayTitle = DAY_NAMES[dayKey]
+
+  const openAdd = (sectionKey) => { setAddingTo(sectionKey); setFlow('picker') }
+  const closeAll = () => { setAddingTo(null); setFlow(null) }
+
+  // Writes go through the same optimistic-then-revert pattern as the Log tab.
+  function updateDay(key, updater) {
+    setPlan(prev => {
+      const base = prev ?? { days: emptyDays(), notes: null }
+      return { ...base, days: { ...base.days, [key]: updater(base.days[key] ?? []) } }
+    })
+  }
+
+  const handlePlanMealAdded = async (meal) => {
+    // Keep the flow's own source ('ai' for an AI estimate) so the tag shows;
+    // anything without one was typed or picked by the user.
+    const full = { ...meal, section: addingTo, source: meal.source ?? 'user' }
+    const key = dayKey
+    closeAll()
+    updateDay(key, list => {
+      const idx = list.findIndex(m => m.id === full.id)
+      if (idx >= 0) { const copy = [...list]; copy[idx] = full; return copy }
+      return [...list, full]
+    })
+    try {
+      await addPlannedMeal(user.id, key, full)
+    } catch {
+      Alert.alert('Could not save to your plan', 'Please check your connection and try again.')
+      load()
+    }
+  }
+
+  const handlePlanMealDelete = async (id) => {
+    const key = dayKey
+    updateDay(key, list => list.filter(m => m.id !== id))
+    try {
+      await deletePlannedMeal(user.id, key, id)
+    } catch {
+      Alert.alert('Could not update your plan', 'Please try again.')
+      load()
+    }
+  }
+
+  const handlePlanReorder = async (next) => {
+    const key = dayKey
+    updateDay(key, () => next)
+    try {
+      await setPlannedDay(user.id, key, next)
+    } catch {
+      Alert.alert('Could not move meal', 'Please check your connection and try again.')
+      load()
+    }
+  }
+
+  const handlePlanPortion = async (meal, portion) => {
+    const key = dayKey
+    const updated = applyPortion(meal, portion)
+    updateDay(key, list => list.map(m => (m.id === updated.id ? updated : m)))
+    try {
+      await addPlannedMeal(user.id, key, updated)
+    } catch {
+      Alert.alert('Could not change the portion', 'Please check your connection and try again.')
+      load()
+    }
+  }
+
+  // A planned meal becomes a logged one for today. The plan repeats every
+  // week, so only today's weekday can be logged: any other day has no date.
+  const toLogged = meal => ({
+    id: newMealId(), name: meal.name, contents: meal.contents ?? '', section: meal.section, macros: meal.macros ?? {},
+    source: derivedSource(meal),
+  })
+
+  async function logPlannedMeal(meal) {
+    try {
+      await saveMeal(user.id, todayStr, toLogged(meal))
+      Alert.alert('Logged', `${meal.name} is on today's log.`)
+    } catch {
+      Alert.alert('Could not log meal', 'Please check your connection and try again.')
+    }
+  }
+
+  function logWholeDay() {
+    const list = dayMeals
+    Alert.alert(
+      `Log ${list.length} planned meal${list.length === 1 ? '' : 's'}?`,
+      "They will be added to today's log.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Log them', onPress: async () => {
+          try {
+            for (const meal of list) await saveMeal(user.id, todayStr, toLogged(meal))
+            Alert.alert('Logged', 'Your planned meals are on the Log tab.')
+          } catch {
+            Alert.alert('Could not log everything', 'Some meals may not have been saved. Check the Log tab.')
+          }
+        }},
+      ],
+    )
+  }
+
+  // The AI planner's week replaces the whole plan.
+  function applyAiPlan(week) {
+    const commit = async () => {
+      setPlannerOpen(false)
+      setPlan(week)
+      setNotesOpen(true)
+      setExpandedId(null)
+      try {
+        await replaceMealPlan(user.id, week)
+      } catch {
+        Alert.alert('Could not save the plan', 'Please check your connection and try again.')
+        load()
+      }
+    }
+    if (weekCount > 0) {
+      Alert.alert(
+        'Replace your weekly plan?',
+        `The ${weekCount} meal${weekCount === 1 ? '' : 's'} already planned will be replaced.`,
+        [{ text: 'Cancel', style: 'cancel' }, { text: 'Replace', style: 'destructive', onPress: commit }],
+      )
+    } else {
+      commit()
+    }
+  }
+
+  function clearPlan() {
+    Alert.alert(
+      'Clear your weekly plan?',
+      'Every planned meal will be removed.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Clear', style: 'destructive', onPress: async () => {
+          const empty = { days: emptyDays(), notes: null }
+          setPlan(empty)
+          setNotesOpen(false)
+          try {
+            await replaceMealPlan(user.id, empty)
+          } catch {
+            Alert.alert('Could not clear the plan', 'Please try again.')
+            load()
+          }
+        }},
+      ],
+    )
+  }
+
+  return (
+    <View style={s.pane}>
+      {/* Header: the plan is one repeating week, so the strip is weekday
+          names only, like the class schedule's day picker. */}
+      <View style={s.planHeader}>
+        <View style={s.planTitleRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.planTitle}>Weekly plan</Text>
+            <Text style={s.planWeekSub}>
+              {weekCount} meal{weekCount === 1 ? '' : 's'} planned · repeats every week
+            </Text>
+          </View>
+          {!isToday && (
+            <Pressable
+              style={[s.planActionBtn, { backgroundColor: theme.accent + '20' }]}
+              onPress={() => { setDayKey(todayKey); setExpandedId(null) }}
+              hitSlop={6}
+            >
+              <Text style={[s.planActionText, { color: theme.accent }]}>Today</Text>
+            </Pressable>
+          )}
+        </View>
+        <View style={s.planDayStrip}>
+          {PLAN_DAYS.map(d => {
+            const active = d === dayKey
+            const isTodayChip = d === todayKey
+            const count = days[d]?.length ?? 0
+            return (
+              <Pressable
+                key={d}
+                onPress={() => { setDayKey(d); setExpandedId(null) }}
+                style={[s.planDayChip, {
+                  backgroundColor: active ? theme.accent : 'transparent',
+                  // Selected reads as a fill, today as a ring; the border is
+                  // always present so highlighting can't resize the chip.
+                  borderColor: !active && isTodayChip ? theme.accent : 'transparent',
+                }]}
+              >
+                <Text style={[s.planDayName, { color: active ? '#fff' : isTodayChip ? theme.accent : theme.subtext }]}>
+                  {d}
+                </Text>
+                <View style={[s.planDayCount, { backgroundColor: active ? '#ffffff2e' : count ? theme.accent + '15' : 'transparent' }]}>
+                  <Text style={[s.planDayCountText, { color: active ? '#fff' : count ? theme.accent : 'transparent' }]}>{count}</Text>
+                </View>
+              </Pressable>
+            )
+          })}
+        </View>
+      </View>
+
+      {loadError ? (
+        <View style={s.errorWrap}>
+          <Text style={s.errorTitle}>We couldn't load your plan</Text>
+          <Text style={s.errorSub}>Check your connection and try again.</Text>
+          <Pressable style={s.errorBtn} onPress={load}>
+            <Text style={s.errorBtnText}>Retry</Text>
+          </Pressable>
+        </View>
+      ) : (
+      <DayList
+        meals={dayMeals}
+        canEdit
+        canDrag
+        emptyText="Nothing planned"
+        deleteLabel="Remove from plan"
+        onLogMeal={isToday ? logPlannedMeal : null}
+        onAdd={openAdd}
+        onDelete={handlePlanMealDelete}
+        onReorder={handlePlanReorder}
+        onPortion={handlePlanPortion}
+        expandedId={expandedId}
+        onToggleExpand={id => setExpandedId(expandedId === id ? null : id)}
+        header={(
+        <View>
+
+        {/* Actions: the AI planner, the week's notes, clear */}
+        <View style={s.planActions}>
+          <Pressable style={[s.plannerBtn, { backgroundColor: theme.accent }]} onPress={() => setPlannerOpen(true)}>
+            <Text style={s.plannerBtnText}>✦ AI meal planner</Text>
+          </Pressable>
+          {hasNotes && (
+            <Pressable
+              style={[s.planActionBtn, { backgroundColor: theme.accent + '20' }]}
+              onPress={() => setNotesOpen(v => !v)}
+            >
+              <Text style={[s.planActionText, { color: theme.accent }]}>{notesOpen ? 'Hide notes' : 'Week notes'}</Text>
+            </Pressable>
+          )}
+          {weekCount > 0 && (
+            <Pressable style={s.planActionBtn} onPress={clearPlan} hitSlop={6}>
+              <Text style={[s.planActionText, { color: theme.muted }]}>Clear</Text>
+            </Pressable>
+          )}
+        </View>
+
+        {/* What the planner said about this week */}
+        {hasNotes && notesOpen && (
+          <View style={s.notesCard}>
+            {!!notes.summary && <Text style={s.notesSummary}>{notes.summary}</Text>}
+            {notes.nutrition?.length > 0 && (
+              <>
+                <Text style={s.notesTitle}>NUTRITION CHECK</Text>
+                {notes.nutrition.map((n, i) => (
+                  <View key={i} style={s.notesRow}>
+                    <Text style={[s.notesBullet, { color: theme.accent }]}>•</Text>
+                    <Text style={s.notesText}>{n}</Text>
+                  </View>
+                ))}
+              </>
+            )}
+            {notes.prep?.length > 0 && (
+              <>
+                <Text style={s.notesTitle}>MEAL PREP</Text>
+                {notes.prep.map((n, i) => (
+                  <View key={i} style={s.notesRow}>
+                    <Text style={[s.notesNum, { color: theme.accent }]}>{i + 1}.</Text>
+                    <Text style={s.notesText}>{n}</Text>
+                  </View>
+                ))}
+              </>
+            )}
+            {notes.grocery?.length > 0 && (
+              <>
+                <Pressable style={s.notesToggle} onPress={() => setGroceryOpen(v => !v)}>
+                  <Text style={[s.notesTitle, { marginTop: 0, marginBottom: 0 }]}>GROCERY LIST · {notes.grocery.length}</Text>
+                  <Text style={s.summaryDetailToggleArrow}>{groceryOpen ? '▲' : '▼'}</Text>
+                </Pressable>
+                {groceryOpen && notes.grocery.map((g, i) => (
+                  <View key={i} style={s.groceryRow}>
+                    <Text style={s.groceryItem}>{g.item}</Text>
+                    <Text style={s.groceryAmount}>{g.amount}</Text>
+                  </View>
+                ))}
+              </>
+            )}
+            <Text style={s.notesDisclaimer}>
+              AI guidance from what you shared, not medical advice. For supplements or a health condition, speak to a doctor or registered dietitian.
+            </Text>
+          </View>
+        )}
+
+        <DailySummary
+          totals={totals}
+          goals={goals}
+          selectedDate={todayStr}
+          title={`${dayTitle.toUpperCase()}'S PLAN`}
         />
+
+        {isToday && dayMeals.length > 0 && (
+          <Pressable style={[s.logDayBtn, { borderColor: theme.accent }]} onPress={logWholeDay}>
+            <Text style={[s.logDayText, { color: theme.accent }]}>
+              Log {dayMeals.length === 1 ? 'this meal' : `all ${dayMeals.length} meals`} to today
+            </Text>
+          </Pressable>
+        )}
+
+        </View>
+        )}
+      />
       )}
 
-      {/* Step 2e: food database search */}
-      {flow === 'search' && activeSection && (
-        <FoodSearch
-          section={addingTo}
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          onAdd={handleMealAdded}
-          onClose={closeAll}
-        />
-      )}
+      <AddMealFlows
+        flow={flow}
+        section={activeSection}
+        userId={user.id}
+        onFlow={setFlow}
+        onAdd={handlePlanMealAdded}
+        onClose={closeAll}
+      />
 
-      {/* Step 2b: history */}
-      {flow === 'history' && activeSection && (
-        <HistoryPicker
-          section={addingTo}
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          loadHistory={() => getRecentMealHistory(user.id)}
-          onAdd={handleMealAdded}
-          onClose={closeAll}
-        />
-      )}
+      <MealPlannerModal
+        visible={plannerOpen}
+        onClose={() => setPlannerOpen(false)}
+        userId={user.id}
+        goals={goals}
+        onApply={applyAiPlan}
+      />
+    </View>
+  )
+}
 
-      {/* Step 2c: saved meals */}
-      {flow === 'saved' && activeSection && (
-        <SavedMealsPicker
-          section={addingTo}
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          loadSaved={() => getSavedMeals(user.id)}
-          onSaveTemplate={meal => upsertSavedMeal(user.id, meal).catch(e => Alert.alert('Could not save meal', e.message))}
-          onDeleteTemplate={id => deleteSavedMeal(user.id, id).catch(e => Alert.alert('Could not delete meal', e.message))}
-          onAdd={handleMealAdded}
-          onClose={closeAll}
-        />
-      )}
+// ── The page: Log | Plan ───────────────────────────────────────────────────
 
-      {/* Step 2d: manual entry */}
-      {flow === 'manual' && activeSection && (
-        <AddMealModal
-          section={addingTo}
-          sectionLabel={activeSection.label}
-          sectionColor={activeSection.color}
-          onSave={handleMealAdded}
-          onClose={closeAll}
-        />
-      )}
-      </ScrollView>
-      )}
+export default function MealsScreen() {
+  const { user } = useAuth()
+  const { theme } = useTheme()
+  const navigation = useNavigation()
+  const s = makeStyles(theme)
+  const [tab, setTab] = useState('log')
+  const [coachOpen, setCoachOpen] = useState(false)
+
+  // The meal coach lives behind an ✦ AI button in the header.
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <Pressable
+          onPress={() => setCoachOpen(true)}
+          hitSlop={10}
+          style={[s.coachBtn, { backgroundColor: theme.accent + '20' }]}
+        >
+          <Text style={[s.coachBtnText, { color: theme.accent }]}>✦ AI</Text>
+        </Pressable>
+      ),
+    })
+  }, [navigation, theme])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <View style={s.page}>
+      <MealCoachChat visible={coachOpen} onClose={() => setCoachOpen(false)} userId={user.id} />
+      <View style={s.tabBar}>
+        <View style={s.tabPill}>
+          {[['log', 'Log'], ['plan', 'Plan']].map(([key, label]) => {
+            const active = tab === key
+            return (
+              <Pressable
+                key={key}
+                style={[s.tabOpt, active && { backgroundColor: theme.accent }]}
+                onPress={() => setTab(key)}
+              >
+                <Text style={[s.tabOptText, { color: active ? '#fff' : theme.subtext }]}>{label}</Text>
+              </Pressable>
+            )
+          })}
+        </View>
+      </View>
+      {tab === 'log' ? <LogPane user={user} /> : <PlanPane user={user} />}
     </View>
   )
 }
 
 function makeStyles(theme) { return StyleSheet.create({
   page: { flex: 1, backgroundColor: theme.bg },
+  pane: { flex: 1 },
   content: { padding: 16, paddingBottom: 40 },
+
+  tabBar: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 8, backgroundColor: theme.header },
+  coachBtn: { borderRadius: 14, paddingHorizontal: 12, paddingVertical: 6, marginRight: 14 },
+  coachBtnText: { fontSize: 13, fontWeight: '800', letterSpacing: 0.2 },
+  tabPill: { flexDirection: 'row', borderRadius: 14, padding: 3, backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' },
+  tabOpt: { flex: 1, paddingVertical: 8, borderRadius: 11, alignItems: 'center' },
+  tabOptText: { fontSize: 13.5, fontWeight: '700' },
 
   summaryCard: {
     backgroundColor: theme.card, borderRadius: 22, padding: 22, marginBottom: 16,
@@ -668,6 +1293,8 @@ function makeStyles(theme) { return StyleSheet.create({
   summaryMacroLabel: { fontSize: 10, color: theme.muted, marginTop: 2, fontWeight: '600' },
 
   calGoal: { fontSize: 13, color: theme.muted, fontWeight: '600' },
+  calToGoWrap: { flex: 1, alignItems: 'flex-end', justifyContent: 'flex-end', paddingBottom: 8, paddingLeft: 8 },
+  calToGo: { fontSize: 12.5, fontWeight: '700', textAlign: 'right', lineHeight: 16 },
 
   calBarWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 16 },
   calBarTrack: { flex: 1, height: 7, backgroundColor: theme.input, borderRadius: 4, overflow: 'hidden' },
@@ -691,12 +1318,28 @@ function makeStyles(theme) { return StyleSheet.create({
   summaryDetailToggleText: { fontSize: 13, fontWeight: '600', color: theme.subtext },
   summaryDetailToggleArrow: { fontSize: 12, color: theme.muted, fontWeight: '700' },
 
-  section: {
-    backgroundColor: theme.card, borderRadius: 20, padding: 16,
-    marginBottom: 14, overflow: 'hidden',
-    shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
-    shadowOffset: { width: 4, height: 5 }, shadowOpacity: 0.18, shadowRadius: 0, elevation: 4,
+  // One section = a header row, its meal rows and a footer row, drawn so
+  // they read as a single card (the outline runs down both sides).
+  secTop: {
+    backgroundColor: theme.card, borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    borderWidth: 1, borderBottomWidth: 0, borderColor: theme.divider, borderLeftWidth: 4,
+    paddingHorizontal: 16, paddingTop: 16, paddingBottom: 6,
   },
+  secBody: {
+    backgroundColor: theme.card,
+    borderWidth: 1, borderTopWidth: 0, borderBottomWidth: 0, borderColor: theme.divider, borderLeftWidth: 4,
+    paddingHorizontal: 16, paddingTop: 8,
+  },
+  secBodyActive: {
+    borderRadius: 16, borderTopWidth: 1, borderBottomWidth: 1, paddingBottom: 8,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.2, shadowRadius: 12, elevation: 8,
+  },
+  secBottom: {
+    backgroundColor: theme.card, borderBottomLeftRadius: 20, borderBottomRightRadius: 20,
+    borderWidth: 1, borderTopWidth: 0, borderColor: theme.divider, borderLeftWidth: 4,
+    paddingHorizontal: 16, paddingTop: 4, paddingBottom: 12, marginBottom: 14,
+  },
+  dragHint: { fontSize: 12, color: theme.muted, fontWeight: '600', textAlign: 'center', marginTop: -6, marginBottom: 12 },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
   sectionLeft: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   sectionIconWrap: { width: 44, height: 44, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
@@ -723,9 +1366,23 @@ function makeStyles(theme) { return StyleSheet.create({
   mealColorBar: { width: 3, borderRadius: 2, alignSelf: 'stretch', minHeight: 40 },
   mealName: { fontSize: 15, fontWeight: '700', color: theme.text, marginBottom: 3 },
   mealContents: { fontSize: 13, color: theme.subtext, lineHeight: 18, marginBottom: 6 },
+  mealPrep: { fontSize: 12, color: theme.muted, lineHeight: 16, marginBottom: 6, fontStyle: 'italic' },
   mealQuickRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   mealQuickItem: { fontSize: 12, color: theme.subtext, fontWeight: '500' },
   mealQuickDot: { fontSize: 12, color: theme.muted },
+  mealAiTag: { fontSize: 10.5, fontWeight: '800', marginLeft: 4, letterSpacing: 0.3 },
+  mealPortionTag: { fontSize: 10.5, fontWeight: '800', marginLeft: 4, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 1, overflow: 'hidden' },
+
+  portionBox: { marginHorizontal: 14, marginTop: 4, marginBottom: 6, backgroundColor: theme.input, borderRadius: 12, padding: 12 },
+  portionTitle: { fontSize: 10, fontWeight: '800', color: theme.muted, letterSpacing: 1, marginBottom: 8 },
+  portionRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  portionStep: { width: 34, height: 34, borderRadius: 10, backgroundColor: theme.card, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: theme.divider },
+  portionStepText: { fontSize: 20, color: theme.text, fontWeight: '600', lineHeight: 24 },
+  portionInput: { width: 62, height: 34, borderWidth: 1.5, borderRadius: 10, textAlign: 'center', fontSize: 15, fontWeight: '700', color: theme.text, backgroundColor: theme.card },
+  portionLabel: { flex: 1, fontSize: 12, color: theme.subtext, fontWeight: '500' },
+  portionChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  portionChip: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: theme.divider, backgroundColor: theme.card },
+  portionChipText: { fontSize: 12.5, fontWeight: '700', color: theme.subtext },
   mealCalBox: { alignItems: 'center', minWidth: 44 },
   mealCalNum: { fontSize: 22, fontWeight: '800', lineHeight: 26 },
   mealCalUnit: { fontSize: 10, color: theme.muted, fontWeight: '700' },
@@ -749,6 +1406,11 @@ function makeStyles(theme) { return StyleSheet.create({
   macroToggleLabel: { fontSize: 13, fontWeight: '600', color: theme.subtext },
   macroToggleArrow: { fontSize: 12, color: theme.muted, fontWeight: '700' },
 
+  logBtn: {
+    marginHorizontal: 14, marginTop: 6, marginBottom: 4,
+    paddingVertical: 11, borderRadius: 11, alignItems: 'center',
+  },
+  logBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   deleteBtn: {
     marginHorizontal: 14, marginBottom: 14, marginTop: 4,
     paddingVertical: 11, borderRadius: 11,
@@ -793,4 +1455,46 @@ function makeStyles(theme) { return StyleSheet.create({
   dayNum: { fontSize: 15, fontWeight: '700', color: theme.text },
   dayNumSelected: { color: '#fff' },
   todayDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: theme.accent, marginTop: 2 },
+
+  // Plan tab header: same bones as the class calendar's day picker.
+  planHeader: {
+    backgroundColor: theme.header, paddingBottom: 10,
+    borderBottomWidth: 1, borderBottomColor: theme.divider,
+  },
+  planTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingTop: 8, paddingBottom: 10 },
+  planTitle: { fontSize: 17, fontWeight: '800', letterSpacing: -0.3, color: theme.text },
+  planWeekSub: { fontSize: 11.5, fontWeight: '600', color: theme.muted, marginTop: 1 },
+  planDayStrip: { flexDirection: 'row', gap: 5, paddingHorizontal: 10 },
+  planDayChip: {
+    flex: 1, minWidth: 40, alignItems: 'center', gap: 1, paddingVertical: 7,
+    borderRadius: 15, borderWidth: 1.5,
+  },
+  planDayName: { fontSize: 12, fontWeight: '800' },
+  planDayCount: { minWidth: 20, height: 18, borderRadius: 9, paddingHorizontal: 5, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
+  planDayCountText: { fontSize: 10.5, lineHeight: 13, fontWeight: '800', fontVariant: ['tabular-nums'] },
+
+  planActions: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 14 },
+  plannerBtn: { flex: 1, borderRadius: 14, paddingVertical: 12, alignItems: 'center' },
+  plannerBtnText: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  planActionBtn: { borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12 },
+  planActionText: { fontSize: 13, fontWeight: '700' },
+
+  notesCard: {
+    backgroundColor: theme.card, borderRadius: 20, padding: 18, marginBottom: 16,
+    borderWidth: 1, borderColor: theme.cardBorder,
+  },
+  notesSummary: { fontSize: 14, lineHeight: 21, fontWeight: '500', color: theme.text },
+  notesTitle: { fontSize: 10.5, fontWeight: '800', color: theme.muted, letterSpacing: 1.2, marginTop: 16, marginBottom: 8 },
+  notesRow: { flexDirection: 'row', gap: 8, marginBottom: 6 },
+  notesBullet: { fontSize: 14, fontWeight: '800', lineHeight: 20 },
+  notesNum: { fontSize: 13, fontWeight: '800', lineHeight: 20, minWidth: 18 },
+  notesText: { flex: 1, fontSize: 13.5, lineHeight: 20, fontWeight: '500', color: theme.text },
+  notesToggle: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 16, marginBottom: 8 },
+  groceryRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 10, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: theme.divider },
+  groceryItem: { flex: 1, fontSize: 13.5, fontWeight: '600', color: theme.text },
+  groceryAmount: { fontSize: 13, fontWeight: '500', color: theme.subtext },
+  notesDisclaimer: { fontSize: 11.5, lineHeight: 16, fontWeight: '500', color: theme.muted, marginTop: 14 },
+
+  logDayBtn: { borderRadius: 14, borderWidth: 1.5, paddingVertical: 12, alignItems: 'center', marginBottom: 14 },
+  logDayText: { fontSize: 14, fontWeight: '700' },
 }) }

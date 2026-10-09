@@ -394,6 +394,8 @@ export default function CalendarScreen() {
   const [cMulti, setCMulti]       = useState(false)
   const [cLoc2, setCLoc2]         = useState('')
   const [cType2, setCType2]       = useState(null)
+  // A class the user usually skips: kept on the schedule, shown in red.
+  const [cSkip, setCSkip]         = useState(false)
   const [cSaving, setCeSaving]    = useState(false)
 
   // Drag-down-to-dismiss for the class sheet. Tapping a class autofocuses the
@@ -653,7 +655,8 @@ export default function CalendarScreen() {
         }
         out.push({
           key: `${item.id}|${dow}`, item, dow, date,
-          color: item.color ?? theme.accent,
+          skip: !!item.meta?.usuallySkip,
+          color: item.meta?.usuallySkip ? '#ef4444' : (item.color ?? theme.accent),
           dayName: dayName.slice(0, 3),
           dateLabel: date ? new Date(date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '',
           startTime: item.startTime, endTime: item.endTime,
@@ -773,6 +776,7 @@ export default function CalendarScreen() {
     setCColor('#3b82f6'); setCFrom(''); setCTo('')
     setCType('Lecture')
     setCMulti(false); setCLoc2(''); setCType2(null)
+    setCSkip(false)
     classDragY.setValue(0)
     classAtTop.current = true
     setClassOpen(true)
@@ -789,6 +793,7 @@ export default function CalendarScreen() {
     setCMulti(!!item.meta?.multiUse)
     setCLoc2(item.meta?.location2 ?? '')
     setCType2(CLASS_TYPES.includes(item.meta?.type2) ? item.meta.type2 : null)
+    setCSkip(!!item.meta?.usuallySkip)
     setCFrom(item.semesterStart ? fmtDateForInput(item.semesterStart) : '')
     setCTo(item.semesterEnd ? fmtDateForInput(item.semesterEnd) : '')
     classDragY.setValue(0)
@@ -796,10 +801,12 @@ export default function CalendarScreen() {
     setClassOpen(true)
   }
 
-  // Slide the sheet the rest of the way out, then unmount it. The travel is a
+  // Slide the sheet the rest of the way out, then hide it. The travel is a
   // screen height rather than the measured sheet height because dismissing the
-  // keyboard re-lays the sheet out taller mid-animation. Resetting the offset
-  // after the modal is gone keeps the next open from starting off screen.
+  // keyboard re-lays the sheet out taller mid-animation. The offset is reset
+  // by the open functions, not here: on iOS the Modal stays mounted through
+  // its own dismiss animation, so resetting now would flash the sheet back
+  // onto the screen before it slides away a second time.
   const closeClassSheet = useCallback(() => {
     Keyboard.dismiss()
     Animated.timing(classDragY, {
@@ -807,7 +814,6 @@ export default function CalendarScreen() {
     }).start(() => {
       setClassOpen(false)
       setEditingClass(null)
-      classDragY.setValue(0)
     })
   }, [classDragY])
 
@@ -931,6 +937,7 @@ export default function CalendarScreen() {
       multiUse: cMulti,
       location2: cMulti ? (cLoc2.trim() || null) : null,
       type2: cMulti ? cType2 : null,
+      usuallySkip: cSkip,
     }
     // A club meeting's card shows meta.courseCode, so a rename here has to
     // reach it too (the club itself is renamed from the Routines page).
@@ -1765,7 +1772,11 @@ export default function CalendarScreen() {
                 {classSearchResults.map(r => (
                   <Pressable
                     key={r.key}
-                    style={[s.searchCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, borderLeftColor: r.color }]}
+                    style={[s.searchCard, {
+                      backgroundColor: r.skip ? '#ef4444' + (theme.isDark ? '3a' : '18') : theme.card,
+                      borderColor: r.skip ? '#ef444466' : theme.cardBorder,
+                      borderLeftColor: r.color,
+                    }]}
                     onPress={() => { if (r.date) setLogDay(r.date); setClassQuery('') }}
                   >
                     <View style={s.searchCardTop}>
@@ -1826,7 +1837,9 @@ export default function CalendarScreen() {
                 // can be ticked, and only for today or earlier.
                 const canCheck = ev.kind === 'class' && logDay <= today
                 const checked = canCheck && !!classChecks[classCheckKey(ev._scheduleId, logDay)]
-                const accent = checked ? '#10b981' : ev.color
+                // A class they usually skip is red, unless they ticked it today.
+                const skipped = ev.kind === 'class' && !!ev.meta?.usuallySkip && !checked
+                const accent = checked ? '#10b981' : skipped ? '#ef4444' : ev.color
                 return (
                   <View key={ev.id} style={s.dayClassRow}>
                     <View style={s.dayClassTimeCol}>
@@ -1837,9 +1850,9 @@ export default function CalendarScreen() {
                     <Pressable
                       onPress={() => handleWeekEventPress(ev)}
                       style={[s.dayClassCard, {
-                        backgroundColor: accent + (theme.isDark ? '24' : '16'),
+                        backgroundColor: accent + (skipped ? (theme.isDark ? '3a' : '26') : (theme.isDark ? '24' : '16')),
                         borderLeftColor: accent,
-                        borderColor: accent + '40',
+                        borderColor: accent + (skipped ? '70' : '40'),
                       }]}
                     >
                       <View style={s.dayClassTopRow}>
@@ -1880,6 +1893,7 @@ export default function CalendarScreen() {
                       <Text style={[s.dayClassRange, { color: theme.muted }]}>
                         {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
                         {checked && <Text style={s.dayClassDone}>   ✓ Attended</Text>}
+                        {skipped && <Text style={s.dayClassSkip}>   ↷ Usually skipped</Text>}
                       </Text>
                     </Pressable>
                   </View>
@@ -2291,7 +2305,28 @@ export default function CalendarScreen() {
                     </View>
                   </>
                 )}
-  
+
+                {/* A class they tend to skip stays on the schedule, in red */}
+                <View style={[s.multiRow, { borderColor: cSkip ? '#ef444466' : theme.cardBorder, backgroundColor: cSkip ? '#ef444412' : (theme.isDark ? '#ffffff06' : '#00000004') }]}>
+                  <Text style={[s.multiQuestion, { color: theme.text }]}>
+                    I usually skip this class
+                  </Text>
+                  <Text style={[s.multiHint, { color: theme.muted }]}>
+                    It stays on your schedule, shown in red, so you can see what you tend to miss.
+                  </Text>
+                  <View style={[s.multiToggle, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
+                    {[['No', false], ['Yes', true]].map(([label, val]) => (
+                      <Pressable
+                        key={label}
+                        style={[s.multiBtn, cSkip === val && { backgroundColor: val ? '#ef4444' : cColor }]}
+                        onPress={() => setCSkip(val)}
+                      >
+                        <Text style={[s.multiBtnText, { color: cSkip === val ? '#fff' : theme.subtext }]}>{label}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+
                 <Pressable
                   style={[s.saveBtn, { backgroundColor: theme.accent, opacity: cSaving ? 0.6 : 1, marginBottom: 8 }]}
                   onPress={handleSaveClass} disabled={cSaving}
@@ -2317,11 +2352,20 @@ export default function CalendarScreen() {
           <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFillObject, s.modalBg, { opacity: taskDrag.backdrop }]} />
           <Pressable style={StyleSheet.absoluteFillObject} onPress={taskDrag.close} />
           <Animated.View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card, transform: [{ translateY: taskDrag.dragY }] }]}>
-            <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-              <View {...taskDrag.handlePan.panHandlers} style={taskDrag.grabStyle}>
-                <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
-                <Text style={[s.modalTitle, { color: theme.text }]}>{editingTask ? 'Edit Task' : 'New Task'}</Text>
-              </View>
+            {/* Grab area outside the ScrollView, like the class sheet: a handle
+                inside the list would have its pull cancelled by the scroll. */}
+            <View {...taskDrag.handlePan.panHandlers} style={s.sheetGrabArea}>
+              <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
+              <Text style={[s.modalTitle, { color: theme.text }]}>{editingTask ? 'Edit Task' : 'New Task'}</Text>
+            </View>
+            <View {...taskDrag.bodyPan.panHandlers} style={s.sheetFormWrap}>
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              bounces={false}
+              scrollEventThrottle={16}
+              onScroll={taskDrag.onScroll}
+            >
 
               <Text style={[s.fieldLabel, { color: theme.muted }]}>TITLE</Text>
               <TextInput
@@ -2395,6 +2439,7 @@ export default function CalendarScreen() {
                 </Pressable>
               )}
             </ScrollView>
+            </View>
           </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
@@ -2640,6 +2685,7 @@ const s = StyleSheet.create({
   dayClassLocation: { fontSize: 13, lineHeight: 18, fontWeight: '600' },
   dayClassRange: { fontSize: 11.5, fontWeight: '600', fontVariant: ['tabular-nums'] },
   dayClassDone: { color: '#10b981', fontWeight: '800' },
+  dayClassSkip: { color: '#ef4444', fontWeight: '800' },
   dayCheck: {
     width: 26, height: 26, borderRadius: 13, borderWidth: 2, marginLeft: 8,
     alignItems: 'center', justifyContent: 'center',
@@ -2652,6 +2698,7 @@ const s = StyleSheet.create({
   typeChipText: { fontSize: 12.5, fontWeight: '700' },
   multiRow: { borderRadius: 12, borderWidth: 1, padding: 12, marginBottom: 12, gap: 8 },
   multiQuestion: { fontSize: 13, fontWeight: '600', lineHeight: 18 },
+  multiHint: { fontSize: 12, fontWeight: '500', lineHeight: 16, marginTop: -4 },
   multiToggle: { flexDirection: 'row', borderRadius: 10, padding: 3, alignSelf: 'flex-start' },
   multiBtn: { paddingHorizontal: 18, paddingVertical: 7, borderRadius: 8 },
   multiBtnText: { fontSize: 12.5, fontWeight: '800' },
