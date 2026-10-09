@@ -20,6 +20,28 @@ function fmtElapsed(ms) {
   return `${s}s`
 }
 
+// The 1-second workout clock lives in its own component so each tick
+// re-renders only the timer pill, not the whole screen (exercise GIF, set
+// table, modals). Elapsed derives from the start timestamp on every tick, so
+// unmounting during rests / on finish loses nothing and needs no parent state.
+function ElapsedTimer({ startedAt, styles: s }) {
+  const [elapsedMs, setElapsedMs] = useState(0)
+
+  useEffect(() => {
+    const base = startedAt || Date.now()
+    const tick = () => setElapsedMs(Date.now() - base)
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [startedAt])
+
+  return (
+    <View style={s.timerPill}>
+      <Text style={s.timerText}>{fmtElapsed(elapsedMs)}</Text>
+    </View>
+  )
+}
+
 export default function WorkoutRun() {
   const { muscleGroup } = useLocalSearchParams()
   const { user } = useAuth()
@@ -40,13 +62,11 @@ export default function WorkoutRun() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [editSets,     setEditSets]     = useState(3)
   const [editRest,     setEditRest]     = useState(90)
-  const [elapsedMs,    setElapsedMs]    = useState(0)
   const [overviewOpen, setOverviewOpen] = useState(false)
   const [timeModes,    setTimeModes]    = useState({}) // exerciseIdx → true=time, false=weight
   const [progressPhoto, setProgressPhoto] = useState(null)
 
   const intervalRef  = useRef(null)
-  const elapsedRef   = useRef(null)
   const startTimeRef = useRef(null)
 
   useEffect(() => {
@@ -82,6 +102,12 @@ export default function WorkoutRun() {
     return () => clearInterval(intervalRef.current)
   }, [phase])
 
+  // ElapsedTimer clears its own interval when it unmounts; only the rest
+  // countdown still needs clearing here.
+  useEffect(() => () => {
+    clearInterval(intervalRef.current)
+  }, [])
+
   function prefillForSet(exName, setIndex) {
     const prev = prevData[exName]?.[setIndex]
     if (prev) { setWeight(String(prev.weight)); setReps(String(prev.reps)) }
@@ -90,7 +116,6 @@ export default function WorkoutRun() {
 
   function startWorkout() {
     startTimeRef.current = Date.now()
-    elapsedRef.current = setInterval(() => setElapsedMs(Date.now() - startTimeRef.current), 1000)
     const ex = exercises[0]
     prefillForSet(ex.name, 0)
     setExerciseIdx(0)
@@ -104,9 +129,22 @@ export default function WorkoutRun() {
     const isLastSet = setIdx >= totalSets - 1
     const isLastEx  = exerciseIdx >= exercises.length - 1
 
+    // In time mode the weight column holds seconds, so both fields read from it
+    const isTime    = timeModes[exerciseIdx] ?? false
+    const amount    = parseFloat(weight) || 0
+
     const newLog = log.map((entry, i) =>
       i === exerciseIdx
-        ? { ...entry, sets: [...entry.sets, { reps: parseInt(reps, 10) || 0, weight: parseFloat(weight) || 0 }] }
+        ? {
+            ...entry,
+            sets: [...entry.sets, {
+              reps: parseInt(reps, 10) || 0,
+              weight: amount,
+              time: isTime ? amount : 0,
+              unit,
+              isTime,
+            }],
+          }
         : entry
     )
     setLog(newLog)
@@ -205,7 +243,6 @@ export default function WorkoutRun() {
 
   async function finishWorkout(finalLog) {
     clearInterval(intervalRef.current)
-    clearInterval(elapsedRef.current)
     setPhase('done')
     if (user) {
       await saveWorkoutLog(user.id, today(), {
@@ -383,7 +420,7 @@ export default function WorkoutRun() {
 
         {/* Top row: exit | timer/rest | settings */}
         <View style={s.topRow}>
-          <Pressable style={s.topSide} onPress={() => { clearInterval(intervalRef.current); clearInterval(elapsedRef.current); router.back() }}>
+          <Pressable style={s.topSide} onPress={() => { clearInterval(intervalRef.current); router.back() }}>
             <Text style={s.backText}>← Exit</Text>
           </Pressable>
 
@@ -394,9 +431,7 @@ export default function WorkoutRun() {
               <Text style={s.restPillSkip}>· Skip →</Text>
             </Pressable>
           ) : (
-            <View style={s.timerPill}>
-              <Text style={s.timerText}>{fmtElapsed(elapsedMs)}</Text>
-            </View>
+            <ElapsedTimer startedAt={startTimeRef.current} styles={s} />
           )}
 
           <View style={[s.topSide, { alignItems: 'flex-end' }]}>

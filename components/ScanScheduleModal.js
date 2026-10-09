@@ -80,10 +80,12 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
     setBusy(true)
     try {
       // Screenshots are big PNGs — downscale and re-encode so the upload stays
-      // small. Timetables are dense, so keep more width than a workout list.
+      // small. Timetables are dense text grids and desktop screenshots are
+      // wide, so 1100px blurred the day columns; 1600 keeps them readable and
+      // still lands well under the server's image-size cap.
       const images = []
       for (const asset of result.assets) {
-        const width = Math.min(asset.width || 1100, 1100)
+        const width = Math.min(asset.width || 1600, 1600)
         const shrunk = await manipulateAsync(
           asset.uri,
           [{ resize: { width } }],
@@ -212,7 +214,7 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
               </Pressable>
               {busy && (
                 <Text style={[sc.busyNote, { color: theme.muted }]}>
-                  Reading your timetable — this takes a few seconds.
+                  Reading your timetable carefully — this can take up to a minute.
                 </Text>
               )}
             </>

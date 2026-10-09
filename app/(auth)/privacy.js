@@ -47,7 +47,7 @@ export default function Privacy() {
         contentContainerStyle={[s.content, { paddingBottom: insets.bottom + 32 }]}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={[s.meta, { color: theme.muted }]}>Effective 5 August 2026 · Last updated 5 August 2026</Text>
+        <Text style={[s.meta, { color: theme.muted }]}>Effective 25 August 2026 · Last updated 25 August 2026</Text>
 
         <P>
           LifeLayer is a personal productivity and fitness app. This policy explains what we collect, why we
@@ -71,7 +71,7 @@ export default function Privacy() {
           <Bullet>Weight, height, age, biological sex, activity level and goals</Bullet>
           <Bullet>Workouts, exercises and sets</Bullet>
           <Bullet>Meals and macros</Bullet>
-          <Bullet>Routines, habits and streaks</Bullet>
+          <Bullet>Routines and streaks</Bullet>
           <Bullet>Journal entries</Bullet>
           <P>
             We use this only to power the features you are using: calculating your calorie and macro targets,
@@ -79,21 +79,32 @@ export default function Privacy() {
           </P>
           <P>
             <Text style={s.strong}>Photos.</Text> You are never required to add a photo. If you choose to, there
-            are three cases. A profile picture is uploaded and visible to other users. Progress and workout
-            photos <Text style={s.strong}>stay on your device and are never uploaded</Text> anywhere. A selfie
-            used for the AI skin and hair analysis is sent for that one analysis only, as described below.
+            are four cases. A profile picture is uploaded and visible to other users. Fitness progress and
+            workout photos <Text style={s.strong}>stay on your device and are never uploaded</Text> anywhere.
+            Photos you attach to a routine task or step are uploaded to our app's cloud storage (a Supabase
+            storage bucket) so they follow you across devices; you can keep up to 10 of these, and you can
+            delete any of them at any time. A selfie used for the AI skin and hair analysis is sent for that
+            one analysis only, as described below.
           </P>
         </Section>
 
         <Section title="AI features and third-party processing">
           <P>
-            Some features are powered by AI: routine generation, routine advice, importing a workout from a
-            screenshot, and skin and hair analysis. When you use one of these, the relevant text or image is sent
+            Some features are powered by AI: routine generation, routine advice, the protocol AI chat,
+            importing a workout from a screenshot, importing a class schedule from a screenshot of your
+            timetable, and skin and hair analysis. When you use one of these, the relevant text or image is sent
             through our secure server to OpenAI for one-time processing, and the result comes back to you.
           </P>
           <P>
             <Text style={s.strong}>We do not store those images or inputs after the request finishes.</Text>{' '}
             OpenAI processes them as our service provider so that we can return your result.
+          </P>
+          <P>
+            <Text style={s.strong}>Protocol AI chat.</Text> What you type in the protocol AI chat — which can
+            include sensitive things, like a habit you are trying to quit or how you are feeling — is sent the
+            same way, to OpenAI through our secure server, only to generate each reply. It is not used to train
+            AI models, and LifeLayer does not keep the conversation once the chat ends. The chat is not a
+            substitute for professional help, and crisis resources are available in the app.
           </P>
           <P>
             Content you post publicly, and profile pictures, are automatically screened for safety before they go
@@ -160,6 +171,9 @@ export default function Privacy() {
         <Section title="Changes to this policy">
           <P>
             If this policy changes, we will update this page and the "Last updated" date at the top.
+          </P>
+          <P>
+            25 August 2026: Updated to describe routine photo storage and AI chat features.
           </P>
         </Section>
 

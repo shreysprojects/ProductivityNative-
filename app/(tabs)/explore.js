@@ -1,4 +1,4 @@
-import { useState, useCallback, useLayoutEffect, useEffect } from 'react'
+import { useState, useCallback, useLayoutEffect, useEffect, useMemo, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, FlatList, Modal,
   Alert, ActivityIndicator, ScrollView, TextInput, Switch, Share,
@@ -902,6 +902,10 @@ export default function ExploreScreen() {
   const [feed, setFeed] = useState([])
   const [blockedIds, setBlockedIds] = useState([])
   const [loading, setLoading] = useState(true)
+  const [feedError, setFeedError] = useState(false)
+  // True once a fetch has succeeded — a ref, not state, because the focus
+  // callback that triggers refetches captures stale renders.
+  const hasFeedRef = useRef(false)
   const [postModalVisible, setPostModalVisible] = useState(false)
   const [activeTopTab, setActiveTopTab] = useState('community')
   const [friends, setFriends] = useState([])
@@ -922,17 +926,28 @@ export default function ExploreScreen() {
   }, [navigation, theme])
 
   async function fetchFeed() {
-    setLoading(true)
+    // Only the very first load gets the full-screen spinner — a refetch on
+    // focus keeps whatever is already on screen until fresh data lands.
+    if (!hasFeedRef.current) setLoading(true)
     const [routinesRes, postsRes, blocked] = await Promise.all([
       supabase.from('shared_routines').select('*').order('created_at', { ascending: false }).limit(100),
       supabase.from('community_posts').select('*').order('created_at', { ascending: false }).limit(100),
       getBlockedIds(user?.id),
     ])
+    if (routinesRes.error || postsRes.error) {
+      // A failed refresh keeps the stale feed; the error page only appears
+      // when there is nothing cached to show instead.
+      if (!hasFeedRef.current) setFeedError(true)
+      setLoading(false)
+      return
+    }
     const routines = (routinesRes.data ?? []).map(r => ({ ...r, post_type: 'routine', _table: 'shared_routines' }))
     const posts = (postsRes.data ?? []).map(p => ({ ...p, _table: 'community_posts' }))
     const merged = [...routines, ...posts].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     setBlockedIds(blocked)
     setFeed(merged)
+    setFeedError(false)
+    hasFeedRef.current = true
     setLoading(false)
   }
 
@@ -1068,6 +1083,34 @@ export default function ExploreScreen() {
     ])
   }
 
+  // Filtering on every render made FlatList see a brand-new array each time;
+  // memoized so it only changes when the feed or block list actually does.
+  const visibleFeed = useMemo(
+    () => feed.filter(item => !blockedIds.includes(item.user_id)),
+    [feed, blockedIds]
+  )
+
+  // Stable list chrome — inline arrows would remount these on every render.
+  const FeedHeader = useCallback(() => (
+    <Text style={[ec.feedLabel, { color: theme.subtext }]}>COMMUNITY</Text>
+  ), [theme])
+
+  const FeedFooter = useCallback(() => (
+    <Text style={[ec.guidelines, { color: theme.muted }]}>
+      Community posts are moderated. Reported content is reviewed and removed within 24 hours, and accounts that post abusive content are removed.
+    </Text>
+  ), [theme])
+
+  const FeedEmpty = useCallback(() => (
+    <View style={ec.emptyContainer}>
+      <Text style={ec.emptyIcon}>🌐</Text>
+      <Text style={[ec.emptyTitle, { color: theme.text }]}>Nothing here yet</Text>
+      <Text style={[ec.emptySub, { color: theme.subtext }]}>
+        Be the first to share with the community!
+      </Text>
+    </View>
+  ), [theme])
+
   return (
     <KeyboardAvoidingView
       style={[ec.page, { backgroundColor: theme.bg }]}
@@ -1095,9 +1138,20 @@ export default function ExploreScreen() {
           <View style={ec.loadingContainer}>
             <ActivityIndicator size="large" color="#6366f1" />
           </View>
+        ) : feedError ? (
+          <View style={ec.errorContainer}>
+            <Text style={[ec.errorTitle, { color: theme.text }]}>We couldn't load the feed</Text>
+            <Text style={[ec.errorSub, { color: theme.subtext }]}>Check your connection and try again.</Text>
+            <Pressable
+              style={[ec.errorBtn, { backgroundColor: '#6366f1' }]}
+              onPress={() => { setFeedError(false); setLoading(true); fetchFeed() }}
+            >
+              <Text style={ec.errorBtnText}>Retry</Text>
+            </Pressable>
+          </View>
         ) : (
           <FlatList
-            data={feed.filter(item => !blockedIds.includes(item.user_id))}
+            data={visibleFeed}
             keyExtractor={item => item.id}
             contentContainerStyle={ec.listContent}
             showsVerticalScrollIndicator={false}
@@ -1111,23 +1165,9 @@ export default function ExploreScreen() {
                 onBlock={handleBlock}
               />
             )}
-            ListHeaderComponent={() => (
-              <Text style={[ec.feedLabel, { color: theme.subtext }]}>COMMUNITY</Text>
-            )}
-            ListFooterComponent={() => (
-              <Text style={[ec.guidelines, { color: theme.muted }]}>
-                Community posts are moderated. Reported content is reviewed and removed within 24 hours, and accounts that post abusive content are removed.
-              </Text>
-            )}
-            ListEmptyComponent={() => (
-              <View style={ec.emptyContainer}>
-                <Text style={ec.emptyIcon}>🌐</Text>
-                <Text style={[ec.emptyTitle, { color: theme.text }]}>Nothing here yet</Text>
-                <Text style={[ec.emptySub, { color: theme.subtext }]}>
-                  Be the first to share with the community!
-                </Text>
-              </View>
-            )}
+            ListHeaderComponent={FeedHeader}
+            ListFooterComponent={FeedFooter}
+            ListEmptyComponent={FeedEmpty}
           />
         )
       ) : (
@@ -1180,6 +1220,12 @@ const ec = StyleSheet.create({
   page: { flex: 1 },
   listContent: { padding: 16, paddingBottom: 110 },
   loadingContainer: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+
+  errorContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
+  errorTitle: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2, textAlign: 'center' },
+  errorSub: { fontSize: 13, fontWeight: '500', textAlign: 'center', marginTop: 6, lineHeight: 18 },
+  errorBtn: { borderRadius: 14, paddingVertical: 13, paddingHorizontal: 30, marginTop: 20 },
+  errorBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 
   feedLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 12 },
   guidelines: { fontSize: 11, fontWeight: '500', lineHeight: 17, textAlign: 'center', paddingHorizontal: 12, paddingTop: 8 },

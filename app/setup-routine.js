@@ -1,6 +1,10 @@
 import { useState, useEffect, useMemo } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
+import * as ImagePicker from 'expo-image-picker'
+import {
+  uploadRoutinePhoto, deleteStepImage, countRoutinePhotos, MAX_ROUTINE_PHOTOS,
+} from '../lib/photoStorage'
 import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
@@ -15,6 +19,7 @@ import {
 const EVERYDAY_COLOR = '#f59e0b'
 const WHENEVER_COLOR = '#06b6d4'
 import { routineTheme } from '../lib/themes'
+import ImageViewerModal from '../components/ImageViewerModal'
 
 const DAY_INITIALS = ['M', 'T', 'W', 'T', 'F', 'S', 'S']
 const DAY_NAMES    = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -208,6 +213,9 @@ export default function SetupRoutine() {
   const [goalSecs,         setGoalSecs]         = useState('')
   const [saving,           setSaving]           = useState(false)
   const [expandedIds,      setExpandedIds]      = useState(new Set())
+  const [expandedSubKeys,  setExpandedSubKeys]  = useState(new Set())
+  const [photoViewer,      setPhotoViewer]      = useState(null)
+  const [uploadingPhoto,   setUploadingPhoto]   = useState(false)
   const [subInputs,        setSubInputs]        = useState({})
   const [activeDays,       setActiveDays]       = useState([true, true, true, true, true, true, true])
   const [startTimeMinutes, setStartTimeMinutes] = useState(540)
@@ -253,6 +261,28 @@ export default function SetupRoutine() {
       .then(run => setRunInProgress(!!run && !run.finished))
       .catch(() => {})
   }, [user, routineName, isFirstTime, isNew])
+
+  // How many of the account's photo slots are in use. The cap is enforced in
+  // the database; this is what lets the button say so before the user picks.
+  const [photoCount, setPhotoCount] = useState(null)
+
+  function refreshPhotoCount() {
+    if (!user?.id) return
+    countRoutinePhotos(user.id).then(setPhotoCount).catch(() => setPhotoCount(null))
+  }
+
+  useEffect(refreshPhotoCount, [user])
+
+  const photoLimitReached = photoCount !== null && photoCount >= MAX_ROUTINE_PHOTOS
+
+  // Label for the add-photo control, which doubles as the place the user finds
+  // out how many slots are left.
+  function addPhotoLabel(what) {
+    if (uploadingPhoto) return 'Uploading…'
+    if (photoLimitReached) return `📷  ${MAX_ROUTINE_PHOTOS}/${MAX_ROUTINE_PHOTOS} photos used — remove one first`
+    const used = photoCount === null ? '' : `  (${photoCount}/${MAX_ROUTINE_PHOTOS})`
+    return `📷  Add photo${what}${used}`
+  }
 
   const totalGoalSecs = tasks.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
 
@@ -328,8 +358,102 @@ export default function SetupRoutine() {
   }
 
   function removeTask(id) {
-    setTasks(prev => prev.filter(t => t.id !== id))
+    setTasks(prev => {
+      const gone = prev.find(t => t.id === id)
+      if (gone?.image) deleteStepImage(gone.image)
+      // The task's steps go with it, so their photos do too.
+      gone?.subTasks?.forEach(st => { if (st.image) deleteStepImage(st.image) })
+      return prev.filter(t => t.id !== id)
+    })
     setExpandedIds(prev => { const n = new Set(prev); n.delete(id); return n })
+  }
+
+  // Shared by task photos and step photos: ask for permission, let the user
+  // pick, and upload it. Returns the stored URL, or null if the user backed out
+  // or it could not be saved — in which case the reason has been shown already.
+  async function pickAndStoreImage() {
+    if (!user?.id) {
+      Alert.alert('Not signed in', 'Sign in to add photos to your routine.')
+      return null
+    }
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Photo library access is required.')
+      return null
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: 'images',
+      quality: 0.6,
+    })
+    const uri = result.canceled ? null : result.assets?.[0]?.uri
+    if (!uri) return null
+
+    setUploadingPhoto(true)
+    try {
+      return await uploadRoutinePhoto(user.id, uri)
+    } catch (err) {
+      Alert.alert('Could not add photo', err?.message ?? 'Please try again.')
+      return null
+    } finally {
+      setUploadingPhoto(false)
+    }
+  }
+
+  async function pickTaskImage(taskId) {
+    const stored = await pickAndStoreImage()
+    if (!stored) return
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t
+      if (t.image) deleteStepImage(t.image)
+      return { ...t, image: stored }
+    }))
+    refreshPhotoCount()
+  }
+
+  function removeTaskImage(taskId) {
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t
+      if (t.image) deleteStepImage(t.image)
+      return { ...t, image: null }
+    }))
+    refreshPhotoCount()
+  }
+
+  // Each step inside a task carries its own photo, independent of the task's.
+  function mapSubTask(taskId, subId, fn) {
+    setTasks(prev => prev.map(t => t.id !== taskId ? t : {
+      ...t,
+      subTasks: t.subTasks.map(st => st.id !== subId ? st : fn(st)),
+    }))
+  }
+
+  async function pickSubTaskImage(taskId, subId) {
+    const stored = await pickAndStoreImage()
+    if (!stored) return
+    mapSubTask(taskId, subId, st => {
+      if (st.image) deleteStepImage(st.image)
+      return { ...st, image: stored }
+    })
+    refreshPhotoCount()
+  }
+
+  function removeSubTaskImage(taskId, subId) {
+    mapSubTask(taskId, subId, st => {
+      if (st.image) deleteStepImage(st.image)
+      return { ...st, image: null }
+    })
+    refreshPhotoCount()
+  }
+
+  const subKey = (taskId, subId) => `${taskId}:${subId}`
+
+  function toggleSubExpand(taskId, subId) {
+    const key = subKey(taskId, subId)
+    setExpandedSubKeys(prev => {
+      const n = new Set(prev)
+      n.has(key) ? n.delete(key) : n.add(key)
+      return n
+    })
   }
 
   function toggleExpand(id) {
@@ -364,9 +488,13 @@ export default function SetupRoutine() {
   }
 
   function removeSubTask(taskId, subId) {
-    setTasks(prev => prev.map(t =>
-      t.id === taskId ? { ...t, subTasks: t.subTasks.filter(st => st.id !== subId) } : t
-    ))
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t
+      const gone = t.subTasks.find(st => st.id === subId)
+      if (gone?.image) deleteStepImage(gone.image)
+      return { ...t, subTasks: t.subTasks.filter(st => st.id !== subId) }
+    }))
+    setExpandedSubKeys(prev => { const n = new Set(prev); n.delete(subKey(taskId, subId)); return n })
   }
 
   function toggleDay(i) {
@@ -418,6 +546,10 @@ export default function SetupRoutine() {
       else if (renaming) router.replace('/routine/' + encodeURIComponent(finalName))
       else if (router.canGoBack()) router.back()
       else router.replace('/(tabs)')
+    } catch (e) {
+      // addRoutine and friends refuse loudly when the routine list can't be
+      // read safely — surface that instead of dying as an unhandled rejection.
+      return Alert.alert('Could not save', e.message)
     } finally {
       setSaving(false)
     }
@@ -534,15 +666,90 @@ export default function SetupRoutine() {
                 </View>
               </View>
 
-              {task.subTasks.map(st => (
-                <View key={st.id} style={s.subRow}>
-                  <View style={[s.subDot, { backgroundColor: accent.color + '66' }]} />
-                  <Text style={s.subText}>{st.text}</Text>
-                  <Pressable onPress={() => removeSubTask(task.id, st.id)} hitSlop={8}>
-                    <Text style={s.remove}>✕</Text>
+              {/* Optional picture, shown full-width on the run card */}
+              {task.image ? (
+                <View style={s.photoWrap}>
+                  <Pressable onPress={() => setPhotoViewer(task.image)}>
+                    <Image source={{ uri: task.image }} style={s.photoThumb} resizeMode="cover" />
                   </Pressable>
+                  <View style={s.photoBtnRow}>
+                    <Pressable onPress={() => pickTaskImage(task.id)} hitSlop={6}>
+                      <Text style={[s.photoBtnText, { color: accent.color }]}>Change photo</Text>
+                    </Pressable>
+                    <Pressable onPress={() => removeTaskImage(task.id)} hitSlop={6}>
+                      <Text style={[s.photoBtnText, { color: '#ef4444' }]}>Remove</Text>
+                    </Pressable>
+                  </View>
                 </View>
-              ))}
+              ) : (
+                <Pressable
+                  style={s.photoAddRow}
+                  onPress={() => pickTaskImage(task.id)}
+                  disabled={uploadingPhoto || photoLimitReached}
+                  hitSlop={6}
+                >
+                  <Text style={[s.photoBtnText, {
+                    color: photoLimitReached ? theme.muted : accent.color,
+                    opacity: uploadingPhoto ? 0.6 : 1,
+                  }]}>
+                    {addPhotoLabel(' to this task')}
+                  </Text>
+                </Pressable>
+              )}
+
+              {task.subTasks.map(st => {
+                const subOpen = expandedSubKeys.has(subKey(task.id, st.id))
+                return (
+                  <View key={st.id}>
+                    <View style={s.subRow}>
+                      <View style={[s.subDot, { backgroundColor: accent.color + '66' }]} />
+                      <Text style={s.subText}>{st.text}</Text>
+                      {!!st.image && <Text style={s.subPhotoFlag}>📷</Text>}
+                      <Pressable onPress={() => toggleSubExpand(task.id, st.id)} hitSlop={8}>
+                        <Text style={[s.subExpand, { color: accent.color }]}>{subOpen ? '▲' : '⊕'}</Text>
+                      </Pressable>
+                      <Pressable onPress={() => removeSubTask(task.id, st.id)} hitSlop={8}>
+                        <Text style={s.remove}>✕</Text>
+                      </Pressable>
+                    </View>
+
+                    {/* Per-step photo, shown in the routine once the steps above it are ticked */}
+                    {subOpen && (
+                      <View style={[s.subPhotoBox, { borderLeftColor: accent.color + '44' }]}>
+                        {st.image ? (
+                          <View style={s.photoWrap}>
+                            <Pressable onPress={() => setPhotoViewer(st.image)}>
+                              <Image source={{ uri: st.image }} style={s.photoThumb} resizeMode="cover" />
+                            </Pressable>
+                            <View style={s.photoBtnRow}>
+                              <Pressable onPress={() => pickSubTaskImage(task.id, st.id)} hitSlop={6}>
+                                <Text style={[s.photoBtnText, { color: accent.color }]}>Change photo</Text>
+                              </Pressable>
+                              <Pressable onPress={() => removeSubTaskImage(task.id, st.id)} hitSlop={6}>
+                                <Text style={[s.photoBtnText, { color: '#ef4444' }]}>Remove</Text>
+                              </Pressable>
+                            </View>
+                          </View>
+                        ) : (
+                          <Pressable
+                            style={s.photoAddRow}
+                            onPress={() => pickSubTaskImage(task.id, st.id)}
+                            disabled={uploadingPhoto || photoLimitReached}
+                            hitSlop={6}
+                          >
+                            <Text style={[s.photoBtnText, {
+                              color: photoLimitReached ? theme.muted : accent.color,
+                              opacity: uploadingPhoto ? 0.6 : 1,
+                            }]}>
+                              {addPhotoLabel(' to this step')}
+                            </Text>
+                          </Pressable>
+                        )}
+                      </View>
+                    )}
+                  </View>
+                )
+              })}
               <View style={s.subAddRow}>
                 <TextInput
                   style={s.subInput}
@@ -888,6 +1095,8 @@ export default function SetupRoutine() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      <ImageViewerModal uri={photoViewer} onClose={() => setPhotoViewer(null)} />
     </KeyboardAvoidingView>
   )
 }
@@ -1029,9 +1238,17 @@ function makeStyles(theme) { return StyleSheet.create({
   },
   goalUnit: { fontSize: 13, fontWeight: '600', color: theme.muted },
 
+  photoWrap: { marginTop: 10, marginBottom: 4 },
+  photoThumb: { width: '100%', height: 140, borderRadius: 14, backgroundColor: theme.divider },
+  photoBtnRow: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 4, paddingTop: 8 },
+  photoAddRow: { paddingVertical: 10, paddingLeft: 2 },
+  photoBtnText: { fontSize: 13, fontWeight: '700' },
   subRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 7, paddingLeft: 8 },
   subDot: { width: 7, height: 7, borderRadius: 4 },
   subText: { flex: 1, fontSize: 14, color: theme.subtext },
+  subPhotoFlag: { fontSize: 12 },
+  subExpand: { fontSize: 15, fontWeight: '800' },
+  subPhotoBox: { marginLeft: 12, paddingLeft: 12, borderLeftWidth: 2, marginBottom: 4 },
   subAddRow: { flexDirection: 'row', gap: 8, marginTop: 8, paddingLeft: 8 },
   subInput: {
     flex: 1, backgroundColor: theme.input, borderRadius: 10,

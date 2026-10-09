@@ -410,7 +410,7 @@ export default function SettingsScreen() {
         await Promise.all([
           getUserGoals(user.id),
           getRoutineNames(user.id),
-          getHistory(user.id),
+          getHistory(user.id, { sinceDays: null }), // export wants the full history, not the display window
           getWorkoutRoutineList(user.id),
           getAllWorkoutLogs(user.id),
           getRecentMealHistory(user.id, 3650),
@@ -481,6 +481,25 @@ export default function SettingsScreen() {
     if (currentSplit) await saveGymSplit(user.id, currentSplit).catch(() => {})
     setSaving(false)
     Alert.alert('Saved', 'Your goals have been updated.')
+  }
+
+  // Sign-out drops the offline write queue (deliberate — queued writes must
+  // never replay into a different account), so when the flush can't land
+  // everything, signOut refuses and reports what's at stake. Only an explicit
+  // "anyway" from the user forces it through.
+  async function handleSignOut() {
+    const result = await signOut()
+    if (result?.pendingSync) {
+      const n = result.pendingSync
+      Alert.alert(
+        'Unsynced changes',
+        `${n} ${n === 1 ? "change hasn't" : "changes haven't"} synced yet — signing out will discard ${n === 1 ? 'it' : 'them'}.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Sign out anyway', style: 'destructive', onPress: () => signOut({ force: true }) },
+        ]
+      )
+    }
   }
 
   if (loading) {
@@ -1104,7 +1123,7 @@ export default function SettingsScreen() {
           style={[st.signOutBtn, { borderColor: theme.cardBorder }]}
           onPress={() => Alert.alert('Sign out', 'Are you sure?', [
             { text: 'Cancel', style: 'cancel' },
-            { text: 'Sign out', style: 'destructive', onPress: signOut },
+            { text: 'Sign out', style: 'destructive', onPress: handleSignOut },
           ])}
         >
           <Text style={[st.signOutText, { color: '#ef4444' }]}>Sign Out</Text>

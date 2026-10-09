@@ -1,18 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   View, Text, Pressable, ScrollView, Modal, TextInput,
-  StyleSheet, KeyboardAvoidingView, Platform, Switch,
+  StyleSheet, KeyboardAvoidingView, Platform, Switch, Alert,
 } from 'react-native'
+import * as Clipboard from 'expo-clipboard'
+import { useFocusEffect } from 'expo-router'
 import { useTheme } from '../lib/ThemeContext'
 import {
   slotStarts, minsToLabel, nowMins,
-  getTimeLogsForDay, saveTimeLog, deleteTimeLog,
+  getTimeLogsForDay, saveTimeLog, deleteTimeLog, importTimeLogBackup,
 } from '../lib/timeLogging'
+
+// Entries the app filled in for you (a finished routine, a class you said you
+// attended) carry a badge so they're recognisable — they're editable and
+// clearable exactly like anything you typed.
+const AUTO_ICON = { routine: '✅', class: '🎓' }
 
 // One row per time slot for a single day. Tapping a slot opens a sheet to
 // write what you were doing. Slots that haven't happened yet can't be logged.
+// `refreshKey` re-reads the day when something outside this component writes
+// to the log.
 export default function DayLogTimeline({
-  userId, day, todayStr, settings, onCountsChange, headerRight,
+  userId, day, todayStr, settings, onCountsChange, headerRight, refreshKey = 0, onImported,
 }) {
   const { theme } = useTheme()
 
@@ -32,16 +41,21 @@ export default function DayLogTimeline({
 
   const load = useCallback(() => {
     getTimeLogsForDay(userId, day).then(setEntries).catch(() => {})
-  }, [userId, day])
+  }, [userId, day, refreshKey])
 
   useEffect(() => { load() }, [load])
   useEffect(() => { didAutoScroll.current = false }, [day])
 
-  // Keep "now" fresh so the current slot unlocks as the day moves on.
-  useEffect(() => {
+  // Keep "now" fresh so the current slot unlocks as the day moves on. Runs
+  // under useFocusEffect rather than useEffect: expo-router keeps the screen
+  // mounted behind other tabs, and this tick has no business re-rendering a
+  // timeline nobody is looking at. The immediate tick on refocus catches
+  // "now" up after time away instead of showing a stale slot for a minute.
+  useFocusEffect(useCallback(() => {
+    setTick(t => t + 1)
     const id = setInterval(() => setTick(t => t + 1), 60000)
     return () => clearInterval(id)
-  }, [])
+  }, []))
 
   const filled = slots.filter(s => entries[s]).length
   useEffect(() => { onCountsChange?.(filled, slots.length) }, [filled, slots.length])
@@ -72,6 +86,42 @@ export default function DayLogTimeline({
     const slot = editing
     setEditing(null)
     setEntries({ ...(await deleteTimeLog(userId, day, slot)) })
+  }
+
+  // One-tap migration from the standalone TimeLog app: its Settings screen
+  // has "Copy backup to clipboard"; this reads that copied text back in.
+  async function handleImport() {
+    let raw = ''
+    try { raw = await Clipboard.getStringAsync() } catch {}
+    let data = null
+    try { data = JSON.parse(raw) } catch {}
+    if (!data || data.app !== 'timelog-backup' || !Array.isArray(data.entries)) {
+      Alert.alert(
+        'No backup in clipboard',
+        'Copy your data first: in the TimeLog app, go to Settings and tap "Copy backup to clipboard", then come back here and tap Import.'
+      )
+      return
+    }
+    Alert.alert(
+      'Import TimeLog data?',
+      `Found ${data.entries.length} log entries in the copied backup. They'll be added to your time log. Slots you've already filled here are kept.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Import',
+          onPress: async () => {
+            const res = await importTimeLogBackup(userId, raw)
+            if (!res) { Alert.alert('Import failed', 'That text is not a TimeLog backup.'); return }
+            load()
+            onImported?.()
+            let msg = `Imported ${res.imported} entries across ${res.days} day${res.days === 1 ? '' : 's'}.`
+            if (res.skipped) msg += ` ${res.skipped} skipped (already logged here).`
+            if (res.offGrid) msg += ` ${res.offGrid} sit outside your current slot grid; change the log interval or day window to see them.`
+            Alert.alert('Import complete', msg)
+          },
+        },
+      ]
+    )
   }
 
   function onRowLayout(slot, e) {
@@ -136,7 +186,10 @@ export default function DayLogTimeline({
                     <Text style={st.breakText}>{e.text || 'Break'}</Text>
                   </View>
                 ) : e ? (
-                  <Text style={[st.entryText, { color: theme.text }]}>{e.text}</Text>
+                  <View style={st.entryRow}>
+                    {!!AUTO_ICON[e.kind] && <Text style={st.entryIcon}>{AUTO_ICON[e.kind]}</Text>}
+                    <Text style={[st.entryText, { color: theme.text, flex: 1 }]}>{e.text}</Text>
+                  </View>
                 ) : current ? (
                   <Text style={[st.hintText, { color: theme.accent }]}>
                     What are you doing right now? Tap to log
@@ -148,6 +201,10 @@ export default function DayLogTimeline({
             </Pressable>
           )
         })}
+
+        <Pressable onPress={handleImport} style={st.importBtn} hitSlop={8}>
+          <Text style={[st.importText, { color: theme.muted }]}>⇪  Import TimeLog data</Text>
+        </Pressable>
       </ScrollView>
 
       <Modal visible={editing !== null} transparent animationType="slide" onRequestClose={() => setEditing(null)}>
@@ -204,10 +261,14 @@ const st = StyleSheet.create({
   timeCol: { width: 76, paddingRight: 10, alignItems: 'flex-end', justifyContent: 'center' },
   timeLabel: { fontSize: 11, fontWeight: '700' },
   cell: { flex: 1, paddingVertical: 8, paddingHorizontal: 10, justifyContent: 'center' },
+  entryRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  entryIcon: { fontSize: 13 },
   entryText: { fontSize: 13, lineHeight: 19, fontWeight: '500' },
   hintText: { fontSize: 12, fontWeight: '600' },
   breakBlock: { borderRadius: 8, paddingVertical: 6, paddingHorizontal: 10, alignSelf: 'flex-start' },
   breakText: { color: '#fff', fontWeight: '700', fontSize: 12.5 },
+  importBtn: { alignItems: 'center', paddingVertical: 16 },
+  importText: { fontSize: 12.5, fontWeight: '700' },
   modalWrap: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.45)' },
   sheet: {
     borderTopLeftRadius: 24, borderTopRightRadius: 24, borderWidth: 1,
