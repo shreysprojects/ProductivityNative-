@@ -16,6 +16,7 @@ import {
   getTasks, saveTask, deleteTask,
   getJournalEntries, saveJournalEntry, deleteJournalEntry,
   getWorkoutLog, getMeals,
+  getRoutineNames, getRoutineSettings, getHiddenDefaults, getRoutineGroupMap,
 } from '../../lib/storage'
 import { readingStats } from '../../lib/textStats'
 import DayLogTimeline from '../../components/DayLogTimeline'
@@ -168,6 +169,48 @@ function formatDuration(startTime, endTime) {
   return rest ? `${hours}h ${rest}m` : `${hours}h`
 }
 
+// Which routines each weekday expects (index = Date#getDay, 0 = Sunday):
+// every non-hidden Every-day routine whose schedule includes that day.
+// Whenever routines have no schedule, so they only count on days they were
+// actually started. Falls back to "nothing expected" if the reads fail, so the
+// grid still reflects whatever was started.
+async function loadDueByWeekday(userId) {
+  const due = Array.from({ length: 7 }, () => [])
+  try {
+    const names = await getRoutineNames(userId)
+    const [settings, hidden, groups] = await Promise.all([
+      Promise.all(names.map(n => getRoutineSettings(userId, n))),
+      getHiddenDefaults(userId),
+      getRoutineGroupMap(userId),
+    ])
+    names.forEach((name, i) => {
+      if (hidden.includes(name) || (groups[name] ?? 'everyday') !== 'everyday') return
+      const active = settings[i]?.activeDays ?? []
+      // Routine schedules are Monday-first; getDay() is Sunday-first.
+      for (let dow = 0; dow < 7; dow++) if (active[(dow + 6) % 7]) due[dow].push(name)
+    })
+  } catch {}
+  return due
+}
+
+// A day's ring. Green only when every routine that was due that day — plus any
+// other routine that was started — reached 100%. Orange when something was
+// started but the day fell short of that. Nothing when nothing was started.
+function dayRingStatus(rows, dueNames) {
+  const expected = new Set(dueNames)
+  const pct = new Map()
+  for (const r of rows) {
+    expected.add(r.routine)
+    pct.set(r.routine, Math.max(pct.get(r.routine) ?? 0, r.completion ?? 0))
+  }
+  if (expected.size === 0) return null
+  const anyProgress = rows.some(r => (r.completion ?? 0) > 0)
+  for (const name of expected) {
+    if ((pct.get(name) ?? 0) < 100) return anyProgress ? 'partial' : null
+  }
+  return 'complete'
+}
+
 function pctColor(p) {
   if (p >= 100) return '#10b981'
   if (p >= 50)  return '#f59e0b'
@@ -293,12 +336,20 @@ export default function CalendarScreen() {
   const now = new Date()
   const { openJournal: openJournalParam } = useLocalSearchParams()
 
-  // View
+  // View. Month, Day and To-do are sections of one scrolling page: the tab bar
+  // highlights the section under the toolbar and a tap jumps to it. Time log
+  // is its own pane, since the timeline is a list in its own right.
   const [viewMode, setViewMode] = useState('month')
+  const [activeSection, setActiveSection] = useState('month')
+  const pageScrollRef = useRef(null)
+  const sectionY = useRef({ day: 0, tasks: 0 })   // section offsets in the page
+  const pendingSection = useRef(null)               // jump to make once the page mounts
+  const ignoreScrollUntil = useRef(0)               // a tap's own scroll must not re-highlight
 
   // Month view
   const [viewDate, setViewDate] = useState({ year: now.getFullYear(), month: now.getMonth() })
   const [completionMap, setCompletionMap] = useState({})
+  const [dayStatus, setDayStatus] = useState({})   // date -> 'complete' | 'partial'
   const [streak, setStreak] = useState({ current: 0, longest: 0 })
   const [selected, setSelected] = useState(null)
   const [historyByDate, setHistoryByDate] = useState({})
@@ -407,13 +458,14 @@ export default function CalendarScreen() {
   const load = useCallback(async () => {
     if (!user) return
     try {
-      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs] = await Promise.all([
+      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs, dueByWeekday] = await Promise.all([
         getHistory(user.id), getStreak(user.id),
         getCalendarEvents(user.id), getScheduleItems(user.id),
         getTasks(user.id), getJournalEntries(user.id),
         getLogSettings(user.id),
         // Never let the time-log sync take the whole calendar down with it.
         getAllTimeLogs(user.id).catch(() => ({})),
+        loadDueByWeekday(user.id),
       ])
       setLogSettings(lSettings)
       const counts = {}
@@ -427,6 +479,13 @@ export default function CalendarScreen() {
       })
       setCompletionMap(map)
       setHistoryByDate(byDate)
+      const status = {}
+      for (const [date, rows] of Object.entries(byDate)) {
+        const dow = new Date(date + 'T12:00:00').getDay()
+        const ring = dayRingStatus(rows, dueByWeekday[dow])
+        if (ring) status[date] = ring
+      }
+      setDayStatus(status)
       setStreak(str)
       setEvents(evts)
       setScheduleItems(sched)
@@ -531,14 +590,14 @@ export default function CalendarScreen() {
   // a class is added. The day you're currently on is always shown, so arrowing
   // onto a free day can't strand you with no chip selected.
   // "Day" is the schedule view now that Time log has its own top-bar tab.
-  const scheduleMode = viewMode === 'week'
-  const stripDays = useMemo(() => {
-    if (!scheduleMode) return weekDays
+  // The Day section's strip only shows days that have classes (the Time log
+  // pane's strip shows the whole week).
+  const scheduleStripDays = useMemo(() => {
     const busy = d => (weekEventsByDay[d]?.length ?? 0) > 0
     // Nothing scheduled all week: show the whole week rather than a lone chip.
     if (!weekDays.some(busy)) return weekDays
     return weekDays.filter(d => busy(d) || d === logDay)
-  }, [scheduleMode, weekDays, logDay, weekEventsByDay])
+  }, [weekDays, logDay, weekEventsByDay])
 
   const upcomingEvents = useMemo(() => {
     const tomorrow = tomorrowStr()
@@ -587,9 +646,51 @@ export default function CalendarScreen() {
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
+  function scrollToSection(section) {
+    const y = section === 'month' ? 0 : Math.max(0, (sectionY.current[section] ?? 0) - 6)
+    ignoreScrollUntil.current = Date.now() + 600
+    pageScrollRef.current?.scrollTo({ y, animated: true })
+  }
+
   function switchView(mode) {
-    setViewMode(mode)
-    if ((mode === 'week' || mode === 'log') && selected) setLogDay(selected)
+    if (mode === 'log') {
+      if (selected) setLogDay(selected)
+      setViewMode('log')
+      return
+    }
+    // A date picked in the month grid carries over to the Day section.
+    if (mode === 'day' && selected) setLogDay(selected)
+    setActiveSection(mode)
+    if (viewMode === 'month') {
+      scrollToSection(mode)
+    } else {
+      // Coming back from the Time log: the page mounts a frame later, so the
+      // jump waits for its first layout (onContentSizeChange).
+      pendingSection.current = mode
+      setViewMode('month')
+    }
+  }
+
+  function flushPendingScroll() {
+    const section = pendingSection.current
+    if (!section) return
+    pendingSection.current = null
+    requestAnimationFrame(() => scrollToSection(section))
+  }
+
+  // The highlighted tab follows whichever section is under the toolbar. The
+  // end of the page counts as To-do, so a short list still lights its tab up
+  // even though it can't reach the top of the screen.
+  function onPageScroll(e) {
+    if (Date.now() < ignoreScrollUntil.current) return
+    const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent
+    const scrolls = contentSize.height > layoutMeasurement.height + 40
+    const atEnd = scrolls && contentOffset.y + layoutMeasurement.height >= contentSize.height - 4
+    const y = contentOffset.y + 72
+    const next = atEnd || y >= sectionY.current.tasks ? 'tasks'
+      : y >= sectionY.current.day ? 'day'
+      : 'month'
+    setActiveSection(prev => (prev === next ? prev : next))
   }
 
   function openAdd() {
@@ -889,8 +990,9 @@ export default function CalendarScreen() {
       setScheduleItems(saved)
       for (const item of previous) await deleteScheduleItem(user.id, item.id)
       for (const item of saved) await saveScheduleItem(user.id, item)
-      setViewMode('week')
+      // Land on today's classes so the result of the scan is what's on screen.
       setLogDay(today)
+      switchView('day')
       Alert.alert(
         'Schedule updated',
         `Your schedule now has ${saved.length} recurring class${saved.length === 1 ? '' : 'es'}.`
@@ -1001,6 +1103,77 @@ export default function CalendarScreen() {
     ? (tasksByDate[selected] || []).slice().sort((a, b) => (_po[a.priority] ?? 3) - (_po[b.priority] ?? 3))
     : []
 
+  const dayClasses = weekEventsByDay[logDay] ?? []
+  const openTaskCount = tasks.filter(t => !t.done).length
+
+  // Day navigation shared by the Day section (weekday names, only the days
+  // with classes) and the Time log pane (dates plus how many slots are logged).
+  const renderDayPicker = (scheduleMode) => (
+    <>
+      <View style={s.dayNav}>
+        <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.dayNavArrowBtn}>
+          <Text style={[s.dayNavArrow, { color: theme.accent }]}>‹</Text>
+        </Pressable>
+        {/* The title is the jump-to-today control — accented while you're
+            away from today to show it does something. */}
+        <Pressable onPress={() => setLogDay(today)} hitSlop={10} style={{ flex: 1 }}>
+          <Text
+            style={[s.dayNavTitle, { color: logDay === today ? theme.text : theme.accent }]}
+            numberOfLines={1}
+          >
+            {logDay === today
+              ? 'Today'
+              : scheduleMode
+                ? new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
+                : formatDateShort(logDay)}
+          </Text>
+        </Pressable>
+        <Pressable onPress={() => setLogDay(d => addDays(d, 1))} hitSlop={10} style={s.dayNavArrowBtn}>
+          <Text style={[s.dayNavArrow, { color: theme.accent }]}>›</Text>
+        </Pressable>
+      </View>
+
+      <View style={s.dayStrip}>
+        {(scheduleMode ? scheduleStripDays : weekDays).map(d => {
+          const active  = d === logDay
+          const isToday = d === today
+          const dObj = new Date(d + 'T12:00:00')
+          const count = scheduleMode
+            ? (weekEventsByDay[d]?.length ?? 0)
+            : (logCounts[d] ?? 0)
+          return (
+            <Pressable
+              key={d}
+              onPress={() => setLogDay(d)}
+              style={[s.dayChip, {
+                backgroundColor: active ? theme.accent : 'transparent',
+                // Selected reads as a fill, today as a ring; the border is
+                // always present so highlighting can't resize the chip.
+                borderColor: !active && isToday ? theme.accent : 'transparent',
+              }]}
+            >
+              <Text style={[s.dayChipName, {
+                color: active ? '#fff' : isToday ? theme.accent : theme.subtext,
+              }]}>
+                {dObj.toLocaleDateString('en-US', { weekday: 'short' })}
+              </Text>
+              {!scheduleMode && (
+                <Text style={[s.dayChipNum, {
+                  color: active ? '#fff' : isToday ? theme.accent : theme.text,
+                }]}>
+                  {dObj.getDate()}
+                </Text>
+              )}
+              <View style={[s.dayChipCount, { backgroundColor: active ? '#ffffff2e' : theme.accent + '15' }]}>
+                <Text style={[s.dayChipCountText, { color: active ? '#fff' : theme.accent }]}>{count}</Text>
+              </View>
+            </Pressable>
+          )
+        })}
+      </View>
+    </>
+  )
+
   // ── JSX ───────────────────────────────────────────────────────────────────
 
   if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
@@ -1024,41 +1197,34 @@ export default function CalendarScreen() {
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {[['month', 'Month'], ['week', 'Day'], ['tasks', 'To-do'], ...(logSettings.enabled ? [['log', 'Time log']] : [])].map(([mode, label]) => (
-            <Pressable
-              key={mode}
-              style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}
-              onPress={() => switchView(mode)}
-            >
-              <Text style={[s.toggleOptText, { color: viewMode === mode ? '#fff' : theme.subtext }]}>
-                {label}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-        <View style={s.toggleActions}>
-          {viewMode === 'week' && (
-            <>
+          {[['month', 'Month'], ['day', 'Day'], ['tasks', 'To-do'], ...(logSettings.enabled ? [['log', 'Time log']] : [])].map(([mode, label]) => {
+            const active = viewMode === 'log' ? mode === 'log' : mode === activeSection
+            return (
               <Pressable
-                style={[s.toggleActionBtn, { backgroundColor: theme.accent + '20' }]}
-                onPress={() => setScanOpen(true)}
+                key={mode}
+                style={[s.toggleOpt, active && { backgroundColor: theme.accent }]}
+                onPress={() => switchView(mode)}
               >
-                <Text style={[s.toggleActionText, { color: theme.accent }]}>✦ Scan</Text>
+                <Text style={[s.toggleOptText, { color: active ? '#fff' : theme.subtext }]}>
+                  {label}
+                </Text>
               </Pressable>
-              <Pressable
-                style={[s.toggleActionBtn, { backgroundColor: theme.accent }]}
-                onPress={openAddClass}
-              >
-                <Text style={[s.toggleActionText, { color: '#fff' }]}>＋ Class</Text>
-              </Pressable>
-            </>
-          )}
+            )
+          })}
         </View>
       </View>
 
-      {/* ── Month view ─────────────────────────────────────────────────────── */}
+      {/* ── The page: Month, then Day, then To-do ──────────────────────────── */}
       {viewMode === 'month' && (
-        <ScrollView contentContainerStyle={s.content}>
+        <ScrollView
+          ref={pageScrollRef}
+          contentContainerStyle={s.content}
+          keyboardShouldPersistTaps="handled"
+          automaticallyAdjustKeyboardInsets
+          scrollEventThrottle={32}
+          onScroll={onPageScroll}
+          onContentSizeChange={flushPendingScroll}
+        >
 
           {/* Stats */}
           <View style={[s.statRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
@@ -1103,11 +1269,13 @@ export default function CalendarScreen() {
                 {row.map((day, di) => {
                   if (!day) return <View key={di} style={s.emptyCell} />
                   const ds = dateStr(year, month, day)
-                  const pct = completionMap[ds]
+                  const ring = dayStatus[ds]
                   const isToday = ds === today
                   const isFuture = ds > today
                   const isSelected = ds === selected
-                  const completed = pct >= 100, partial = pct > 0 && pct < 100
+                  // Green only when every routine due that day was finished.
+                  const completed = ring === 'complete', partial = ring === 'partial'
+                  const filled = completed || partial
                   const dayEvTypes = [...new Set((eventsByDate[ds] || []).map(e => e.type))]
 
                   return (
@@ -1116,13 +1284,13 @@ export default function CalendarScreen() {
                         s.dayCircle,
                         completed && s.circleComplete,
                         partial && s.circlePartial,
-                        isToday && !pct && { borderWidth: 2, borderColor: theme.accent },
-                        isSelected && !pct && { backgroundColor: theme.accent + '22' },
+                        isToday && !filled && { borderWidth: 2, borderColor: theme.accent },
+                        isSelected && !filled && { backgroundColor: theme.accent + '22' },
                       ]}>
                         <Text style={[
                           s.dayNum, { color: theme.text },
-                          (completed || partial) && { color: '#fff', fontWeight: '700' },
-                          isToday && !pct && { color: theme.accent, fontWeight: '700' },
+                          filled && { color: '#fff', fontWeight: '700' },
+                          isToday && !filled && { color: theme.accent, fontWeight: '700' },
                           isFuture && !isToday && { color: theme.muted },
                         ]}>{day}</Text>
                       </View>
@@ -1149,7 +1317,7 @@ export default function CalendarScreen() {
 
             <View style={[s.legendDivider, { backgroundColor: theme.divider }]} />
             <View style={s.legend}>
-              {[['#10b981','Complete'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
+              {[['#10b981','All routines done'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
                 <View key={l} style={s.legendItem}>
                   <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
                   <Text style={[s.legendText, { color: theme.muted }]}>{l}</Text>
@@ -1419,204 +1587,137 @@ export default function CalendarScreen() {
               )}
             </View>
           )}
-        </ScrollView>
-      )}
-
-      {/* ── Week view ──────────────────────────────────────────────────────── */}
-      {/* Shared day navigation for the Day (schedule) and Time log tabs. */}
-      {(viewMode === 'week' || viewMode === 'log') && (
-        <View style={[s.dayPicker, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
-          <View style={s.dayNav}>
-            <Pressable onPress={() => setLogDay(d => addDays(d, -1))} hitSlop={10} style={s.dayNavArrowBtn}>
-              <Text style={[s.dayNavArrow, { color: theme.accent }]}>‹</Text>
-            </Pressable>
-            {/* The title is the jump-to-today control — accented while you're
-                away from today to show it does something. */}
-            <Pressable onPress={() => setLogDay(today)} hitSlop={10} style={{ flex: 1 }}>
-              <Text
-                style={[s.dayNavTitle, { color: logDay === today ? theme.text : theme.accent }]}
-                numberOfLines={1}
-              >
-                {logDay === today
-                  ? 'Today'
-                  : scheduleMode
-                    ? new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
-                    : formatDateShort(logDay)}
-              </Text>
-            </Pressable>
-            <Pressable onPress={() => setLogDay(d => addDays(d, 1))} hitSlop={10} style={s.dayNavArrowBtn}>
-              <Text style={[s.dayNavArrow, { color: theme.accent }]}>›</Text>
-            </Pressable>
-          </View>
-
-          <View style={s.dayStrip}>
-            {stripDays.map(d => {
-              const active  = d === logDay
-              const isToday = d === today
-              const dObj = new Date(d + 'T12:00:00')
-              const count = scheduleMode
-                ? (weekEventsByDay[d]?.length ?? 0)
-                : (logCounts[d] ?? 0)
-              return (
+          {/* ── Day: the chosen day's classes ── */}
+          <View style={s.pageSection} onLayout={e => { sectionY.current.day = e.nativeEvent.layout.y }}>
+            <View style={s.pageSectionHeading}>
+              <View style={{ flex: 1 }}>
+                <Text style={[s.dayScheduleTitle, { color: theme.text }]}>
+                  {new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })}
+                  {logDay === today && <Text style={{ color: theme.accent }}> · Today</Text>}
+                </Text>
+                <Text style={[s.dayScheduleCount, { color: theme.subtext }]}>
+                  {dayClasses.length} {dayClasses.length === 1 ? 'class' : 'classes'}
+                </Text>
+              </View>
+              <View style={s.toggleActions}>
                 <Pressable
-                  key={d}
-                  onPress={() => setLogDay(d)}
-                  style={[s.dayChip, {
-                    backgroundColor: active ? theme.accent : 'transparent',
-                    // Selected reads as a fill, today as a ring; the border is
-                    // always present so highlighting can't resize the chip.
-                    borderColor: !active && isToday ? theme.accent : 'transparent',
-                  }]}
+                  style={[s.toggleActionBtn, { backgroundColor: theme.accent + '20' }]}
+                  onPress={() => setScanOpen(true)}
                 >
-                  <Text style={[s.dayChipName, {
-                    color: active ? '#fff' : isToday ? theme.accent : theme.subtext,
-                  }]}>
-                    {dObj.toLocaleDateString('en-US', { weekday: 'short' })}
-                  </Text>
-                  {!scheduleMode && (
-                    <Text style={[s.dayChipNum, {
-                      color: active ? '#fff' : isToday ? theme.accent : theme.text,
-                    }]}>
-                      {dObj.getDate()}
-                    </Text>
-                  )}
-                  <View style={[s.dayChipCount, { backgroundColor: active ? '#ffffff2e' : theme.accent + '15' }]}>
-                    <Text style={[s.dayChipCountText, { color: active ? '#fff' : theme.accent }]}>{count}</Text>
-                  </View>
+                  <Text style={[s.toggleActionText, { color: theme.accent }]}>✦ Scan</Text>
                 </Pressable>
-              )
-            })}
-          </View>
-        </View>
-      )}
-
-      {/* Time log — one row per slot for the chosen day. */}
-      {viewMode === 'log' && logSettings.enabled && (
-        <DayLogTimeline
-          key={logDay}
-          userId={user.id}
-          day={logDay}
-          todayStr={today}
-          settings={logSettings}
-          refreshKey={logRefresh}
-          onImported={load}
-          onCountsChange={(filled) => setLogCounts(prev => (
-            prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
-          ))}
-        />
-      )}
-
-      {/* Schedule — a readable agenda for the chosen day. */}
-      {viewMode === 'week' && (
-        <ScrollView
-          style={{ flex: 1 }}
-          contentInsetAdjustmentBehavior="automatic"
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={s.dayScheduleContent}
-        >
-          <View style={s.dayScheduleHeading}>
-            <View>
-              <Text style={[s.dayScheduleTitle, { color: theme.text }]}>
-                {new Date(logDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })}
-                {logDay === today && <Text style={{ color: theme.accent }}> · Today</Text>}
-              </Text>
-              <Text style={[s.dayScheduleCount, { color: theme.subtext }]}>
-                {(weekEventsByDay[logDay]?.length ?? 0)} {(weekEventsByDay[logDay]?.length ?? 0) === 1 ? 'class' : 'classes'}
-              </Text>
-            </View>
-          </View>
-
-          {(weekEventsByDay[logDay] ?? []).length === 0 ? (
-            <View style={[s.dayScheduleEmpty, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-              <Text style={s.dayScheduleEmptyIcon}>☀️</Text>
-              <Text style={[s.dayScheduleEmptyTitle, { color: theme.text }]}>No classes scheduled</Text>
-              <Text style={[s.dayScheduleEmptyText, { color: theme.subtext }]}>Enjoy the open time, or add a class above.</Text>
-            </View>
-          ) : (weekEventsByDay[logDay] ?? []).map(ev => {
-            const courseCode = ev.meta?.courseCode || (ev.kind === 'event' ? 'EVENT' : ev.title)
-            const classType = ev.meta?.type || (ev.kind === 'event' ? 'Calendar' : 'Class')
-            const courseName = ev.meta?.courseName && ev.meta.courseName !== courseCode
-              ? ev.meta.courseName
-              : ev.title
-            return (
-              <View key={ev.id} style={s.dayClassRow}>
-                <View style={s.dayClassTimeCol}>
-                  <Text style={[s.dayClassStart, { color: theme.subtext }]}>{fmtTime(ev.startTime)}</Text>
-                  <View style={[s.dayClassTimeLine, { backgroundColor: theme.divider }]} />
-                  <Text style={[s.dayClassEnd, { color: theme.muted }]}>{fmtTime(ev.endTime)}</Text>
-                </View>
                 <Pressable
-                  onPress={() => handleWeekEventPress(ev)}
-                  style={[s.dayClassCard, {
-                    backgroundColor: ev.color + (theme.isDark ? '24' : '16'),
-                    borderLeftColor: ev.color,
-                    borderColor: ev.color + '40',
-                  }]}
+                  style={[s.toggleActionBtn, { backgroundColor: theme.accent }]}
+                  onPress={openAddClass}
                 >
-                  <View style={s.dayClassTopRow}>
-                    <View style={[s.dayCoursePill, { backgroundColor: ev.color }]}>
-                      <Text style={s.dayCoursePillText} numberOfLines={1}>{courseCode}</Text>
-                    </View>
-                    <View style={[s.dayTypePill, { backgroundColor: ev.color + '20' }]}>
-                      <Text style={[s.dayTypePillText, { color: ev.color }]}>{classType}</Text>
-                    </View>
-                    <Text style={[s.dayDuration, { color: ev.color }]}>{formatDuration(ev.startTime, ev.endTime)}</Text>
-                  </View>
-                  <Text style={[s.dayClassName, { color: theme.text }]} numberOfLines={2}>{courseName}</Text>
-                  {!!ev.location && (
-                    <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {ev.location}</Text>
-                  )}
-                  <Text style={[s.dayClassRange, { color: theme.muted }]}>
-                    {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
-                  </Text>
+                  <Text style={[s.toggleActionText, { color: '#fff' }]}>＋ Class</Text>
                 </Pressable>
               </View>
-            )
-          })}
-        </ScrollView>
-      )}
+            </View>
 
-      {/* ── To-do view ────────────────────────────────────────────────────── */}
-      {viewMode === 'tasks' && (
-        <View style={{ flex: 1 }}>
-          <View style={s.bucketBar}>
-            {BUCKETS.map(b => {
-              const active = b.key === bucket
-              const count = bucketCounts[b.key] ?? 0
-              return (
-                <Pressable
-                  key={b.key}
-                  onPress={() => setBucket(b.key)}
-                  style={[s.bucketBtn, {
-                    backgroundColor: active ? theme.accent : theme.card,
-                    borderColor: active ? theme.accent : theme.cardBorder,
-                  }]}
-                >
-                  <Text style={s.bucketEmoji}>{b.emoji}</Text>
-                  <Text style={[s.bucketLabel, { color: active ? '#fff' : theme.subtext }]}>
-                    {b.label}{count > 0 ? ` ${count}` : ''}
-                  </Text>
-                </Pressable>
-              )
-            })}
+            <View style={[s.dayPickerCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+              {renderDayPicker(true)}
+            </View>
+
+            <View style={s.dayScheduleList}>
+              {dayClasses.length === 0 ? (
+                <View style={[s.dayScheduleEmpty, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+                  <Text style={s.dayScheduleEmptyIcon}>☀️</Text>
+                  <Text style={[s.dayScheduleEmptyTitle, { color: theme.text }]}>No classes scheduled</Text>
+                  <Text style={[s.dayScheduleEmptyText, { color: theme.subtext }]}>Enjoy the open time, or add a class above.</Text>
+                </View>
+              ) : dayClasses.map(ev => {
+                const courseCode = ev.meta?.courseCode || (ev.kind === 'event' ? 'EVENT' : ev.title)
+                const classType = ev.meta?.type || (ev.kind === 'event' ? 'Calendar' : 'Class')
+                const courseName = ev.meta?.courseName && ev.meta.courseName !== courseCode
+                  ? ev.meta.courseName
+                  : ev.title
+                return (
+                  <View key={ev.id} style={s.dayClassRow}>
+                    <View style={s.dayClassTimeCol}>
+                      <Text style={[s.dayClassStart, { color: theme.subtext }]}>{fmtTime(ev.startTime)}</Text>
+                      <View style={[s.dayClassTimeLine, { backgroundColor: theme.divider }]} />
+                      <Text style={[s.dayClassEnd, { color: theme.muted }]}>{fmtTime(ev.endTime)}</Text>
+                    </View>
+                    <Pressable
+                      onPress={() => handleWeekEventPress(ev)}
+                      style={[s.dayClassCard, {
+                        backgroundColor: ev.color + (theme.isDark ? '24' : '16'),
+                        borderLeftColor: ev.color,
+                        borderColor: ev.color + '40',
+                      }]}
+                    >
+                      <View style={s.dayClassTopRow}>
+                        <View style={[s.dayCoursePill, { backgroundColor: ev.color }]}>
+                          <Text style={s.dayCoursePillText} numberOfLines={1}>{courseCode}</Text>
+                        </View>
+                        <View style={[s.dayTypePill, { backgroundColor: ev.color + '20' }]}>
+                          <Text style={[s.dayTypePillText, { color: ev.color }]}>{classType}</Text>
+                        </View>
+                        <Text style={[s.dayDuration, { color: ev.color }]}>{formatDuration(ev.startTime, ev.endTime)}</Text>
+                      </View>
+                      <Text style={[s.dayClassName, { color: theme.text }]} numberOfLines={2}>{courseName}</Text>
+                      {!!ev.location && (
+                        <Text style={[s.dayClassLocation, { color: theme.subtext }]} numberOfLines={1}>⌖ {ev.location}</Text>
+                      )}
+                      <Text style={[s.dayClassRange, { color: theme.muted }]}>
+                        {fmtTime(ev.startTime)} – {fmtTime(ev.endTime)}
+                      </Text>
+                    </Pressable>
+                  </View>
+                )
+              })}
+            </View>
           </View>
 
-          <View style={[s.addTodoRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-            <TextInput
-              value={draftTodo}
-              onChangeText={setDraftTodo}
-              placeholder={`Add to ${BUCKETS.find(b => b.key === bucket).label}…`}
-              placeholderTextColor={theme.muted}
-              returnKeyType="done"
-              onSubmitEditing={addQuickTodo}
-              style={[s.addTodoInput, { color: theme.text }]}
-            />
-            <Pressable onPress={addQuickTodo} hitSlop={8}>
-              <Text style={[s.addTodoPlus, { color: draftTodo.trim() ? theme.accent : theme.muted }]}>＋</Text>
-            </Pressable>
-          </View>
+          {/* ── To-do ── */}
+          <View style={s.pageSection} onLayout={e => { sectionY.current.tasks = e.nativeEvent.layout.y }}>
+            <View style={s.pageSectionHeading}>
+              <View style={{ flex: 1 }}>
+                <Text style={[s.dayScheduleTitle, { color: theme.text }]}>To-do</Text>
+                <Text style={[s.dayScheduleCount, { color: theme.subtext }]}>
+                  {openTaskCount === 0 ? 'Nothing open' : `${openTaskCount} open`}
+                </Text>
+              </View>
+            </View>
 
-          <ScrollView contentContainerStyle={[s.content, { paddingTop: 4 }]}>
+            <View style={s.bucketBar}>
+              {BUCKETS.map(b => {
+                const active = b.key === bucket
+                const count = bucketCounts[b.key] ?? 0
+                return (
+                  <Pressable
+                    key={b.key}
+                    onPress={() => setBucket(b.key)}
+                    style={[s.bucketBtn, {
+                      backgroundColor: active ? theme.accent : theme.card,
+                      borderColor: active ? theme.accent : theme.cardBorder,
+                    }]}
+                  >
+                    <Text style={s.bucketEmoji}>{b.emoji}</Text>
+                    <Text style={[s.bucketLabel, { color: active ? '#fff' : theme.subtext }]}>
+                      {b.label}{count > 0 ? ` ${count}` : ''}
+                    </Text>
+                  </Pressable>
+                )
+              })}
+            </View>
+
+            <View style={[s.addTodoRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+              <TextInput
+                value={draftTodo}
+                onChangeText={setDraftTodo}
+                placeholder={`Add to ${BUCKETS.find(b => b.key === bucket).label}…`}
+                placeholderTextColor={theme.muted}
+                returnKeyType="done"
+                onSubmitEditing={addQuickTodo}
+                style={[s.addTodoInput, { color: theme.text }]}
+              />
+              <Pressable onPress={addQuickTodo} hitSlop={8}>
+                <Text style={[s.addTodoPlus, { color: draftTodo.trim() ? theme.accent : theme.muted }]}>＋</Text>
+              </Pressable>
+            </View>
+
             {bucketTasks.length === 0 ? (
               <View style={[s.taskEmptyCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
                 <Text style={{ fontSize: 32, textAlign: 'center', marginBottom: 8 }}>
@@ -1677,9 +1778,34 @@ export default function CalendarScreen() {
                 </Pressable>
               )
             })}
-          </ScrollView>
+          </View>
+        </ScrollView>
+      )}
+
+      {/* ── Time log pane ──────────────────────────────────────────────────── */}
+      {viewMode === 'log' && (
+        <View style={[s.dayPicker, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
+          {renderDayPicker(false)}
         </View>
       )}
+
+      {/* Time log — one row per slot for the chosen day. */}
+      {viewMode === 'log' && logSettings.enabled && (
+        <DayLogTimeline
+          key={logDay}
+          userId={user.id}
+          day={logDay}
+          todayStr={today}
+          settings={logSettings}
+          refreshKey={logRefresh}
+          onImported={load}
+          onCountsChange={(filled) => setLogCounts(prev => (
+            prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
+          ))}
+        />
+      )}
+
+      {/* ── To-do view ────────────────────────────────────────────────────── */}
 
       {/* ── Deadline picker ───────────────────────────────────────────────── */}
       <Modal visible={deadlinePick !== null} transparent animationType="fade" onRequestClose={() => setDeadlinePick(null)}>
@@ -2200,8 +2326,12 @@ const s = StyleSheet.create({
   dayChipCountText: { fontSize: 10.5, lineHeight: 13, fontWeight: '800', fontVariant: ['tabular-nums'] },
 
   // Day schedule agenda
-  dayScheduleContent: { paddingHorizontal: 16, paddingTop: 18, paddingBottom: 40, gap: 14 },
-  dayScheduleHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 2, paddingBottom: 2 },
+  // Day and To-do sit under the month grid on one page; each opens with a
+  // heading row (title and count on the left, actions on the right).
+  pageSection: { marginTop: 10 },
+  pageSectionHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, paddingHorizontal: 2, marginBottom: 12 },
+  dayPickerCard: { borderRadius: 20, borderWidth: 1, paddingTop: 2, paddingBottom: 10, marginBottom: 14 },
+  dayScheduleList: { gap: 14 },
   dayScheduleTitle: { fontSize: 22, fontWeight: '800', letterSpacing: -0.5 },
   dayScheduleCount: { fontSize: 13.5, fontWeight: '600', marginTop: 2 },
   dayScheduleEmpty: { alignItems: 'center', borderRadius: 20, borderWidth: 1, padding: 28, gap: 6 },
@@ -2298,7 +2428,7 @@ const s = StyleSheet.create({
   logStatPct: { fontSize: 14, fontWeight: '800' },
 
   // To-do buckets
-  bucketBar: { flexDirection: 'row', gap: 6, paddingHorizontal: 12, paddingTop: 12, paddingBottom: 8 },
+  bucketBar: { flexDirection: 'row', gap: 6, paddingBottom: 8 },
   bucketBtn: {
     flex: 1, alignItems: 'center', justifyContent: 'center', gap: 2,
     paddingVertical: 8, borderRadius: 12, borderWidth: 1,
@@ -2307,7 +2437,7 @@ const s = StyleSheet.create({
   bucketLabel: { fontSize: 10.5, fontWeight: '800' },
   addTodoRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
-    marginHorizontal: 12, marginBottom: 10,
+    marginBottom: 10,
     paddingLeft: 14, paddingRight: 12, paddingVertical: 2,
     borderWidth: 1, borderRadius: 14,
   },
