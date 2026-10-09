@@ -11,7 +11,6 @@ import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
 import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
-import { getProtocols, trackerDays } from '../../lib/protocolStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
@@ -25,7 +24,6 @@ const REFETCH_MS = 30 * 1000
 // Section identities for the routine groups (chip + rule tint)
 const EVERYDAY_COLOR = '#f59e0b'
 const WHENEVER_COLOR = '#06b6d4'
-const PROTOCOL_COLOR = '#ec4899'
 
 function fmtMs(ms) {
   const s = Math.floor(ms / 1000)
@@ -890,7 +888,6 @@ export default function RoutinesScreen() {
   const [activeTab, setActiveTab] = useState('daily')
   const [weeklyRoutines, setWeeklyRoutines] = useState([])
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
-  const [protocols, setProtocols] = useState([])
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
   // Which dashboard group each routine is in: 'everyday' (default) | 'whenever'
   const [groupMap, setGroupMap] = useState({})
@@ -961,9 +958,6 @@ export default function RoutinesScreen() {
       setError(false)
       hasLoadedRef.current = true
       lastLoadAtRef.current = Date.now()
-      // Protocols are additive to the dashboard — a failed fetch must not take
-      // the routines list down with it.
-      getProtocols(user.id).then(setProtocols).catch(() => {})
       // Keep routine start-time reminders in sync. The sync re-reads the
       // routine list itself, so only fire it when something it schedules from
       // (names, groups, hidden set, per-routine schedules) actually changed.
@@ -1215,54 +1209,6 @@ export default function RoutinesScreen() {
             >
               <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
             </Pressable>
-
-            {/* ── Protocols — emergency checklists for hard moments ── */}
-            <View style={[s.groupHeaderRow, { marginTop: 18 }]}>
-              <View style={[s.groupChip, { backgroundColor: PROTOCOL_COLOR + '1c' }]}>
-                <Text style={s.groupHeaderEmoji}>🛟</Text>
-                <Text style={[s.groupHeaderText, { color: PROTOCOL_COLOR }]}>PROTOCOLS</Text>
-              </View>
-              <Text style={[s.groupHeaderHint, { color: theme.muted }]}>for the hard moments</Text>
-              <View style={[s.groupRule, { backgroundColor: PROTOCOL_COLOR + '2a' }]} />
-            </View>
-            {protocols.length === 0 && (
-              <Text style={[s.groupEmptyHint, { color: theme.muted }]}>
-                A protocol is a step-by-step plan for when you're unmotivated or close to slipping — set it up now so it's there when you need it.
-              </Text>
-            )}
-            {protocols.map(p => {
-              const days = trackerDays(p)
-              return (
-                <Pressable
-                  key={p.id}
-                  onPress={() => router.push('/protocol/' + p.id)}
-                  style={[s.protocolCard, { backgroundColor: theme.card, borderColor: PROTOCOL_COLOR + '3a' }]}
-                >
-                  <Text style={s.protocolEmoji}>{p.emoji ?? '🛟'}</Text>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[s.protocolName, { color: theme.text }]} numberOfLines={1}>{p.name}</Text>
-                    <Text style={[s.protocolMeta, { color: theme.subtext }]}>
-                      {p.steps.length} step{p.steps.length === 1 ? '' : 's'}
-                      {p.activeRun ? <Text style={{ color: PROTOCOL_COLOR, fontWeight: '800' }}>  ·  ▶ in progress</Text> : null}
-                    </Text>
-                  </View>
-                  {days !== null && (
-                    <View style={[s.protocolDaysBadge, { backgroundColor: PROTOCOL_COLOR + '16' }]}>
-                      <Text style={[s.protocolDaysText, { color: PROTOCOL_COLOR }]}>
-                        {days}d
-                      </Text>
-                    </View>
-                  )}
-                  <Text style={[s.protocolChevron, { color: theme.muted }]}>›</Text>
-                </Pressable>
-              )
-            })}
-            <Pressable
-              style={[s.addBtn, { borderColor: PROTOCOL_COLOR + '44' }]}
-              onPress={() => router.push('/protocol/new')}
-            >
-              <Text style={[s.addBtnText, { color: PROTOCOL_COLOR }]}>＋  Add Protocol</Text>
-            </Pressable>
           </>
         ) : (
           <>
@@ -1382,18 +1328,6 @@ const s = StyleSheet.create({
     borderWidth: 1.5, borderStyle: 'dashed',
   },
   addBtnText: { fontWeight: '700', fontSize: 15 },
-
-  // Protocols
-  protocolCard: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    borderRadius: 18, borderWidth: 1.5, padding: 14, marginBottom: 10,
-  },
-  protocolEmoji: { fontSize: 22 },
-  protocolName: { fontSize: 15, fontWeight: '800', letterSpacing: -0.2 },
-  protocolMeta: { fontSize: 12, fontWeight: '600', marginTop: 2 },
-  protocolDaysBadge: { borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
-  protocolDaysText: { fontSize: 13, fontWeight: '800', fontVariant: ['tabular-nums'] },
-  protocolChevron: { fontSize: 20, fontWeight: '700' },
 
   // Bottom-sheet scaffolding (used by the Weekly Routine + label modals)
   settingsOverlay: { flex: 1, justifyContent: 'flex-end' },
