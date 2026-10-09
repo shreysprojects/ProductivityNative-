@@ -72,8 +72,13 @@ export default function AddMealModal({ section, sectionLabel, sectionColor, onSa
 
   const handleSave = () => {
     if (!name.trim()) return
+    // A decimal comma counts ("1,5" on a French keyboard); a blank, an
+    // unreadable or a negative value is 0.
     const parsed = {}
-    Object.entries(macros).forEach(([k, v]) => { parsed[k] = v === '' ? 0 : parseFloat(v) || 0 })
+    Object.entries(macros).forEach(([k, v]) => {
+      const n = parseFloat(String(v).replace(',', '.'))
+      parsed[k] = Number.isFinite(n) && n > 0 ? n : 0
+    })
     onSave({
       id: Date.now().toString(36) + Math.random().toString(36).slice(2),
       name: name.trim(),
@@ -88,8 +93,11 @@ export default function AddMealModal({ section, sectionLabel, sectionColor, onSa
   return (
     <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
       <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
+        {/* On iOS the form's scroll view makes room for the keyboard itself:
+            it measures on screen, where this view's padding came up short
+            inside a page sheet and left the lower fields covered. */}
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          behavior={Platform.OS === 'ios' ? undefined : 'height'}
           style={{ flex: 1 }}
         >
           <View style={m.header}>
@@ -106,7 +114,7 @@ export default function AddMealModal({ section, sectionLabel, sectionColor, onSa
             </Pressable>
           </View>
 
-          <ScrollView contentContainerStyle={m.form} keyboardShouldPersistTaps="handled">
+          <ScrollView contentContainerStyle={m.form} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             <View style={m.group}>
               <Text style={m.groupLabel}>MEAL NAME</Text>
               <TextInput

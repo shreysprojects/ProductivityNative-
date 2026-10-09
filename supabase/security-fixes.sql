@@ -1,4 +1,9 @@
 -- ============================================================================
+-- HISTORICAL REFERENCE — DO NOT RUN AGAINST THE LIVE DATABASE.
+-- Superseded by supabase/migrations/20260923090000_security_hardening.sql.
+-- Re-running this file would restore direct avatar uploads and a friendship
+-- insert policy that lets anyone create an already-accepted friendship.
+-- ============================================================================
 -- security-fixes.sql  —  paste the WHOLE file into Supabase SQL Editor and Run.
 -- Idempotent: safe to run more than once.
 -- Pair this with the client + edge-function changes (see the chat steps).

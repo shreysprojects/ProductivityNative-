@@ -8,6 +8,10 @@ import { useAuth } from '../../lib/AuthContext'
 import GoogleSignInButton from '../../components/GoogleSignInButton'
 import AppleSignInButton from '../../components/AppleSignInButton'
 import { checkUsernameAvailable } from '../../lib/profileStorage'
+import { findBlockedWord } from '../../lib/contentFilter'
+
+// The longest name the server accepts.
+const NAME_MAX = 40
 
 function validateUsernameFormat(u) {
   if (!u || u.length < 3) return 'too_short'
@@ -26,9 +30,13 @@ export default function Signup() {
   const [loading, setLoading] = useState(false)
   const [usernameStatus, setUsernameStatus] = useState(null)
   const timerRef = useRef(null)
+  // What is in the box now. A slow answer about an earlier spelling used to
+  // land late and mark the current one "available".
+  const latestUsername = useRef('')
 
   useEffect(() => {
     const normalized = username.toLowerCase().trim()
+    latestUsername.current = normalized
     if (!normalized) { setUsernameStatus(null); return }
 
     const fmt = validateUsernameFormat(normalized)
@@ -41,6 +49,7 @@ export default function Signup() {
     clearTimeout(timerRef.current)
     timerRef.current = setTimeout(async () => {
       const ok = await checkUsernameAvailable(normalized)
+      if (latestUsername.current !== normalized) return
       setUsernameStatus(ok ? 'available' : 'taken')
     }, 500)
     return () => clearTimeout(timerRef.current)
@@ -61,19 +70,27 @@ export default function Signup() {
   }
 
   async function handleSignUp() {
-    if (!email || !password || !username) return Alert.alert('Required fields missing', 'Email, username, and password are required.')
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) return Alert.alert('Invalid email', 'Please enter a valid email address.')
+    const cleanEmail = email.trim()
+    if (!cleanEmail || !password || !username) return Alert.alert('Required fields missing', 'Email, username, and password are required.')
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return Alert.alert('Invalid email', 'Please enter a valid email address.')
     if (password.length < 8) return Alert.alert('Weak password', 'Password must be at least 8 characters.')
     if (password !== confirm) return Alert.alert('Passwords do not match')
     if (validateUsernameFormat(username.toLowerCase().trim()) !== 'valid') return Alert.alert('Invalid username', 'Use 3–20 letters, numbers, or underscores.')
     if (usernameStatus !== 'available') return Alert.alert('Username unavailable', 'Please choose a different username.')
+    // Caught here rather than by the server: a refused name fails sign-up with
+    // a bare "Database error saving new user", and a refused username only
+    // shows up after the email is verified.
+    const nameWord = findBlockedWord(name)
+    if (nameWord) return Alert.alert('Name not allowed', `Your name contains a word we don't allow ("${nameWord}"). Please edit it and try again.`)
+    const usernameWord = findBlockedWord(username)
+    if (usernameWord) return Alert.alert('Username not allowed', `Your username contains a word we don't allow ("${usernameWord}"). Please edit it and try again.`)
     setLoading(true)
     try {
-      const res = await signUp({ name, email, password, username })
+      const res = await signUp({ name, email: cleanEmail, password, username })
       if (res?.needsConfirmation) {
         router.push({
           pathname: '/(auth)/verify-email',
-          params: { email: email.trim(), username: username.toLowerCase().trim(), name },
+          params: { email: cleanEmail, username: username.toLowerCase().trim(), name },
         })
       } else {
         router.replace('/')
@@ -108,6 +125,7 @@ export default function Signup() {
             style={s.input} placeholder="Name (optional)"
             placeholderTextColor="#9090a8"
             value={name} onChangeText={setName}
+            maxLength={NAME_MAX}
           />
           <TextInput
             style={s.input} placeholder="Email"

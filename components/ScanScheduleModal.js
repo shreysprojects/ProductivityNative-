@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, ScrollView, Modal,
   StyleSheet, ActivityIndicator, Alert, Animated,
@@ -48,8 +48,15 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
   const [busy, setBusy]       = useState(false)
   const [found, setFound]     = useState(null)   // extracted classes, or null before a scan
   const [skipped, setSkipped] = useState(new Set())
+  // Each scan takes a number, and closing, rescanning or unmounting moves the
+  // number on. A scan still out from before then knows nobody is waiting for
+  // it: no alerts, no results, and its finish can't re-enable the button in
+  // the middle of a newer scan.
+  const scanSeq = useRef(0)
+  useEffect(() => () => { scanSeq.current++ }, [])
 
   function reset() {
+    scanSeq.current++
     setFound(null)
     setSkipped(new Set())
     setBusy(false)
@@ -65,18 +72,18 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
   }
 
   async function pickAndScan() {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Photo library access is required to pick your timetable screenshots.')
-      return
-    }
+    const seq = ++scanSeq.current
+    const stale = () => seq !== scanSeq.current
+    // No permission request: the system photo picker only hands back what
+    // was picked, so it needs no library access — asking for it (and
+    // refusing to go on when it was denied) only got in the way.
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
       allowsMultipleSelection: true,
       selectionLimit: 3,
       orderedSelection: true,
     })
-    if (result.canceled || !result.assets?.length) return
+    if (stale() || result.canceled || !result.assets?.length) return
 
     setBusy(true)
     try {
@@ -94,14 +101,16 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
         )
         if (shrunk.base64) images.push(shrunk.base64)
       }
-      if (!images.length) return
+      if (stale() || !images.length) return
 
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'extract_schedule', images },
       })
+      if (stale()) return
       if (error) {
         let detail = null
         try { detail = await error.context?.json() } catch {}
+        if (stale()) return
         if (detail?.error === 'daily_limit') {
           Alert.alert('Limit reached', detail.reason)
           return
@@ -141,9 +150,9 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
       setFound(classes)
       setSkipped(new Set())
     } catch (e) {
-      Alert.alert('Scan failed', String(e?.message ?? e))
+      if (!stale()) Alert.alert('Scan failed', String(e?.message ?? e))
     } finally {
-      setBusy(false)
+      if (!stale()) setBusy(false)
     }
   }
 

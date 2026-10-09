@@ -1,7 +1,7 @@
 import { useState, useCallback, useLayoutEffect, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, Pressable, StyleSheet, ScrollView,
-  Modal, Switch, Alert, KeyboardAvoidingView, Platform, Animated,
+  Modal, Switch, Alert, KeyboardAvoidingView, Platform, Animated, AppState,
 } from 'react-native'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import Svg, { Circle } from 'react-native-svg'
@@ -23,6 +23,8 @@ const DEFAULT_ROUTINES = new Set(['Morning', 'Fitness', 'Night'])
 // Focus refetch throttle: a tab hop back here within this window keeps
 // rendering cached state instead of hitting the network again.
 const REFETCH_MS = 30 * 1000
+// Coming back to the app after this long (or on a new day) reloads Home.
+const RESUME_RELOAD_MS = 10 * 60 * 1000
 
 // Section identities for the routine groups (chip + rule tint)
 const EVERYDAY_COLOR = '#f59e0b'
@@ -66,7 +68,7 @@ function nextRoutineNudge(visible, doneCount, total) {
     : `Let's move onto ${next.name} routine!`
 }
 
-function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hiddenSet, routineStreaks, theme }) {
+function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hiddenSet, routineStreaks, theme, resumeKey = 0 }) {
   const [calItems, setCalItems] = useState([])
   const [pendingTodos, setPendingTodos] = useState([])
   const [tasksToday, setTasksToday] = useState([])
@@ -74,24 +76,30 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
   const [collapsed, setCollapsed] = useState(false)
   // Rules for the day — persist until the user changes them
   const [rules, setRules] = useState([])
+  // The editor starts from `rules`, so it stays shut until they've loaded:
+  // saving a draft made from the empty placeholder would erase them all.
+  const [rulesLoaded, setRulesLoaded] = useState(false)
   const [rulesOpen, setRulesOpen] = useState(false)
   const [draftRules, setDraftRules] = useState([])
   const [newRule, setNewRule] = useState('')
   // Stamped on each successful fetch — focus refetches inside the throttle
-  // window keep showing what's already here.
+  // window keep showing what's already here — along with the day it was
+  // for, since a new day always refetches.
   const lastDashLoadRef = useRef(0)
+  const lastDashDayRef = useRef(null)
 
   // Sleep set from the Night routine. The "you've slept for…" line appears once
   // a minute has passed since that time, and the figure keeps ticking while
-  // it's on screen. Re-read on every focus (not throttled): this is exactly
-  // the thing the user reopens the app to answer.
+  // it's on screen. Re-read on every focus and every return to the app (not
+  // throttled): this is exactly the thing the user reopens the app to answer.
   const [sleep, setSleep] = useState(null)      // the pending session, or null
   const [justWoke, setJustWoke] = useState(null) // "7h 20m" right after tapping I woke up
   const [, setSleepTick] = useState(0)
-  useFocusEffect(useCallback(() => {
+  const readSleep = useCallback(() => {
     if (!user?.id) return
     getSleep(user.id).then(s => setSleep(s?.session ?? null)).catch(() => {})
-  }, [user?.id]))
+  }, [user?.id])
+  useFocusEffect(readSleep)
   useEffect(() => {
     if (!sleep) return
     const id = setInterval(() => setSleepTick(t => t + 1), 30000)
@@ -128,6 +136,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
   const rulesDrag = useSheetDrag(() => saveRules(), { visible: rulesOpen })
 
   function openRulesEditor() {
+    if (!rulesLoaded) return
     setDraftRules(rules.map(r => ({ ...r })))
     setNewRule('')
     setRulesOpen(true)
@@ -152,9 +161,8 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
     await saveDayRules(user.id, cleaned)
   }
 
-  useFocusEffect(useCallback(() => {
+  const loadDash = useCallback(() => {
     if (!user?.id) return
-    if (Date.now() - lastDashLoadRef.current < REFETCH_MS) return
     const key = today()
     Promise.all([
       getCalendarEvents(user.id),
@@ -165,20 +173,44 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
       getDayRules(user.id),
     ]).then(([events, todos, schedule, allTasks, jEntries, dayRules]) => {
       setRules(dayRules)
+      setRulesLoaded(true)
       const dow = new Date().getDay()
       const combined = [
         ...events.filter(e => e.date === key),
-        ...schedule.filter(s => s.days?.includes(dow)),
+        // Same rule as the calendar: a class only meets inside its semester.
+        ...schedule.filter(s => s.days?.includes(dow) &&
+          !(s.semesterStart && key < s.semesterStart) &&
+          !(s.semesterEnd && key > s.semesterEnd)),
       ].sort((a, b) =>
         (a.time || a.startTime || '99:99').localeCompare(b.time || b.startTime || '99:99')
       )
       setCalItems(combined.slice(0, 4))
       setPendingTodos(todos.filter(t => !t.done).slice(0, 2))
-      setTasksToday(allTasks.filter(t => !t.done && t.dueDate === key).slice(0, 3))
+      // Due today, plus the to-do list's Today bucket (quick-added to-dos
+      // have no due date) — the ones due today first.
+      setTasksToday(allTasks
+        .filter(t => !t.done && (t.dueDate === key || (t.bucket ?? 'today') === 'today'))
+        .sort((a, b) => (b.dueDate === key) - (a.dueDate === key))
+        .slice(0, 3))
       setTodayJournal(jEntries[key] ?? null)
       lastDashLoadRef.current = Date.now()
+      lastDashDayRef.current = key
     }).catch(() => {}) // a failed refetch keeps whatever is already on screen
-  }, [user?.id]))
+  }, [user?.id])
+
+  useFocusEffect(useCallback(() => {
+    if (Date.now() - lastDashLoadRef.current < REFETCH_MS && lastDashDayRef.current === today()) return
+    loadDash()
+  }, [loadDash]))
+
+  // Coming back to the app doesn't focus the tab again (RoutinesScreen bumps
+  // resumeKey instead): the sleep state is re-read every time, the rest once
+  // the day has turned or it has been a while.
+  useEffect(() => {
+    if (!resumeKey) return
+    readSleep()
+    if (lastDashDayRef.current !== today() || Date.now() - lastDashLoadRef.current >= RESUME_RELOAD_MS) loadDash()
+  }, [resumeKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const visible   = routines.filter(r => !hiddenSet.has(r.name))
   // A routine with skipped steps still on its do-later list is not done yet.
@@ -290,7 +322,8 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
               {wheneverDone.map(r => (
                 <View key={r.name} style={[db.streakChip, { backgroundColor: WHENEVER_COLOR + '18' }]}>
                   <Text style={{ fontSize: 11 }}>🌊</Text>
-                  <Text style={[db.streakChipText, { color: '#0e7490' }]}>{r.name} · done today ✓</Text>
+                  {/* The deep teal is unreadable on the dark card; the section colour isn't */}
+                  <Text style={[db.streakChipText, { color: theme.isDark ? WHENEVER_COLOR : '#0e7490' }]}>{r.name} · done today ✓</Text>
                 </View>
               ))}
             </View>
@@ -302,7 +335,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
             <>
               <View style={db.rulesHeaderRow}>
                 <Text style={[db.rulesTitle, { color: theme.text }]}>📜  Rules for today</Text>
-                <Pressable onPress={openRulesEditor} hitSlop={8}>
+                <Pressable onPress={openRulesEditor} disabled={!rulesLoaded} hitSlop={8}>
                   <Text style={[db.rulesEdit, { color: theme.accent }]}>Edit</Text>
                 </Pressable>
               </View>
@@ -316,7 +349,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
               ))}
             </>
           ) : (
-            <Pressable style={db.eventRow} onPress={openRulesEditor}>
+            <Pressable style={db.eventRow} onPress={openRulesEditor} disabled={!rulesLoaded}>
               <Text style={{ fontSize: 12 }}>📜</Text>
               <Text style={[db.eventTitle, { color: theme.text }]}>Rules for today</Text>
               <Text style={[db.eventTime, { color: theme.muted }]}>Set them →</Text>
@@ -421,7 +454,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
   )
 }
 
-function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete, group = 'everyday' }) {
+function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete, onOpen, group = 'everyday' }) {
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isRunning = !isHidden && run && !run.finished
@@ -431,13 +464,18 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
   let btnLabel   = 'Start  →'
   let btnColor   = card.color
 
+  // A checklist (quick) run has no timer and no current step: it is ticked
+  // off in any order, so it reports a count rather than a duration.
   if (isDone) {
     const left = pendingLater(run)
-    statusText = `Done in ${fmtMs(run.completedAt - run.startedAt)}${left > 0 ? `  ·  ${left} to do later` : ''}`
+    const done = run.quick ? 'Done ✓' : `Done in ${fmtMs(run.completedAt - run.startedAt)}`
+    statusText = `${done}${left > 0 ? `  ·  ${left} to do later` : ''}`
     btnLabel   = left > 0 ? 'Finish later tasks  →' : 'View Summary  →'
     btnColor   = left > 0 ? '#f59e0b' : '#10b981'
   } else if (isRunning) {
-    statusText = `Task ${run.currentStep + 1} of ${run.steps.length}`
+    statusText = run.quick
+      ? `${run.steps.filter(st => st.completedAt).length} of ${run.steps.length} done`
+      : `Task ${run.currentStep + 1} of ${run.steps.length}`
     btnLabel   = 'Continue  →'
     btnColor   = '#f59e0b'
   }
@@ -446,11 +484,14 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
   const showSplit    = name === 'Fitness' && !isHidden && todayMuscles[0] !== 'Rest'
 
   const totalGoalMins = Math.round(template.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60) / 60, 0))
-  // Whenever routines aren't scheduled — no time range on their cards.
-  const timeRange = settings && group !== 'whenever'
+  // Whenever routines aren't scheduled — no time range on their cards. The
+  // rest show today's slot: its per-day time when set, and none on a day off.
+  const dayIdx = (new Date().getDay() + 6) % 7 // settings days run Monday = 0
+  const start  = settings?.perDayMode ? (settings.dayTimes?.[dayIdx] ?? settings.startTimeMinutes) : settings?.startTimeMinutes
+  const timeRange = settings && group !== 'whenever' && settings.activeDays?.[dayIdx] !== false
     ? totalGoalMins > 0
-      ? `${fmtTime(settings.startTimeMinutes)} – ${fmtTime(settings.startTimeMinutes + totalGoalMins)}`
-      : fmtTime(settings.startTimeMinutes)
+      ? `${fmtTime(start)} – ${fmtTime(start + totalGoalMins)}`
+      : fmtTime(start)
     : null
 
   return (
@@ -461,7 +502,7 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
         shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
         opacity: isHidden ? 0.55 : 1,
       }]}
-      onPress={isHidden ? undefined : () => router.push('/routine/' + name)}
+      onPress={isHidden ? undefined : () => onOpen({ pathname: '/routine/[name]', params: { name } })}
     >
       <View style={[s.cardStripe, { backgroundColor: card.color }]} />
       <View style={s.cardContent}>
@@ -510,7 +551,7 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
             )}
             <Pressable
               style={[s.cardEditBtn, { borderColor: theme.cardBorder }]}
-              onPress={() => router.push('/setup-routine?name=' + encodeURIComponent(name))}
+              onPress={() => onOpen({ pathname: '/setup-routine', params: { name } })}
               hitSlop={10}
             >
               <Text style={[s.cardEditBtnText, { color: card.color }]}>Edit</Text>
@@ -549,7 +590,7 @@ function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings
         {!isHidden && (
           <Pressable
             style={[s.cardBtn, { backgroundColor: btnColor }]}
-            onPress={() => router.push('/routine/' + name)}
+            onPress={() => onOpen({ pathname: '/routine/[name]', params: { name } })}
           >
             <Text style={s.cardBtnText}>{btnLabel}</Text>
           </Pressable>
@@ -577,6 +618,22 @@ function weeklyRoutineTheme(index) {
 
 const DAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
 
+// 'YYYY-MM-DD' in local time, the same shape as today().
+function localDay(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// The latest date, today included, that falls on one of a weekly routine's
+// reset days (resetDays is indexed like getDay(): 0 = Sunday).
+function lastResetDay(resetDays) {
+  const d = new Date()
+  for (let i = 0; i < 7; i++) {
+    if (resetDays[d.getDay()]) return localDay(d)
+    d.setDate(d.getDate() - 1)
+  }
+  return null
+}
+
 // ── Weekly Routine card (expandable checklist) ───────────────────────────
 
 function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete, onSaveTask, onUpdate }) {
@@ -588,6 +645,8 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
   const [editDays, setEditDays] = useState(Array(7).fill(false))
   const [editAutoReset, setEditAutoReset] = useState(false)
   const [editTasks, setEditTasks] = useState([])
+  // The name prompts (new list, edit item) — Alert.prompt only exists on iOS.
+  const [prompt, setPrompt] = useState(null)
   const { color, bg, emoji } = weeklyRoutineTheme(colorIndex)
   const doneCount = routine.tasks.filter(t => t.done).length
   const allDone = doneCount === routine.tasks.length && routine.tasks.length > 0
@@ -606,7 +665,13 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
     if (!editName.trim()) return
     const validTasks = editTasks.filter(t => t.text.trim())
     if (!validTasks.length) return
-    onUpdate(routine.id, { name: editName.trim(), resetDays: editDays, autoReset: editAutoReset, tasks: validTasks })
+    const updates = { name: editName.trim(), resetDays: editDays, autoReset: editAutoReset, tasks: validTasks }
+    // Resets count from when they're switched on (or their days change), so
+    // doing that on a reset day doesn't wipe what's already ticked today.
+    if (editAutoReset && (!routine.autoReset || JSON.stringify(editDays) !== JSON.stringify(routine.resetDays ?? []))) {
+      updates.lastResetDate = today()
+    }
+    onUpdate(routine.id, updates)
     setIsEditing(false)
   }
 
@@ -618,11 +683,15 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
   }
 
   function promptAddList() {
-    Alert.prompt('New list', 'Name this list (e.g. Weekly Goals)', text => {
-      const clean = text?.trim()
-      if (!clean) return
-      onUpdate(routine.id, { lists: [...(routine.lists ?? []), { id: Date.now(), name: clean, items: [] }] })
-    }, 'plain-text')
+    setPrompt({
+      title: 'New list',
+      message: 'Name this list (e.g. Weekly Goals)',
+      onSubmit: text => {
+        const clean = text?.trim()
+        if (!clean) return
+        onUpdate(routine.id, { lists: [...(routine.lists ?? []), { id: Date.now(), name: clean, items: [] }] })
+      },
+    })
   }
 
   return (
@@ -765,6 +834,7 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
                 list={list}
                 color={color}
                 theme={theme}
+                onPrompt={setPrompt}
                 onChange={next => onUpdate(routine.id, { lists: (routine.lists ?? []).map(l => l.id === next.id ? next : l) })}
                 onDelete={() => Alert.alert('Delete list?', `Remove "${list.name}" and everything in it?`, [
                   { text: 'Cancel', style: 'cancel' },
@@ -781,6 +851,8 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
           </View>
         )}
       </View>
+
+      <TextPromptModal prompt={prompt} theme={theme} color={color} onClose={() => setPrompt(null)} />
     </View>
   )
 }
@@ -789,7 +861,7 @@ function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete,
 // A named, fully editable checklist inside a weekly routine: rename via ✏️,
 // tap to check items, long-press an item to edit its text, ✕ to remove.
 
-function WeeklyListBlock({ list, color, theme, onChange, onDelete }) {
+function WeeklyListBlock({ list, color, theme, onChange, onDelete, onPrompt }) {
   const [editingName, setEditingName] = useState(false)
   const [nameDraft, setNameDraft] = useState(list.name)
   const [newItem, setNewItem] = useState('')
@@ -811,11 +883,15 @@ function WeeklyListBlock({ list, color, theme, onChange, onDelete }) {
   }
 
   function editItem(item) {
-    Alert.prompt('Edit item', undefined, text => {
-      const clean = text?.trim()
-      if (!clean) return
-      onChange({ ...list, items: items.map(it => it.id === item.id ? { ...it, text: clean } : it) })
-    }, 'plain-text', item.text)
+    onPrompt({
+      title: 'Edit item',
+      initialValue: item.text,
+      onSubmit: text => {
+        const clean = text?.trim()
+        if (!clean) return
+        onChange({ ...list, items: items.map(it => it.id === item.id ? { ...it, text: clean } : it) })
+      },
+    })
   }
 
   return (
@@ -885,23 +961,88 @@ function WeeklyListBlock({ list, color, theme, onChange, onDelete }) {
   )
 }
 
+// ── Text prompt (new list, edit item) ────────────────────────────────────
+// Single-field prompt that works on both platforms (Alert.prompt is iOS-only).
+// `prompt` is { title, message, placeholder, initialValue, onSubmit } or null
+// when closed.
+
+function TextPromptModal({ prompt, theme, color, onClose }) {
+  const [value, setValue] = useState('')
+
+  useEffect(() => {
+    if (prompt) setValue(prompt.initialValue ?? '')
+  }, [prompt])
+
+  function submit() {
+    const submitted = value
+    const handler = prompt?.onSubmit
+    onClose()
+    handler?.(submitted)
+  }
+
+  return (
+    <Modal visible={!!prompt} transparent animationType="fade" onRequestClose={onClose}>
+      <KeyboardAvoidingView style={wk.promptOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <Pressable style={wk.promptBg} onPress={onClose} />
+        <View style={[wk.promptCard, { backgroundColor: theme.card }]}>
+          <Text style={[wk.promptTitle, { color: theme.text }]}>{prompt?.title}</Text>
+          {prompt?.message ? (
+            <Text style={[wk.promptMessage, { color: theme.subtext }]}>{prompt.message}</Text>
+          ) : null}
+          <TextInput
+            style={[wk.promptInput, { color: theme.text, backgroundColor: theme.input, borderColor: theme.inputBorder }]}
+            value={value}
+            onChangeText={setValue}
+            placeholder={prompt?.placeholder}
+            placeholderTextColor={theme.muted}
+            autoFocus
+            returnKeyType="done"
+            onSubmitEditing={submit}
+          />
+          <View style={wk.promptBtns}>
+            <Pressable style={[wk.promptCancelBtn, { borderColor: theme.cardBorder }]} onPress={onClose}>
+              <Text style={[wk.promptCancelText, { color: theme.subtext }]}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[wk.promptSaveBtn, { backgroundColor: color }]} onPress={submit}>
+              <Text style={wk.promptSaveText}>Save</Text>
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  )
+}
+
 // ── Weekly Routine creation modal ────────────────────────────────────────
+
+// The counter keeps ids unique even for rows made in the same millisecond.
+let taskRowSeq = 0
+const blankTaskRow = () => ({ id: `${Date.now()}_${taskRowSeq++}`, text: '' })
 
 function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
   const [name, setName] = useState('')
-  const [tasks, setTasks] = useState([''])
+  // Rows carry ids so removing one doesn't shift the text of the others.
+  const [tasks, setTasks] = useState(() => [blankTaskRow()])
+  const savingRef = useRef(false)
 
-  function reset() { setName(''); setTasks(['']) }
+  function reset() { setName(''); setTasks([blankTaskRow()]) }
   function close() { reset(); onClose() }
 
-  function save() {
-    if (!name.trim()) return
+  // The sheet closes straight away (see handleWeeklyAddRoutine); the draft
+  // is only cleared once the save lands, so a failed one reopens with
+  // everything still filled in.
+  async function save() {
+    if (savingRef.current || !name.trim()) return
     const taskList = tasks
-      .filter(t => t.trim())
-      .map((t, i) => ({ id: Date.now() + i, text: t.trim(), done: false }))
+      .filter(t => t.text.trim())
+      .map((t, i) => ({ id: Date.now() + i, text: t.text.trim(), done: false }))
     if (!taskList.length) return
-    onSave({ id: String(Date.now()), name: name.trim(), tasks: taskList })
-    reset()
+    savingRef.current = true
+    try {
+      if (await onSave({ id: String(Date.now()), name: name.trim(), tasks: taskList })) reset()
+    } finally {
+      savingRef.current = false
+    }
   }
 
   const drag = useSheetDrag(close, { visible })
@@ -927,22 +1068,22 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
             />
             <Text style={[wk.modalLabel, { color: theme.subtext }]}>TASKS</Text>
             {tasks.map((t, i) => (
-              <View key={i} style={wk.modalTaskRow}>
+              <View key={t.id} style={wk.modalTaskRow}>
                 <TextInput
                   style={[wk.modalTaskInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
                   placeholder={`Task ${i + 1}...`}
                   placeholderTextColor={theme.muted}
-                  value={t}
-                  onChangeText={v => setTasks(prev => prev.map((x, j) => j === i ? v : x))}
+                  value={t.text}
+                  onChangeText={v => setTasks(prev => prev.map(x => x.id === t.id ? { ...x, text: v } : x))}
                 />
                 {tasks.length > 1 && (
-                  <Pressable onPress={() => setTasks(prev => prev.filter((_, j) => j !== i))} hitSlop={10} style={{ padding: 8 }}>
+                  <Pressable onPress={() => setTasks(prev => prev.filter(x => x.id !== t.id))} hitSlop={10} style={{ padding: 8 }}>
                     <Text style={{ color: '#ef4444', fontSize: 14 }}>✕</Text>
                   </Pressable>
                 )}
               </View>
             ))}
-            <Pressable style={wk.modalAddTask} onPress={() => setTasks(t => [...t, ''])}>
+            <Pressable style={wk.modalAddTask} onPress={() => setTasks(prev => [...prev, blankTaskRow()])}>
               <Text style={[wk.modalAddTaskText, { color: '#6366f1' }]}>＋  Add another task</Text>
             </Pressable>
             <Pressable style={[wk.modalSave, { backgroundColor: '#6366f1' }]} onPress={save}>
@@ -978,6 +1119,12 @@ export default function RoutinesScreen() {
   // rendering the current content — the blank/error states are first-load only.
   const hasLoadedRef = useRef(false)
   const lastLoadAtRef = useRef(0)
+  // The day the last full load was for: a new day always reloads in full.
+  const loadedDayRef = useRef(null)
+  // Set by openFromHome, so the next focus reloads in full.
+  const reloadOnFocusRef = useRef(false)
+  // Bumped each time the app comes back while Home is on screen.
+  const [resumeKey, setResumeKey] = useState(0)
   // Fingerprint of everything the notification sync schedules from, so the
   // sync (which re-reads the routine list itself) only fires on real changes.
   const notifSyncKeyRef = useRef(null)
@@ -993,9 +1140,10 @@ export default function RoutinesScreen() {
   }, [navigation, theme])
 
   const load = useCallback(async ({ force = false } = {}) => {
-    if (!user) return
-    // A focus refetch inside the throttle window keeps rendering cached state.
-    if (!force && hasLoadedRef.current && Date.now() - lastLoadAtRef.current < REFETCH_MS) {
+    if (!user?.id) return
+    // A focus refetch inside the throttle window keeps rendering cached state
+    // (unless the day has turned since).
+    if (!force && hasLoadedRef.current && Date.now() - lastLoadAtRef.current < REFETCH_MS && loadedDayRef.current === today()) {
       // Inside the throttle window, still refresh today's runs: a routine
       // finished seconds ago has to read as done the moment the user lands
       // back here. One query plus the device mirrors, so it is cheap.
@@ -1027,24 +1175,32 @@ export default function RoutinesScreen() {
       setGroupMap(gMap)
       setRoutines(names.map((name, i) => ({ name, template: templates[name], run: runs[name], settings: settingsArr[i] })))
       setHiddenSet(new Set(hiddenArr))
-      setStreak(str)
+      // null means the streak couldn't be read at all — show none.
+      setStreak(str ?? { current: 0, longest: 0 })
       setRoutineStreaks(rStreaks)
       const muscle = split?.days?.[todaySplitIndex()] ?? null
       setTodayMuscle(muscle)
       const todayStr = today()
-      const todayDow = new Date().getDay()
       let wkUpdated = false
       const wkReset = wkRoutines.map(r => {
-        if (r.autoReset && r.resetDays?.[todayDow] && r.lastResetDate !== todayStr) {
+        if (!r.autoReset || !r.resetDays?.some(Boolean)) return r
+        // Measured against the latest reset day, not today: a reset still
+        // happens when the app wasn't opened on the day itself.
+        const due = lastResetDay(r.resetDays)
+        if (!r.lastResetDate && due !== todayStr) {
+          // Switched on before resets were dated: count from today rather
+          // than clear ticks for a reset day that may predate switching on.
           wkUpdated = true
-          return {
-            ...r,
-            tasks: r.tasks.map(t => ({ ...t, done: false })),
-            lists: (r.lists ?? []).map(l => ({ ...l, items: (l.items ?? []).map(it => ({ ...it, done: false })) })),
-            lastResetDate: todayStr,
-          }
+          return { ...r, lastResetDate: todayStr }
         }
-        return r
+        if (r.lastResetDate >= due) return r
+        wkUpdated = true
+        return {
+          ...r,
+          tasks: r.tasks.map(t => ({ ...t, done: false })),
+          lists: (r.lists ?? []).map(l => ({ ...l, items: (l.items ?? []).map(it => ({ ...it, done: false })) })),
+          lastResetDate: todayStr,
+        }
       })
       if (wkUpdated) await saveWeeklyRoutines(user.id, wkReset)
       setWeeklyRoutines(wkReset)
@@ -1053,10 +1209,13 @@ export default function RoutinesScreen() {
       setError(false)
       hasLoadedRef.current = true
       lastLoadAtRef.current = Date.now()
+      loadedDayRef.current = todayStr
       // Keep routine start-time reminders in sync. The sync re-reads the
       // routine list itself, so only fire it when something it schedules from
-      // (names, groups, hidden set, per-routine schedules) actually changed.
-      const notifKey = JSON.stringify([names, gMap, [...hiddenArr].sort(), settingsArr])
+      // (names, groups, hidden set, per-routine schedules) actually changed —
+      // or once a day, so that when there are more reminders than iOS can
+      // hold, the ones coming up next rotate in.
+      const notifKey = JSON.stringify([todayStr, names, gMap, [...hiddenArr].sort(), settingsArr])
       if (notifSyncKeyRef.current !== notifKey) {
         notifSyncKeyRef.current = notifKey
         syncRoutineNotifications(user.id)
@@ -1068,7 +1227,7 @@ export default function RoutinesScreen() {
     } finally {
       setLoading(false)
     }
-  }, [user])
+  }, [user?.id])
 
   // The routine list as of the last render, for the throttled runs refresh
   // above (load's closure can't see state without re-creating itself).
@@ -1150,11 +1309,24 @@ export default function RoutinesScreen() {
     ])
   }
 
+  // Resolves true once saved. The sheet closes first: waiting on the network
+  // behind a sheet that had already cleared looked like a failed save and
+  // invited a second, duplicate one.
   async function handleWeeklyAddRoutine(routine) {
+    setWeeklyModalOpen(false)
     const next = [...weeklyRoutines, routine]
     setWeeklyRoutines(next)
-    await saveWeeklyRoutines(user.id, next)
-    setWeeklyModalOpen(false)
+    try {
+      await saveWeeklyRoutines(user.id, next)
+      return true
+    } catch (e) {
+      // Put things back: the routine out of the list, the sheet open again
+      // with the draft still in it.
+      setWeeklyRoutines(prev => prev.filter(r => r.id !== routine.id))
+      setWeeklyModalOpen(true)
+      Alert.alert('Could not save', e?.message ?? 'Please try again.')
+      return false
+    }
   }
 
   async function handleWeeklyUpdateRoutine(routineId, updates) {
@@ -1163,7 +1335,34 @@ export default function RoutinesScreen() {
     await saveWeeklyRoutines(user.id, next)
   }
 
-  useFocusEffect(useCallback(() => { load() }, [load]))
+  // Every screen opened from Home can change what it shows — a finished run,
+  // an edited, renamed or reordered routine, a new one — so coming back from
+  // one reloads in full (and resyncs the reminders). The throttle is only
+  // for hopping between tabs.
+  function openFromHome(href) {
+    reloadOnFocusRef.current = true
+    router.push(href)
+  }
+
+  useFocusEffect(useCallback(() => {
+    const force = reloadOnFocusRef.current
+    reloadOnFocusRef.current = false
+    load({ force })
+  }, [load]))
+
+  // Returning to the app doesn't focus the tab again, so a day that turned
+  // while it sat in the background (or a long break) reloads it here; the
+  // dashboard re-reads the sleep state off resumeKey.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'active' || !navigation.isFocused()) return
+      setResumeKey(n => n + 1)
+      if (loadedDayRef.current !== today() || Date.now() - lastLoadAtRef.current >= RESUME_RELOAD_MS) {
+        load({ force: true })
+      }
+    })
+    return () => sub.remove()
+  }, [load, navigation])
 
   if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
 
@@ -1190,6 +1389,8 @@ export default function RoutinesScreen() {
   const doneCount = visibleEveryday.filter(r => runFullyDone(r.run)).length
   const allDone = doneCount > 0 && doneCount === visibleEveryday.length
   const wheneverDoneCount = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && runFullyDone(r.run)).length
+  // The light theme's indigo is unreadable on the dark card; the accent isn't.
+  const activeTabColor = theme.isDark ? theme.accent : '#4f46e5'
 
   return (
     <KeyboardAvoidingView
@@ -1206,6 +1407,7 @@ export default function RoutinesScreen() {
           hiddenSet={hiddenSet}
           routineStreaks={routineStreaks}
           theme={theme}
+          resumeKey={resumeKey}
         />
 
         {/* Tab switcher — Weekly only shows when enabled in section settings */}
@@ -1215,13 +1417,13 @@ export default function RoutinesScreen() {
               style={[wk.tab, activeTab === 'daily' && [wk.tabActive, { backgroundColor: theme.card }]]}
               onPress={() => setActiveTab('daily')}
             >
-              <Text style={[wk.tabText, { color: activeTab === 'daily' ? '#4f46e5' : theme.subtext, fontSize: 13 }]}>Daily</Text>
+              <Text style={[wk.tabText, { color: activeTab === 'daily' ? activeTabColor : theme.subtext, fontSize: 13 }]}>Daily</Text>
             </Pressable>
             <Pressable
               style={[wk.tab, activeTab === 'weekly' && [wk.tabActive, { backgroundColor: theme.card }]]}
               onPress={() => setActiveTab('weekly')}
             >
-              <Text style={[wk.tabText, { color: activeTab === 'weekly' ? '#4f46e5' : theme.subtext, fontSize: 13 }]}>Weekly</Text>
+              <Text style={[wk.tabText, { color: activeTab === 'weekly' ? activeTabColor : theme.subtext, fontSize: 13 }]}>Weekly</Text>
             </Pressable>
           </View>
         )}
@@ -1246,7 +1448,7 @@ export default function RoutinesScreen() {
               <Text style={[s.groupHeaderHint, { color: theme.muted }]}>aim to do these daily</Text>
               <View style={[s.groupRule, { backgroundColor: EVERYDAY_COLOR + '2a' }]} />
               {routines.length > 1 && (
-                <Pressable onPress={() => router.push('/reorder-routines')} hitSlop={8}>
+                <Pressable onPress={() => openFromHome('/reorder-routines')} hitSlop={8}>
                   <Text style={{ color: theme.accent, fontWeight: '700', fontSize: 13 }}>⇅ Organize</Text>
                 </Pressable>
               )}
@@ -1270,6 +1472,7 @@ export default function RoutinesScreen() {
                 onHide={() => handleHide(name)}
                 onUnhide={() => handleUnhide(name)}
                 onDelete={() => handleDeleteCustom(name)}
+                onOpen={openFromHome}
                 group="everyday"
               />
             ))}
@@ -1306,12 +1509,13 @@ export default function RoutinesScreen() {
                 onHide={() => handleHide(name)}
                 onUnhide={() => handleUnhide(name)}
                 onDelete={() => handleDeleteCustom(name)}
+                onOpen={openFromHome}
                 group="whenever"
               />
             ))}
             <Pressable
               style={[s.addBtn, { borderColor: theme.isDark ? '#28284a' : '#dde0f8' }]}
-              onPress={() => router.push('/setup-routine?name=new')}
+              onPress={() => openFromHome('/setup-routine?name=new')}
             >
               <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
             </Pressable>
@@ -1705,6 +1909,27 @@ const wk = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   editSave: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+
+  // Text prompt (same look as the routine screen's name prompt)
+  promptOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 28 },
+  promptBg: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
+  promptCard: {
+    borderRadius: 24, padding: 24, width: '100%',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2, shadowRadius: 24, elevation: 12,
+  },
+  promptTitle: { fontSize: 18, fontWeight: '800', letterSpacing: -0.3 },
+  promptMessage: { fontSize: 14, lineHeight: 20, marginTop: 8 },
+  promptInput: {
+    borderRadius: 12, borderWidth: 1.5,
+    paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 15, fontWeight: '600', marginTop: 16,
+  },
+  promptBtns: { flexDirection: 'row', gap: 10, marginTop: 18 },
+  promptCancelBtn: { flex: 1, borderRadius: 12, paddingVertical: 13, alignItems: 'center', borderWidth: 1.5 },
+  promptCancelText: { fontWeight: '600', fontSize: 14 },
+  promptSaveBtn: { flex: 2, borderRadius: 12, paddingVertical: 13, alignItems: 'center' },
+  promptSaveText: { color: '#fff', fontWeight: '700', fontSize: 14 },
 })
 
 

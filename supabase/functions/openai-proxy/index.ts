@@ -8,6 +8,14 @@ const CORS = {
 const OPENAI_KEY   = Deno.env.get('OPENAI_API_KEY')!
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_KEY  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+// Profile pictures only ever live here; moderate_profile_picture refuses to
+// hand any other URL to the model (it would fetch whatever it was given).
+const AVATAR_PREFIX = `${SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/public/avatars/`
+// Routine task/step photos and saved-meal ingredient photos.
+const PHOTO_BUCKET        = 'routine-photos'
+// Must match the cap in the routine_photos limit trigger and
+// MAX_ROUTINE_PHOTOS in lib/photoPaths.js.
+const MAX_ROUTINE_PHOTOS  = 10
 const MAX_PER_DAY          = 3
 const MAX_MOD_PER_DAY      = 60
 const MAX_EXTRACT_PER_WEEK = 10
@@ -197,11 +205,16 @@ Deno.serve(async (req) => {
           429,
         )
       }
-    } else if (action === 'upload_avatar') {
+    } else if (action === 'upload_avatar' || action === 'upload_photo') {
       const rl = await consumeLimit('mod', MAX_MOD_PER_DAY)
       if (rl && !rl.allowed) {
         return json(
-          { error: 'daily_limit', reason: 'You have changed your photo too many times today. Please try again tomorrow.' },
+          {
+            error: 'daily_limit',
+            reason: action === 'upload_avatar'
+              ? 'You have changed your photo too many times today. Please try again tomorrow.'
+              : 'You have added too many photos today. Please try again tomorrow.',
+          },
           429,
         )
       }
@@ -227,12 +240,18 @@ Deno.serve(async (req) => {
     }
 
     if (action === 'upload_avatar') {
-      const base64 = String(body.base64 ?? '')
+      const base64 = typeof body.base64 === 'string' ? body.base64 : ''
       if (!base64) return json({ error: 'no_image' }, 400)
       const oversize = checkImageSize(base64)
       if (oversize) return oversize
+      // Only real JPEG/PNG/WebP bytes are stored, under their true type; the
+      // bucket is public, so anything else would be served to every viewer.
+      const img = decodeImage(base64)
+      if (!img) {
+        return json({ error: 'invalid_image', reason: 'That photo could not be read. Please try another one.' }, 400)
+      }
 
-      const dataUrl = `data:image/jpeg;base64,${base64}`
+      const dataUrl = `data:${img.mime};base64,${base64}`
       let reason = 'That photo does not fit our community guidelines. Please pick another one.'
       let flagged = false
       try {
@@ -273,17 +292,9 @@ Deno.serve(async (req) => {
       }
       if (flagged) return json({ error: 'flagged', reason }, 422)
 
-      let bytes: Uint8Array | null = null
-      try {
-        bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0))
-      } catch {}
-      if (!bytes) {
-        return json({ error: 'invalid_image', reason: 'That photo could not be read. Please try another one.' }, 400)
-      }
-
       const path = `${user.id}/avatar.jpg`
-      const { error: upErr } = await admin.storage.from('avatars').upload(path, bytes, {
-        contentType: 'image/jpeg',
+      const { error: upErr } = await admin.storage.from('avatars').upload(path, img.bytes, {
+        contentType: img.mime,
         upsert: true,
       })
       if (upErr) {
@@ -295,12 +306,95 @@ Deno.serve(async (req) => {
       return json({ url: pub.publicUrl })
     }
 
+    // Routine task/step photos ('routine') and saved-meal ingredient photos
+    // ('ingredient'). The bucket is public and clients cannot write to it, so
+    // this is the only way in: moderation first (fails closed), then the
+    // service-role upload, then — for routine photos — the ledger row whose
+    // trigger enforces the per-account cap.
+    if (action === 'upload_photo') {
+      const kind = body.kind === 'ingredient' ? 'ingredient' : 'routine'
+      const base64 = typeof body.base64 === 'string' ? body.base64 : ''
+      if (!base64) return json({ error: 'no_image', reason: 'Pick a photo first.' }, 400)
+      const oversize = checkImageSize(base64)
+      if (oversize) return oversize
+      const img = decodeImage(base64)
+      if (!img) {
+        return json({ error: 'invalid_image', reason: 'Could not read that picture. Please try another one.' }, 400)
+      }
+
+      try {
+        const mod = await callOpenAI('https://api.openai.com/v1/moderations', {
+          model: 'omni-moderation-latest',
+          input: [{ type: 'image_url', image_url: { url: `data:${img.mime};base64,${base64}` } }],
+        })
+        if (mod.results?.[0]?.flagged === true) {
+          return json(
+            { error: 'flagged', reason: 'That photo may not be appropriate to share. Please choose a different one.' },
+            422,
+          )
+        }
+      } catch (e) {
+        console.error('upload_photo moderation failed:', e)
+        return json(
+          { error: 'moderation_unavailable', reason: 'Could not check that photo right now. Check your connection and try again.' },
+          503,
+        )
+      }
+
+      // The uid prefix is what the storage policies (list/delete) check, and
+      // the app reads it back out of the URL, so it stays the first segment.
+      const file = `${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}.${img.ext}`
+      const path = kind === 'ingredient' ? `${user.id}/ingredients/${file}` : `${user.id}/${file}`
+
+      // Bytes first, ledger second: if the ledger insert is refused the object
+      // is removed again, and a stray object left by a crash in between is
+      // swept up by the app's slot reconciler.
+      const { error: upErr } = await admin.storage.from(PHOTO_BUCKET).upload(path, img.bytes, {
+        contentType: img.mime,
+        upsert: false,
+      })
+      if (upErr) {
+        console.error('upload_photo storage error:', upErr)
+        return json({ error: 'upload_failed', reason: 'Could not upload that photo. Check your connection and try again.' }, 500)
+      }
+
+      if (kind === 'routine') {
+        const { error: rowErr } = await admin.from('routine_photos').insert({ path, user_id: user.id })
+        if (rowErr) {
+          await admin.storage.from(PHOTO_BUCKET).remove([path])
+          if (String(rowErr.message ?? '').includes('routine_photo_limit_reached')) {
+            return json(
+              {
+                error: 'photo_limit',
+                reason: `You've used all ${MAX_ROUTINE_PHOTOS} routine photos. Remove one from a task or step to free up a slot.`,
+              },
+              409,
+            )
+          }
+          console.error('upload_photo ledger error:', rowErr)
+          return json({ error: 'upload_failed', reason: 'Could not save that photo. Check your connection and try again.' }, 500)
+        }
+      }
+
+      const { data: pub } = admin.storage.from(PHOTO_BUCKET).getPublicUrl(path)
+      return json({ url: pub.publicUrl })
+    }
+
     if (action === 'create_routine') {
-      const surveyQA: Array<{ q: string; answer: string }> = body.surveyQA ?? []
-      const routineName: string = body.routineName ?? ''
+      // Every string here goes straight into the prompt, so each is capped:
+      // uncapped, one call could carry megabytes of text and cost as much as
+      // hundreds of normal ones.
+      const routineName = String(body.routineName ?? '').trim().slice(0, 60)
+      const surveyQA = (Array.isArray(body.surveyQA) ? body.surveyQA : [])
+        .slice(0, 20)
+        .map((i: Record<string, unknown>) => ({
+          q: String(i?.q ?? '').trim().slice(0, 200),
+          answer: String(i?.answer ?? '').trim().slice(0, 500),
+        }))
 
       // Moderate all user-supplied text before generating
-      const userText = surveyQA.map(i => i.answer).filter(Boolean).join(' ').slice(0, 2000)
+      const userText = [routineName, ...surveyQA.flatMap(i => [i.q, i.answer])]
+        .filter(Boolean).join('\n').slice(0, 4000)
       const mod = await callOpenAI('https://api.openai.com/v1/moderations', { input: userText })
       if (mod.results?.[0]?.flagged) {
         return json({ error: 'flagged', reason: 'Input contains inappropriate content.' }, 422)
@@ -328,12 +422,15 @@ Deno.serve(async (req) => {
       const raw: Array<{ text?: string; emoji?: string; timeGoalSecs?: number }> =
         Array.isArray(parsed.tasks) ? parsed.tasks : Array.isArray(parsed) ? parsed : []
 
+      // The model's reply is bounded like any other input: it becomes the
+      // user's routine template.
       const tasks = raw
+        .slice(0, 20)
         .map((t, i) => ({
           id: Date.now() + i,
-          text: noEmDash(String(t.text ?? '').trim()),
-          emoji: String(t.emoji ?? ''),
-          timeGoalSecs: Math.max(0, Math.round(Number(t.timeGoalSecs) || 0)),
+          text: noEmDash(String(t?.text ?? '').trim()).slice(0, 80),
+          emoji: String(t?.emoji ?? '').slice(0, 8),
+          timeGoalSecs: Math.min(4 * 3600, Math.max(0, Math.round(Number(t?.timeGoalSecs) || 0))),
           subTasks: [],
         }))
         .filter(t => t.text)
@@ -342,8 +439,12 @@ Deno.serve(async (req) => {
     }
 
     if (action === 'advise_routine') {
-      const tasks: Array<{ text: string }> = body.tasks ?? []
-      const routineName: string = body.routineName ?? ''
+      // Capped for the same reason as create_routine.
+      const routineName = String(body.routineName ?? '').trim().slice(0, 60)
+      const tasks = (Array.isArray(body.tasks) ? body.tasks : [])
+        .slice(0, 60)
+        .map((t: Record<string, unknown>) => ({ text: String(t?.text ?? '').trim().slice(0, 200) }))
+        .filter((t: { text: string }) => t.text)
 
       const taskList = tasks.map((t, i) => `${i + 1}. ${t.text}`).join('\n')
       const fitnessClause = routineName === 'Fitness'
@@ -366,8 +467,13 @@ Deno.serve(async (req) => {
     }
 
     if (action === 'moderate_profile_picture') {
-      const avatarUrl: string = body.avatarUrl ?? ''
+      const avatarUrl = typeof body.avatarUrl === 'string' ? body.avatarUrl : ''
       if (!avatarUrl) return json({ allowed: true })
+      // The model fetches whatever URL it is handed, so only our own avatars
+      // bucket is accepted (the database refuses any other avatar_url too).
+      if (!avatarUrl.startsWith(AVATAR_PREFIX)) {
+        return json({ allowed: false, reason: 'Please upload your profile picture again in Settings before sharing.' })
+      }
       try {
         const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
           model: 'gpt-5.6-luna',
@@ -620,8 +726,27 @@ Deno.serve(async (req) => {
       if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
         return json({ error: 'inappropriate' })
       }
-      const parsed = JSON.parse(choice?.message?.content ?? '{}')
-      return json(noEmDashDeep(parsed))
+      const parsed = JSON.parse(choice?.message?.content ?? '{}') as Record<string, unknown>
+      if (parsed.error === 'inappropriate' || parsed.error === 'quality') return json({ error: parsed.error })
+      // The app saves this and renders it on every Morning screen open, so
+      // only the documented shape goes back, every field a bounded string.
+      const str = (v: unknown, max: number) => noEmDash(String(v ?? '').trim()).slice(0, max)
+      const categories = (Array.isArray(parsed.categories) ? parsed.categories : [])
+        .slice(0, 6)
+        .map((c: Record<string, unknown>) => ({
+          name: str(c?.name, 60),
+          steps: (Array.isArray(c?.steps) ? c.steps : [])
+            .slice(0, 6)
+            .map((st: Record<string, unknown>) => ({
+              name: str(st?.name, 80),
+              product: str(st?.product, 120),
+              explanation: str(st?.explanation, 300),
+            }))
+            .filter((st: { name: string }) => st.name),
+        }))
+        .filter((c: { name: string; steps: unknown[] }) => c.name && c.steps.length)
+      const skinNote = str(parsed.skinNote, 200)
+      return json({ ...(skinNote ? { skinNote } : {}), categories })
     }
 
     // ── Food estimator ("Ask AI" under the food search) ──────────────────────
@@ -1146,7 +1271,11 @@ function mealCoachData(body: Record<string, unknown>): string {
 
   const today = (body.today && typeof body.today === 'object' ? body.today : null) as Record<string, unknown> | null
   const todayMeals = (Array.isArray(today?.meals) ? today!.meals : []).slice(0, 30) as Array<Record<string, unknown>>
-  if (todayMeals.length) {
+  if (today?.unavailable === true || body.today === null) {
+    // The app could not read the day's log. That is not the same as an
+    // empty day, and answering as if nothing was eaten would be wrong.
+    parts.push('', 'LOGGED TODAY: could not be read just now. Do not assume nothing was eaten; if the answer depends on it, say you cannot see today\'s log right now.')
+  } else if (todayMeals.length) {
     parts.push('', `LOGGED TODAY (${s(today?.date, 10)}), actually eaten, one line per food with everything tracked for it:`,
       ...todayMeals.map(m => mealLine(m)),
       `Today so far: ${dayTotals(todayMeals)}`,
@@ -1498,4 +1627,31 @@ async function callOpenAI(url: string, body: unknown): Promise<Record<string, un
     throw new Error(String(msg))
   }
   return res.json()
+}
+
+// Decodes an uploaded picture and identifies it by its magic bytes, so what
+// lands in a public bucket is a real JPEG, PNG or WebP stored under its true
+// content type. Null for anything else (or for base64 that does not decode).
+function decodeImage(b64: string): { bytes: Uint8Array; mime: string; ext: string } | null {
+  let bytes: Uint8Array
+  try {
+    bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+  } catch {
+    return null
+  }
+  const at = (i: number) => bytes[i]
+  if (bytes.length > 3 && at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) {
+    return { bytes, mime: 'image/jpeg', ext: 'jpg' }
+  }
+  if (bytes.length > 8 && at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) {
+    return { bytes, mime: 'image/png', ext: 'png' }
+  }
+  if (
+    bytes.length > 12 &&
+    String.fromCharCode(at(0), at(1), at(2), at(3)) === 'RIFF' &&
+    String.fromCharCode(at(8), at(9), at(10), at(11)) === 'WEBP'
+  ) {
+    return { bytes, mime: 'image/webp', ext: 'webp' }
+  }
+  return null
 }

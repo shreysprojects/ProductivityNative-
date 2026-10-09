@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Modal, View, Text, TextInput, Pressable, ScrollView, Image, ActivityIndicator,
-  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, Alert,
+  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, Alert, Linking,
 } from 'react-native'
 import * as ImagePicker from 'expo-image-picker'
 import { uploadIngredientPhoto, deleteIngredientPhoto } from '../lib/photoStorage'
@@ -34,13 +34,18 @@ const fmt = v => { const n = Number(v) || 0; return n % 1 === 0 ? String(Math.ro
 // for the item sub-picker.
 function CreateView({
   name, onNameChange, item, onPickItem, onClearItem, note, onNoteChange,
-  image, onPhoto, onViewPhoto, uploading, initial, sectionColor, onSave, onCancel,
+  image, onPhoto, onViewPhoto, uploading, saving, initial, sectionColor, onSave, onCancel,
 }) {
-  const ready = name.trim().length > 0 && !!item
+  // Not while a picture is still uploading (it would miss the save) or a
+  // save is already on its way (a second tap made a second snack).
+  const ready = name.trim().length > 0 && !!item && !uploading && !saving
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+    // On iOS the form's scroll view makes room for the keyboard itself: it
+    // measures on screen, where this view's padding came up short inside a
+    // page sheet.
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? undefined : 'height'} style={{ flex: 1 }}>
       <View style={s.header}>
-        <Pressable onPress={onCancel} hitSlop={10}>
+        <Pressable onPress={onCancel} hitSlop={10} disabled={saving}>
           <Text style={s.cancel}>{initial ? '‹ Back' : 'Back'}</Text>
         </Pressable>
         <Text style={s.headerTitle}>{initial ? 'Edit Snack' : 'New Saved Snack'}</Text>
@@ -53,7 +58,7 @@ function CreateView({
         </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={s.form} keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={s.form} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
         <View style={s.group}>
           <Text style={s.groupLabel}>THE ITEM</Text>
           {item ? (
@@ -223,12 +228,28 @@ export default function SavedSnacksPicker({
   const [uploading, setUploading] = useState(false)
   const [photoViewer, setPhotoViewer] = useState(null)   // picture shown full size
   const [itemFlow, setItemFlow] = useState(null)   // null | an ITEM_SOURCES key
+  const [draftId, setDraftId] = useState(null)     // the snack's id, fixed when the editor opens
+  const [saving, setSaving] = useState(false)
+  const savingRef = useRef(false)
+  // Pictures uploaded since the editor opened. Nothing leaves storage until
+  // the change is committed: a picture replaced or removed here is still the
+  // one the saved snack shows if the user backs out.
+  const uploadsRef = useRef(new Set())
 
   const refresh = () => loadSaved().then(list => setSnacks((list ?? []).filter(m => m?.kind === 'snack')))
   useEffect(() => { refresh() }, [])
 
+  // Closing the whole picker mid-edit is backing out too. A save still on
+  // its way sorts out its own pictures.
+  useEffect(() => () => {
+    if (!savingRef.current) uploadsRef.current.forEach(u => deleteIngredientPhoto(u))
+    uploadsRef.current = new Set()
+  }, [])
+
   const openCreate = () => {
     setName(''); setItem(null); setNote(''); setImage(null)
+    setDraftId(newId())
+    uploadsRef.current = new Set()
     setEditing(null)
     setView('create')
   }
@@ -238,11 +259,19 @@ export default function SavedSnacksPicker({
     setItem({ name: snack.itemName || snack.name, contents: snack.contents || '', macros: snack.macros || {}, source: snack.source ?? null })
     setNote(snack.note || '')
     setImage(snack.image || null)
+    setDraftId(snack.id)
+    uploadsRef.current = new Set()
     setEditing(snack)
     setView('create')
   }
 
-  const cancelCreate = () => { setView('list'); setEditing(null) }
+  // Backing out leaves the saved snack as it was, so only pictures uploaded
+  // in this edit, which it never used, are deleted.
+  const cancelCreate = () => {
+    uploadsRef.current.forEach(u => { if (u !== editing?.image) deleteIngredientPhoto(u) })
+    uploadsRef.current = new Set()
+    setView('list'); setEditing(null)
+  }
 
   // The item arrives from a sub-picker in logged-meal shape.
   const handleItemPicked = (picked) => {
@@ -254,22 +283,38 @@ export default function SavedSnacksPicker({
   function pickPhoto() {
     if (!userId) { Alert.alert('Not signed in', 'Sign in to add photos.'); return }
     const choose = async (fromCamera) => {
-      const perm = fromCamera
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync()
-      if (perm.status !== 'granted') {
-        Alert.alert('Permission needed', fromCamera ? 'Camera access is required to take a photo.' : 'Photo library access is required to pick a photo.')
+      let uri
+      try {
+        // Only the camera needs permission; the photo library's system
+        // picker hands over just the photo chosen.
+        if (fromCamera) {
+          const perm = await ImagePicker.requestCameraPermissionsAsync()
+          if (perm.status !== 'granted') {
+            // Refused for good, asking again does nothing: only Settings can
+            // turn it back on.
+            Alert.alert('Permission needed', 'Camera access is required to take a photo.', perm.canAskAgain === false ? [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Open Settings', onPress: () => Linking.openSettings().catch(() => {}) },
+            ] : undefined)
+            return
+          }
+        }
+        const res = fromCamera
+          ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.6 })
+          : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.6 })
+        uri = res.canceled ? null : res.assets?.[0]?.uri
+      } catch (e) {
+        Alert.alert(fromCamera ? 'Could not open the camera' : 'Could not open your photos', e?.message ?? 'Please try again.')
         return
       }
-      const res = fromCamera
-        ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.6 })
-        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.6 })
-      const uri = res.canceled ? null : res.assets?.[0]?.uri
       if (!uri) return
+      const session = uploadsRef.current
       setUploading(true)
       try {
         const url = await uploadIngredientPhoto(userId, uri)
-        if (image) deleteIngredientPhoto(image)
+        // The editor was left while this uploaded, so nothing will show it.
+        if (session !== uploadsRef.current) { deleteIngredientPhoto(url); return }
+        session.add(url)
         setImage(url)
       } catch (e) {
         Alert.alert('Could not add photo', e?.message ?? 'Please try again.')
@@ -280,7 +325,7 @@ export default function SavedSnacksPicker({
     const buttons = image
       ? [
           { text: 'Change photo', onPress: () => choose(false) },
-          { text: 'Remove photo', style: 'destructive', onPress: () => { deleteIngredientPhoto(image); setImage(null) } },
+          { text: 'Remove photo', style: 'destructive', onPress: () => setImage(null) },
         ]
       : [
           { text: '📷  Take photo', onPress: () => choose(true) },
@@ -290,9 +335,9 @@ export default function SavedSnacksPicker({
   }
 
   const handleSave = async () => {
-    if (!name.trim() || !item) return
-    await onSaveTemplate({
-      id: editing?.id || newId(),
+    if (!name.trim() || !item || savingRef.current) return
+    const snack = {
+      id: draftId,
       kind: 'snack',
       name: name.trim(),
       itemName: item.name,
@@ -301,7 +346,23 @@ export default function SavedSnacksPicker({
       source: item.source ?? null,   // 'ai' when the numbers are an AI estimate
       note: note.trim(),
       image: image || null,
-    })
+    }
+    const session = uploadsRef.current
+    savingRef.current = true
+    setSaving(true)
+    try {
+      await onSaveTemplate(snack)
+    } catch {
+      // The owner has said why; the form stays as it was to try again.
+      return
+    } finally {
+      savingRef.current = false
+      setSaving(false)
+    }
+    // Saved: the pictures it no longer shows can go now, the old one and any
+    // uploaded along the way.
+    ;[editing?.image, ...session].forEach(u => { if (u && u !== snack.image) deleteIngredientPhoto(u) })
+    uploadsRef.current = new Set()
     setView('list')
     setEditing(null)
     refresh()
@@ -311,7 +372,11 @@ export default function SavedSnacksPicker({
     Alert.alert('Delete Saved Snack', `Remove "${snack.name}"?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
-        await onDeleteTemplate(snack.id)
+        try {
+          await onDeleteTemplate(snack.id)
+        } catch {
+          return   // not deleted (the owner has said why), so its picture stays
+        }
         if (snack.image) deleteIngredientPhoto(snack.image)
         refresh()
       } },
@@ -360,6 +425,7 @@ export default function SavedSnacksPicker({
               onPhoto={pickPhoto}
               onViewPhoto={setPhotoViewer}
               uploading={uploading}
+              saving={saving}
               initial={editing}
               sectionColor={sectionColor}
               onSave={handleSave}

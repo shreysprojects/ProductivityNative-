@@ -8,6 +8,11 @@
 // it. That works only because runSteps.js has no imports — if you ever add one,
 // this loader has to change with it.
 
+// Pinned to a zone with daylight saving, so the DST checks below run against
+// real 23- and 25-hour days wherever the suite runs. Must be set before any
+// Date is made.
+process.env.TZ = 'America/Toronto'
+
 const fs = require('fs')
 const path = require('path')
 
@@ -183,6 +188,13 @@ function runSuite({
       const ts = parseStartTimeInput(text, now)
       assert(ts != null && ts <= now, `"${text}" resolved into the future`)
     }
+  })
+  t('yesterday is a calendar day back, even across a DST change', () => {
+    // 8 Mar 2026 is 23 hours long and 1 Nov 2026 is 25 in America/Toronto;
+    // taking 24 hours off landed an hour away from the time typed.
+    const at = (y, mo, d, h, mi) => new Date(y, mo, d, h, mi, 0, 0).getTime()
+    eq(parseStartTimeInput('11 pm', at(2026, 2, 8, 10, 0)), at(2026, 2, 7, 23, 0), 'spring forward')
+    eq(parseStartTimeInput('11 pm', at(2026, 10, 1, 10, 0)), at(2026, 9, 31, 23, 0), 'fall back')
   })
   t('non-times are rejected', () => {
     for (const bad of ['', 'abc', '25:00', '7:75', '13 pm', '6:4', null, undefined]) {
@@ -400,6 +412,20 @@ const mutants = [
       ...real,
       parseStartTimeInput: (text, now) =>
         real.parseStartTimeInput(text, now + 24 * 60 * 60 * 1000),
+    },
+  },
+  {
+    name: 'parseStartTimeInput steps back 24 hours instead of a calendar day (DST)',
+    mod: {
+      ...real,
+      parseStartTimeInput: (text, now) => {
+        const t = real.parseStartTimeInput(text, now)
+        if (t == null || new Date(t).toDateString() === new Date(now).toDateString()) return t
+        // The original bug: today's occurrence minus a flat 24 hours.
+        const d = new Date(now)
+        d.setHours(new Date(t).getHours(), new Date(t).getMinutes(), 0, 0)
+        return d.getTime() - 24 * 60 * 60 * 1000
+      },
     },
   },
   {

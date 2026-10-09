@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Modal, View, Text, TextInput, Pressable, ScrollView, Image,
-  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert,
+  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert, Linking,
 } from 'react-native'
 import * as ImagePicker from 'expo-image-picker'
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator'
@@ -28,20 +28,32 @@ export default function ScanMealModal({ section, sectionLabel, sectionColor, onA
   useEffect(() => { takePhoto(true) }, [])   // eslint-disable-line react-hooks/exhaustive-deps
 
   async function takePhoto(fromCamera) {
-    const perm = fromCamera
-      ? await ImagePicker.requestCameraPermissionsAsync()
-      : await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (perm.status !== 'granted') {
-      Alert.alert(
-        'Permission needed',
-        fromCamera ? 'Camera access is required to photograph the meal.' : 'Photo library access is required to pick a photo.'
-      )
+    let asset
+    try {
+      // Only the camera needs permission; the photo library's system picker
+      // hands over just the photo chosen.
+      if (fromCamera) {
+        const perm = await ImagePicker.requestCameraPermissionsAsync()
+        if (perm.status !== 'granted') {
+          if (!alive.current) return
+          // Refused for good, asking again does nothing: only Settings can
+          // turn it back on.
+          Alert.alert('Permission needed', 'Camera access is required to photograph the meal.', perm.canAskAgain === false ? [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings().catch(() => {}) },
+          ] : undefined)
+          return
+        }
+      }
+      const res = fromCamera
+        ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.8 })
+        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.8 })
+      asset = res.canceled ? null : res.assets?.[0]
+    } catch (e) {
+      // This also runs from the open effect, where a rejection went unhandled.
+      if (alive.current) Alert.alert(fromCamera ? 'Could not open the camera' : 'Could not open your photos', String(e?.message ?? e))
       return
     }
-    const res = fromCamera
-      ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.8 })
-      : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.8 })
-    const asset = res.canceled ? null : res.assets?.[0]
     if (!asset || !alive.current) return
     try {
       // 1024px is plenty to read a plate and keeps the upload under the
@@ -88,7 +100,10 @@ export default function ScanMealModal({ section, sectionLabel, sectionColor, onA
   return (
     <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
       <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+        {/* On iOS the scroll views below make room for the keyboard
+            themselves: they measure on screen, where this view's padding
+            came up short inside a page sheet. */}
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? undefined : 'height'} style={{ flex: 1 }}>
 
           <View style={m.header}>
             <Pressable onPress={onClose} hitSlop={10}>
@@ -114,7 +129,7 @@ export default function ScanMealModal({ section, sectionLabel, sectionColor, onA
               backLabel="Retake or add a note"
             />
           ) : (
-            <ScrollView contentContainerStyle={m.scroll} keyboardShouldPersistTaps="handled">
+            <ScrollView contentContainerStyle={m.scroll} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
               <View style={[m.intro, { borderColor: sectionColor + '40', backgroundColor: sectionColor + '0d' }]}>
                 <Text style={m.introIcon}>📸</Text>
                 <Text style={m.introText}>

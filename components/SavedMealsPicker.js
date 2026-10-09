@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   Modal, View, Text, TextInput, Pressable, ScrollView, Image, ActivityIndicator,
-  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, Alert,
+  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, Alert, Linking,
 } from 'react-native'
 import * as ImagePicker from 'expo-image-picker'
 import { uploadIngredientPhoto, deleteIngredientPhoto } from '../lib/photoStorage'
@@ -35,6 +35,9 @@ const MEAL_LABELS = [
   { key: 'snacks',  emoji: '🍎',  label: 'Snack' },
 ]
 const labelOf = key => MEAL_LABELS.find(l => l.key === key) ?? null
+
+// The photo URLs a saved meal's ingredients use.
+const photosOf = meal => new Set((meal?.ingredients ?? []).map(i => i.image).filter(Boolean))
 
 const fmtMult = m => (m === 0.25 ? '¼' : m === 0.5 ? '½' : m === 0.75 ? '¾' : m % 1 === 0 ? String(m) : m.toFixed(2).replace(/0+$/, ''))
 
@@ -177,7 +180,7 @@ function CreateView({
   ingredients, onIngredientsChange,
   note, onNoteChange,
   label, onLabelChange,
-  initialMeal, sectionColor, onIngredientPick, onIngredientPhoto, onViewPhoto, uploadingId, onSave, onCancel,
+  templateId, initialMeal, sectionColor, onIngredientPick, onIngredientPhoto, onViewPhoto, uploadingId, saving, onSave, onCancel,
 }) {
   const addIngredient = (type) => {
     onIngredientPick(type, (item) => {
@@ -192,9 +195,9 @@ function CreateView({
     })
   }
 
+  // Its picture stays in storage until the meal is saved without it: backing
+  // out keeps the saved meal, which still shows it.
   const removeIngredient = (id) => {
-    const gone = ingredients.find(i => i.id === id)
-    if (gone?.image) deleteIngredientPhoto(gone.image)
     onIngredientsChange(prev => prev.filter(i => i.id !== id))
   }
 
@@ -208,9 +211,11 @@ function CreateView({
   }, [ingredients])
 
   const handleSave = () => {
-    if (!name.trim()) return
+    if (!ready) return
     onSave({
-      id: initialMeal?.id || (Date.now().toString(36) + Math.random().toString(36).slice(2)),
+      // Made once when the editor opened, so a second tap can't make a
+      // second meal.
+      id: templateId,
       name: name.trim(),
       ingredients,
       note: note.trim(),
@@ -221,14 +226,19 @@ function CreateView({
     })
   }
 
-  const ready = name.trim().length > 0
+  // Not while a picture is still uploading (it would miss the save) or a
+  // save is already on its way.
+  const ready = name.trim().length > 0 && !uploadingId && !saving
   const trackedCount = ingredients.filter(i => i.macros).length
   const cal = Math.round(calculatedMacros.calories || 0)
 
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+    // On iOS the form's scroll view makes room for the keyboard itself: it
+    // measures on screen, where this view's padding came up short inside a
+    // page sheet.
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? undefined : 'height'} style={{ flex: 1 }}>
       <View style={s.header}>
-        <Pressable onPress={onCancel} hitSlop={10}>
+        <Pressable onPress={onCancel} hitSlop={10} disabled={saving}>
           <Text style={s.cancel}>{initialMeal ? '‹ Back' : 'Back'}</Text>
         </Pressable>
         <Text style={s.headerTitle}>{initialMeal ? 'Edit Meal' : 'New Saved Meal'}</Text>
@@ -241,7 +251,7 @@ function CreateView({
         </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={s.form} keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={s.form} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
         <View style={s.group}>
           <Text style={s.groupLabel}>MEAL NAME</Text>
           <TextInput
@@ -530,6 +540,13 @@ export default function SavedMealsPicker({
   const [adjusting, setAdjusting] = useState(null)         // the template being resized before it is added
   const [uploadingId, setUploadingId] = useState(null)   // ingredient whose photo is uploading
   const [photoViewer, setPhotoViewer] = useState(null)   // picture shown full size
+  const [templateId, setTemplateId] = useState(null)     // the meal's id, fixed when the editor opens
+  const [saving, setSaving] = useState(false)
+  const savingRef = useRef(false)
+  // Photos uploaded since the editor opened. Nothing leaves storage until the
+  // change is committed: a photo removed or replaced here is still what the
+  // saved meal shows if the user backs out.
+  const uploadsRef = useRef(new Set())
 
   const [ingFlow, setIngFlow] = useState(null)   // null | an ING_SOURCES key
   const [ingCallback, setIngCallback] = useState(null)
@@ -539,12 +556,21 @@ export default function SavedMealsPicker({
   const refresh = () => loadSaved().then(list => setMeals((list ?? []).filter(m => m?.kind !== 'snack')))
   useEffect(() => { refresh() }, [])
 
+  // Closing the whole picker mid-edit is backing out too. A save still on
+  // its way sorts out its own photos.
+  useEffect(() => () => {
+    if (!savingRef.current) uploadsRef.current.forEach(u => deleteIngredientPhoto(u))
+    uploadsRef.current = new Set()
+  }, [])
+
   const openCreate = () => {
     setPendingName('')
     setPendingIngredients([])
     setPendingNote('')
     // A new meal is labelled for the part of the day it is being made from.
     setPendingLabel(labelOf(section) ? section : null)
+    setTemplateId(Date.now().toString(36) + Math.random().toString(36).slice(2))
+    uploadsRef.current = new Set()
     setEditingMeal(null)
     setView('create')
   }
@@ -554,11 +580,18 @@ export default function SavedMealsPicker({
     setPendingIngredients(meal.ingredients || [])
     setPendingNote(meal.note || '')
     setPendingLabel(labelOf(meal.label) ? meal.label : null)
+    setTemplateId(meal.id)
+    uploadsRef.current = new Set()
     setEditingMeal(meal)
     setView('create')
   }
 
+  // Backing out leaves the saved meal as it was, so only photos uploaded in
+  // this edit, which it never used, are deleted.
   const cancelCreate = () => {
+    const kept = photosOf(editingMeal)
+    uploadsRef.current.forEach(u => { if (!kept.has(u)) deleteIngredientPhoto(u) })
+    uploadsRef.current = new Set()
     setView('list')
     setEditingMeal(null)
   }
@@ -583,22 +616,38 @@ export default function SavedMealsPicker({
   function pickIngredientPhoto(ing) {
     if (!userId) { Alert.alert('Not signed in', 'Sign in to add photos.'); return }
     const choose = async (fromCamera) => {
-      const perm = fromCamera
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync()
-      if (perm.status !== 'granted') {
-        Alert.alert('Permission needed', fromCamera ? 'Camera access is required to take a photo.' : 'Photo library access is required to pick a photo.')
+      let uri
+      try {
+        // Only the camera needs permission; the photo library's system
+        // picker hands over just the photo chosen.
+        if (fromCamera) {
+          const perm = await ImagePicker.requestCameraPermissionsAsync()
+          if (perm.status !== 'granted') {
+            // Refused for good, asking again does nothing: only Settings can
+            // turn it back on.
+            Alert.alert('Permission needed', 'Camera access is required to take a photo.', perm.canAskAgain === false ? [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Open Settings', onPress: () => Linking.openSettings().catch(() => {}) },
+            ] : undefined)
+            return
+          }
+        }
+        const res = fromCamera
+          ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.6 })
+          : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.6 })
+        uri = res.canceled ? null : res.assets?.[0]?.uri
+      } catch (e) {
+        Alert.alert(fromCamera ? 'Could not open the camera' : 'Could not open your photos', e?.message ?? 'Please try again.')
         return
       }
-      const res = fromCamera
-        ? await ImagePicker.launchCameraAsync({ mediaTypes: 'images', quality: 0.6 })
-        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: 'images', quality: 0.6 })
-      const uri = res.canceled ? null : res.assets?.[0]?.uri
       if (!uri) return
+      const session = uploadsRef.current
       setUploadingId(ing.id)
       try {
         const url = await uploadIngredientPhoto(userId, uri)
-        if (ing.image) deleteIngredientPhoto(ing.image)
+        // The editor was left while this uploaded, so nothing will show it.
+        if (session !== uploadsRef.current) { deleteIngredientPhoto(url); return }
+        session.add(url)
         setIngredientImage(ing.id, url)
       } catch (e) {
         Alert.alert('Could not add photo', e?.message ?? 'Please try again.')
@@ -609,7 +658,7 @@ export default function SavedMealsPicker({
     const buttons = ing.image
       ? [
           { text: 'Change photo', onPress: () => choose(false) },
-          { text: 'Remove photo', style: 'destructive', onPress: () => { deleteIngredientPhoto(ing.image); setIngredientImage(ing.id, null) } },
+          { text: 'Remove photo', style: 'destructive', onPress: () => setIngredientImage(ing.id, null) },
         ]
       : [
           { text: '📷  Take photo', onPress: () => choose(true) },
@@ -619,7 +668,24 @@ export default function SavedMealsPicker({
   }
 
   const handleSaveTemplate = async (meal) => {
-    await onSaveTemplate(meal)
+    if (savingRef.current) return
+    const session = uploadsRef.current
+    savingRef.current = true
+    setSaving(true)
+    try {
+      await onSaveTemplate(meal)
+    } catch {
+      // The owner has said why; the form stays as it was to try again.
+      return
+    } finally {
+      savingRef.current = false
+      setSaving(false)
+    }
+    // Saved: photos the meal no longer shows can go now, the old version's
+    // and any uploaded along the way.
+    const kept = photosOf(meal)
+    ;[...photosOf(editingMeal), ...session].forEach(u => { if (!kept.has(u)) deleteIngredientPhoto(u) })
+    uploadsRef.current = new Set()
     setPendingName('')
     setPendingIngredients([])
     setPendingNote('')
@@ -633,7 +699,11 @@ export default function SavedMealsPicker({
     Alert.alert('Delete Saved Meal', `Remove "${meal.name}"?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
-        await onDeleteTemplate(meal.id)
+        try {
+          await onDeleteTemplate(meal.id)
+        } catch {
+          return   // not deleted (the owner has said why), so its photos stay
+        }
         ;(meal.ingredients ?? []).forEach(i => { if (i.image) deleteIngredientPhoto(i.image) })
         refresh()
       } },
@@ -701,12 +771,14 @@ export default function SavedMealsPicker({
               onNoteChange={setPendingNote}
               label={pendingLabel}
               onLabelChange={setPendingLabel}
+              templateId={templateId}
               initialMeal={editingMeal}
               sectionColor={sectionColor}
               onIngredientPick={pickIngredient}
               onIngredientPhoto={pickIngredientPhoto}
               onViewPhoto={setPhotoViewer}
               uploadingId={uploadingId}
+              saving={saving}
               onSave={handleSaveTemplate}
               onCancel={cancelCreate}
             />

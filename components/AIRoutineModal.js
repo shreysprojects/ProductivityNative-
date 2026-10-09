@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, Modal, ScrollView,
   TextInput, ActivityIndicator, Alert, Platform, KeyboardAvoidingView, Animated,
@@ -59,7 +59,13 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
   const currentQ = survey[step]
   const totalSteps = survey.length
 
+  // Each request takes a number, and closing, reopening or unmounting the
+  // sheet moves it on: a reply that arrives after the user has left is
+  // dropped instead of rewriting their routine behind their back.
+  const requestRef = useRef(0)
+
   useEffect(() => {
+    requestRef.current += 1
     if (visible) {
       setPhase(hasExisting ? 'choice' : 'survey')
       setStep(0)
@@ -69,6 +75,8 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
       setAdviceText('')
     }
   }, [visible]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => { requestRef.current += 1 }, [])
 
   function goToSurvey() {
     setStep(0)
@@ -99,16 +107,20 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
   }
 
   async function submitCreate(finalAnswers) {
+    const req = ++requestRef.current
+    const stale = () => req !== requestRef.current
     setPhase('loading')
     const surveyQA = survey.map((q, i) => ({ q: q.q, answer: String(finalAnswers[i] ?? 'not specified') }))
     try {
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'create_routine', routineName, surveyQA },
       })
+      if (stale()) return
       if (error) {
         // Limits/flags come back as non-2xx, so the reason is on the error body.
         let detail = null
         try { detail = await error.context?.json() } catch {}
+        if (stale()) return
         if (detail?.error === 'daily_limit') {
           setPhase('survey')
           Alert.alert('Daily limit reached', detail.reason)
@@ -138,25 +150,50 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
       }
       const tasks = data?.tasks ?? []
       if (!tasks.length) throw new Error('No tasks were generated')
-      onApplyTasks(tasks)
-      onClose()
+      const replacing = existingTasks?.length ?? 0
+      if (replacing === 0) {
+        onApplyTasks(tasks)
+        onClose()
+        return
+      }
+      // The new list takes the place of the current one, so ask first.
+      Alert.alert(
+        `Replace ${replacing} task${replacing !== 1 ? 's' : ''}?`,
+        `Your new ${routineName} routine will replace the tasks you have now.`,
+        [
+          { text: 'Cancel', style: 'cancel', onPress: () => { if (!stale()) setPhase('choice') } },
+          {
+            text: 'Replace', style: 'destructive',
+            onPress: () => {
+              if (stale()) return
+              onApplyTasks(tasks)
+              onClose()
+            },
+          },
+        ],
+      )
     } catch (e) {
+      if (stale()) return
       setPhase('survey')
       Alert.alert('Something went wrong', e.message ?? 'Please try again.')
     }
   }
 
   async function getAdvice() {
+    const req = ++requestRef.current
+    const stale = () => req !== requestRef.current
     setPhase('loading')
     const tasks = (existingTasks ?? []).map(t => ({ text: t.text }))
     try {
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'advise_routine', routineName, tasks },
       })
+      if (stale()) return
       if (error) {
         // Limits/flags come back as non-2xx, so the reason is on the error body.
         let detail = null
         try { detail = await error.context?.json() } catch {}
+        if (stale()) return
         if (detail?.error === 'daily_limit') {
           setPhase('choice')
           Alert.alert('Daily limit reached', detail.reason)
@@ -184,6 +221,7 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
       setAdviceText(advice)
       setPhase('advice')
     } catch (e) {
+      if (stale()) return
       setPhase('choice')
       Alert.alert('Something went wrong', e.message ?? 'Please try again.')
     }

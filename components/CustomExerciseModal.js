@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import {
   Modal, View, Text, TextInput, Pressable, ScrollView, StyleSheet,
   KeyboardAvoidingView, Platform, SafeAreaView, ActivityIndicator, Alert,
 } from 'react-native'
-import { MUSCLE_OPTIONS, suggestMuscles } from '../lib/customExercises'
+import { MUSCLE_OPTIONS, suggestMuscles, isYouTubeId } from '../lib/customExercises'
 import ExerciseVideo from './ExerciseVideo'
 
 // Create (or edit) one of the user's own exercises: a name, an optional
@@ -16,6 +16,8 @@ const SECONDARY = '#0ea5e9'
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2) }
 
+const norm = s => String(s ?? '').trim().toLowerCase()
+
 export default function CustomExerciseModal({ initial, onSave, onDelete, onClose }) {
   const [name, setName] = useState(initial?.name ?? '')
   const [description, setDescription] = useState(initial?.description ?? '')
@@ -27,8 +29,13 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
   })
   const [aiBusy, setAiBusy] = useState(false)
   const [aiNote, setAiNote] = useState(null)
-  // A YouTube demo the AI step found once it recognised the exercise.
-  const [video, setVideo] = useState(initial?.video ?? null)
+  // A YouTube demo the AI step found once it recognised the exercise. It
+  // belongs to the name it was found for: renaming drops it, and asking the
+  // AI again replaces it, or clears it when nothing is found this time.
+  const [video, setVideo] = useState(isYouTubeId(initial?.video?.id) ? initial.video : null)
+  const videoFor = useRef(norm(initial?.name))
+  // A second tap on Add before the sheet closed saved the exercise twice.
+  const saved = useRef(false)
 
   const primary = MUSCLE_OPTIONS.filter(n => picks[n] === 'primary')
   const secondary = MUSCLE_OPTIONS.filter(n => picks[n] === 'secondary')
@@ -45,12 +52,19 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
     })
   }
 
+  function rename(text) {
+    setName(text)
+    if (video && norm(text) !== videoFor.current) setVideo(null)
+  }
+
   async function askAI() {
     if (!name.trim()) { Alert.alert('Name it first', 'Type the exercise name so the AI knows what to look at.'); return }
     setAiBusy(true)
     setAiNote(null)
     try {
       const data = await suggestMuscles({ name: name.trim(), description: description.trim() })
+      videoFor.current = norm(name)
+      setVideo(isYouTubeId(data?.video?.id) ? { id: data.video.id, title: String(data.video.title ?? '') } : null)
       const p = Array.isArray(data?.primary) ? data.primary : []
       const s = Array.isArray(data?.secondary) ? data.secondary : []
       if (p.length === 0 && s.length === 0) {
@@ -62,7 +76,6 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
       for (const n of s) if (MUSCLE_OPTIONS.includes(n) && !m[n]) m[n] = 'secondary'
       setPicks(m)
       setAiNote(data?.note || 'Filled in by AI. Adjust anything that looks off.')
-      if (data?.video?.id) setVideo({ id: String(data.video.id), title: String(data.video.title ?? '') })
     } catch (e) {
       Alert.alert('Could not ask AI', String(e?.message ?? e))
     } finally {
@@ -71,8 +84,10 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
   }
 
   function save() {
+    if (saved.current) return
     if (!name.trim()) { Alert.alert('Name the exercise'); return }
     if (primary.length === 0) { Alert.alert('Pick the main muscle', 'Tap at least one muscle once so it counts as the main one.'); return }
+    saved.current = true
     onSave({
       id: initial?.id ?? genId(),
       name: name.trim(),
@@ -108,7 +123,7 @@ export default function CustomExerciseModal({ initial, onSave, onDelete, onClose
               placeholder='e.g. "Bayesian curl"'
               placeholderTextColor="#bbb"
               value={name}
-              onChangeText={setName}
+              onChangeText={rename}
               returnKeyType="next"
               autoFocus={!initial}
             />

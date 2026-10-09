@@ -18,14 +18,33 @@ import { WebView } from '@expo/dom-webview'
 // embed arrives from youtube.com and plays.
 //
 // The embed page pings back once loaded; if no ping arrives the box says so
-// and offers YouTube instead of sitting black. The webview cannot open new
-// windows, so links out of the player are caught and handed to the phone.
+// and offers another try or YouTube instead of sitting black. The webview
+// cannot open new windows, so links out of the player are caught and handed
+// to the phone, YouTube's own only.
 // @expo/dom-webview ships with SDK 57, so none of this needs a native rebuild.
 
 const COLOR = '#6366f1'
 const LOAD_TIMEOUT_MS = 10000
 const BOOTSTRAP_URL = 'https://www.youtube.com/robots.txt'
 const embedUrl = id => `https://www.youtube.com/embed/${id}?playsinline=1&rel=0&autoplay=1`
+
+// A YouTube video id is exactly 11 of these characters. Anything else (a
+// path like "../../redirect?q=…") would point the player somewhere else.
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/
+
+// Only YouTube's own pages may leave the app from the player. Any frame
+// inside it (an ad, another embed) can post a message, and must not be able
+// to send the phone to any site it likes. The parsed, re-serialised URL is
+// what opens, so the host that was checked is the host that loads.
+const YOUTUBE_HOSTS = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be']
+function youTubeLink(raw) {
+  try {
+    const u = new URL(String(raw ?? ''))
+    const web = u.protocol === 'https:' || u.protocol === 'http:'
+    if (web && YOUTUBE_HOSTS.includes(u.hostname) && !u.username && !u.password) return u.href
+  } catch {}
+  return null
+}
 
 // Runs before the bootstrap page renders: hop to the embed straight away.
 const hopScript = url => `
@@ -55,20 +74,33 @@ const PAGE_SCRIPT = `
 true;
 `
 
+// Keyed by the video, so a newly found one starts from its thumbnail instead
+// of inheriting the last one's "couldn't load".
 export default function ExerciseVideo({ videoId, height = 210, style }) {
+  if (typeof videoId !== 'string' || !VIDEO_ID.test(videoId)) return null
+  return <Player key={videoId} videoId={videoId} height={height} style={style} />
+}
+
+function Player({ videoId, height, style }) {
   const [playing, setPlaying] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [failed, setFailed] = useState(false)
+  // Bumped by "Try again", so the new attempt gets its own timeout.
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     if (!playing || loaded) return
     const t = setTimeout(() => setFailed(true), LOAD_TIMEOUT_MS)
     return () => clearTimeout(t)
-  }, [playing, loaded])
+  }, [playing, loaded, attempt])
 
-  if (!videoId) return null
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}`
   const open = url => Linking.openURL(url).catch(() => {})
+  const retry = () => {
+    setFailed(false)
+    setLoaded(false)
+    setAttempt(n => n + 1)
+  }
 
   return (
     <View style={style}>
@@ -88,9 +120,14 @@ export default function ExerciseVideo({ videoId, height = 210, style }) {
         ) : failed ? (
           <View style={[v.fill, v.failWrap]}>
             <Text style={v.failText}>The player couldn't load here.</Text>
-            <Pressable style={v.failBtn} onPress={() => open(watchUrl)}>
-              <Text style={v.failBtnText}>Watch on YouTube</Text>
-            </Pressable>
+            <View style={v.failRow}>
+              <Pressable style={v.retryBtn} onPress={retry}>
+                <Text style={v.failBtnText}>Try again</Text>
+              </Pressable>
+              <Pressable style={v.failBtn} onPress={() => open(watchUrl)}>
+                <Text style={v.failBtnText}>Watch on YouTube</Text>
+              </Pressable>
+            </View>
           </View>
         ) : (
           <View style={v.fill}>
@@ -105,8 +142,9 @@ export default function ExerciseVideo({ videoId, height = 210, style }) {
               injectedJavaScript={PAGE_SCRIPT}
               onMessage={e => {
                 const data = e?.nativeEvent?.data
-                if (data === '__loaded__') setLoaded(true)
-                else if (/^https?:\/\//.test(String(data ?? ''))) open(data)
+                if (data === '__loaded__') { setLoaded(true); return }
+                const link = youTubeLink(data)
+                if (link) open(link)
               }}
             />
             {!loaded && (
@@ -137,6 +175,8 @@ const v = StyleSheet.create({
   spinner: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', backgroundColor: '#000' },
   failWrap: { alignItems: 'center', justifyContent: 'center', gap: 10, padding: 16 },
   failText: { color: '#ddd', fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  failRow: { flexDirection: 'row', gap: 10 },
+  retryBtn: { backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 },
   failBtn: { backgroundColor: '#ff0000', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 8 },
   failBtnText: { color: '#fff', fontWeight: '800', fontSize: 13 },
   openBtn: { alignSelf: 'flex-start', paddingVertical: 8, paddingHorizontal: 2 },

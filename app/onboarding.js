@@ -1,8 +1,11 @@
 import { useState, useMemo } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView, TextInput,
-  KeyboardAvoidingView, Platform, SafeAreaView,
+  KeyboardAvoidingView, Platform,
 } from 'react-native'
+// React Native's own SafeAreaView pads only on iOS; this one pads on Android
+// too, where the progress bar sat under the status bar.
+import { SafeAreaView } from 'react-native-safe-area-context'
 import { router } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
@@ -10,7 +13,7 @@ import {
   calculateGoals, generateGymSplit,
   ACTIVITY_LABELS, GOAL_LABELS,
 } from '../lib/goals'
-import { saveUserGoals } from '../lib/goalsStorage'
+import { getUserGoals, saveUserGoals } from '../lib/goalsStorage'
 import { saveGymSplit } from '../lib/storage'
 import { saveSections, FOCUS_PRESETS } from '../lib/sectionsStorage'
 import { seedStarterWorkouts } from '../lib/starterWorkouts'
@@ -19,6 +22,14 @@ import { muscleColor, muscleTextColor } from '../lib/splitData'
 const ACCENT = '#6366f1'
 const TOTAL_STEPS = 6  // steps 1–6; step 0 = welcome (no bar)
 const DAY_ABBR = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+
+// A typed weight in the other unit, or the text as it was when it isn't one.
+// Switching units converts what is typed: 75 kg used to become "75 lbs".
+function convertWeight(text, toUnit) {
+  const w = parseFloat(text)
+  if (!(w > 0)) return text
+  return String(toUnit === 'kg' ? +(w * 0.453592).toFixed(1) : +(w / 0.453592).toFixed(1))
+}
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
@@ -162,15 +173,44 @@ export default function Onboarding() {
     setIsCustom(v => !v)
   }
 
+  function switchWeightUnit(next) {
+    if (next === weightUnit) return
+    setWeightVal(v => convertWeight(v, next))
+    setWeightUnit(next)
+  }
+
+  function switchTargetUnit(next) {
+    if (next === targetWeightUnit) return
+    setTargetWeightVal(v => convertWeight(v, next))
+    setTargetWeightUnit(next)
+  }
+
+  // Feet and inches are filled in from centimetres and back. Switching used
+  // to show empty boxes, and carrying on from them saved no height at all.
+  function switchHeightMode(next) {
+    if (next === heightMode) return
+    if (next === 'ft') {
+      const inches = Math.round((parseFloat(heightCm) || 0) / 2.54)
+      setHeightFt(inches > 0 ? String(Math.floor(inches / 12)) : '')
+      setHeightIn(inches > 0 ? String(inches % 12) : '')
+    } else {
+      setHeightCm(heightCmVal ? String(Math.round(heightCmVal)) : '')
+    }
+    setHeightMode(next)
+  }
+
   // Navigation
   function next() { setStep(s => s + 1) }
   function back() { setStep(s => s - 1) }
 
+  // Leaving early keeps whatever goals the account already has. Both exits
+  // used to save a blank set over them — weight, targets and split all gone.
   async function handleSkip() {
     if (!user || saving) return
     setSaving(true)
     await saveSections(user.id, FOCUS_PRESETS[focus ?? 'all'])
-    await saveUserGoals(user.id, { onboardingDone: true, fitnessGoal: 'none', skipped: true })
+    const existing = await getUserGoals(user.id)
+    await saveUserGoals(user.id, { ...(existing ?? { fitnessGoal: 'none', skipped: true }), onboardingDone: true })
     setSaving(false)
     router.replace('/(tabs)')
   }
@@ -179,7 +219,14 @@ export default function Onboarding() {
     if (!user || saving) return
     setSaving(true)
     await saveSections(user.id, FOCUS_PRESETS[focus ?? 'all'])
-    await saveUserGoals(user.id, { onboardingDone: true, fitnessGoal: 'none' })
+    const existing = await getUserGoals(user.id)
+    await saveUserGoals(user.id, {
+      ...existing,
+      // The body stats from the step before are kept too.
+      weightKg, heightCm: heightCmVal, age: parseInt(age), sex,
+      fitnessGoal: 'none',
+      onboardingDone: true,
+    })
     setSaving(false)
     router.replace('/(tabs)')
   }
@@ -299,13 +346,13 @@ export default function Onboarding() {
               onChangeText={setWeightVal}
               keyboardType="decimal-pad"
             />
-            <UnitToggle value={weightUnit} options={['lbs','kg']} onChange={setWeightUnit} theme={theme} />
+            <UnitToggle value={weightUnit} options={['lbs','kg']} onChange={switchWeightUnit} theme={theme} />
           </View>
 
           {/* Height */}
           <FieldLabel theme={theme}>Height</FieldLabel>
           <View style={[ob.inputRow, { marginBottom: 4 }]}>
-            <UnitToggle value={heightMode} options={['ft','cm']} onChange={setHeightMode} theme={theme} />
+            <UnitToggle value={heightMode} options={['ft','cm']} onChange={switchHeightMode} theme={theme} />
           </View>
           {heightMode === 'ft' ? (
             <View style={ob.inputRow}>
@@ -380,7 +427,7 @@ export default function Onboarding() {
           </View>
 
           <Text style={[ob.disclaimer, { color: theme.muted }]}>
-            Used only for calorie calculations. Not stored or shared.
+            Saved to your account to calculate your targets. Never shared, unless you choose to show your age or gender on a post.
           </Text>
         </ScrollView>
 
@@ -449,7 +496,7 @@ export default function Onboarding() {
                 onChangeText={setTargetWeightVal}
                 keyboardType="decimal-pad"
               />
-              <UnitToggle value={targetWeightUnit} options={['lbs', 'kg']} onChange={setTargetWeightUnit} theme={theme} />
+              <UnitToggle value={targetWeightUnit} options={['lbs', 'kg']} onChange={switchTargetUnit} theme={theme} />
             </View>
             {targetWeightKg ? (
               <Text style={[ob.targetNote, { color: theme.muted }]}>

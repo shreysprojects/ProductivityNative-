@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   View, Text, Pressable, ScrollView, Modal, TextInput,
-  StyleSheet, KeyboardAvoidingView, Platform, Switch, Alert,
+  StyleSheet, KeyboardAvoidingView, Platform, Switch, Alert, AppState,
 } from 'react-native'
 import * as Clipboard from 'expo-clipboard'
 import { useFocusEffect } from 'expo-router'
@@ -16,12 +16,17 @@ import {
 // clearable exactly like anything you typed.
 const AUTO_ICON = { routine: '✅', class: '🎓' }
 
+function localToday() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
 // One row per time slot for a single day. Tapping a slot opens a sheet to
 // write what you were doing. Slots that haven't happened yet can't be logged.
 // `refreshKey` re-reads the day when something outside this component writes
-// to the log.
+// to the log. `onEditingChange` hears when the slot sheet opens and closes.
 export default function DayLogTimeline({
-  userId, day, todayStr, settings, onCountsChange, headerRight, refreshKey = 0, onImported,
+  userId, day, settings, onCountsChange, headerRight, refreshKey = 0, onImported, onEditingChange,
 }) {
   const { theme } = useTheme()
 
@@ -33,7 +38,12 @@ export default function DayLogTimeline({
 
   const scrollRef = useRef(null)
   const didAutoScroll = useRef(false)
+  const writing = useRef(0) // saves and clears still on their way to storage
 
+  // Today comes off the clock on every render, like "now" — the tick below
+  // re-renders each minute, so a timeline left open past midnight sees the
+  // new day instead of locking every slot of the old one.
+  const todayStr    = localToday()
   const isToday     = day === todayStr
   const dayIsFuture = day > todayStr // 'YYYY-MM-DD' sorts lexicographically
   const slots       = slotStarts(settings)
@@ -45,16 +55,24 @@ export default function DayLogTimeline({
 
   useEffect(() => { load() }, [load])
   useEffect(() => { didAutoScroll.current = false }, [day])
+  useEffect(() => {
+    if (editing === null) return
+    onEditingChange?.(true)
+    return () => onEditingChange?.(false)
+  }, [editing])
 
   // Keep "now" fresh so the current slot unlocks as the day moves on. Runs
   // under useFocusEffect rather than useEffect: expo-router keeps the screen
   // mounted behind other tabs, and this tick has no business re-rendering a
   // timeline nobody is looking at. The immediate tick on refocus catches
-  // "now" up after time away instead of showing a stale slot for a minute.
+  // "now" up after time away instead of showing a stale slot for a minute —
+  // and so does coming back to the app, since timers don't run in the
+  // background.
   useFocusEffect(useCallback(() => {
     setTick(t => t + 1)
     const id = setInterval(() => setTick(t => t + 1), 60000)
-    return () => clearInterval(id)
+    const sub = AppState.addEventListener('change', s => { if (s === 'active') setTick(t => t + 1) })
+    return () => { clearInterval(id); sub.remove() }
   }, []))
 
   const filled = slots.filter(s => entries[s]).length
@@ -71,21 +89,52 @@ export default function DayLogTimeline({
     setEditing(slot)
   }
 
-  async function save() {
+  // The row changes the moment you tap; the write, and its upload, follow
+  // behind. Once the last write in flight is stored the day settles on what
+  // storage holds — a re-read that landed while a write waited its turn could
+  // have shown the row without it.
+  async function persist(slot, entry) {
+    setEntries(prev => {
+      const next = { ...prev }
+      if (entry) next[slot] = entry
+      else delete next[slot]
+      return next
+    })
+    writing.current++
+    let stored = null
+    try {
+      stored = entry
+        ? await saveTimeLog(userId, day, slot, entry.text, entry.kind)
+        : await deleteTimeLog(userId, day, slot)
+    } catch {}
+    if (--writing.current > 0) return
+    if (stored) setEntries({ ...stored })
+    else load()
+  }
+
+  function save() {
     const slot = editing
     const text = draft.trim()
     setEditing(null)
     // An empty, non-break entry means "nothing here" — clear it instead.
-    const next = (!text && !isBreak)
-      ? await deleteTimeLog(userId, day, slot)
-      : await saveTimeLog(userId, day, slot, text, isBreak ? 'break' : 'log')
-    setEntries({ ...next })
+    persist(slot, (!text && !isBreak) ? null : { text, kind: isBreak ? 'break' : 'log' })
   }
 
-  async function clear() {
+  function clear() {
     const slot = editing
     setEditing(null)
-    setEntries({ ...(await deleteTimeLog(userId, day, slot)) })
+    persist(slot, null)
+  }
+
+  // Closing the sheet without saving (backdrop, back button) asks first when
+  // there's typed text that hasn't been saved.
+  function dismiss() {
+    const text = draft.trim()
+    if (!text || text === (entries[editing]?.text ?? '')) { setEditing(null); return }
+    Alert.alert('Discard this entry?', "What you typed hasn't been saved.", [
+      { text: 'Keep editing', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: () => setEditing(null) },
+    ])
   }
 
   // One-tap migration from the standalone TimeLog app: its Settings screen
@@ -207,9 +256,9 @@ export default function DayLogTimeline({
         </Pressable>
       </ScrollView>
 
-      <Modal visible={editing !== null} transparent animationType="slide" onRequestClose={() => setEditing(null)}>
+      <Modal visible={editing !== null} transparent animationType="slide" onRequestClose={dismiss}>
         <KeyboardAvoidingView style={st.modalWrap} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <Pressable style={{ flex: 1 }} onPress={() => setEditing(null)} />
+          <Pressable style={{ flex: 1 }} onPress={dismiss} />
           <View style={[st.sheet, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
             <Text style={[st.sheetTitle, { color: theme.text }]}>
               {editing !== null ? `${minsToLabel(editing)} – ${minsToLabel(editing + settings.interval)}` : ''}

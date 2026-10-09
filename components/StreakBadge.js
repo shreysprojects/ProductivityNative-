@@ -1,7 +1,8 @@
 import { View, Text, StyleSheet } from 'react-native'
 
 export default function StreakBadge({ streak }) {
-  if (streak.current === 0) return null
+  // The streak can be unknown (null) when it couldn't be read: show nothing.
+  if (!streak?.current) return null
   return (
     <View style={s.badge}>
       <Text style={s.fire}>🔥</Text>

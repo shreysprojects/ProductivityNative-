@@ -4,7 +4,7 @@ import {
   KeyboardAvoidingView, Platform, ScrollView, Alert, ActivityIndicator,
 } from 'react-native'
 const BIO_MAX = 120
-import { router } from 'expo-router'
+import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { checkUsernameAvailable, upsertProfile } from '../../lib/profileStorage'
 
@@ -16,16 +16,24 @@ function validateUsernameFormat(u) {
 }
 
 export default function CompleteProfile() {
-  const { user, refreshProfile } = useAuth()
-  const [username, setUsername] = useState('')
+  const { user, profile, profileLoading, profileError, profileSetupError, refreshProfile } = useAuth()
+  const params = useLocalSearchParams()
+  // The username chosen at sign-up, when verification could not save it.
+  const [username, setUsername] = useState(() => String(profile?.username || params.username || ''))
   const [bio, setBio] = useState('')
   const [age, setAge] = useState('')
   const [usernameStatus, setUsernameStatus] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [retrying, setRetrying] = useState(false)
   const timerRef = useRef(null)
+  // What is in the box now. A slow answer about an earlier spelling used to
+  // land late and mark the current one "available".
+  const latestUsername = useRef('')
+  const userId = user?.id ?? null
 
   useEffect(() => {
     const normalized = username.toLowerCase().trim()
+    latestUsername.current = normalized
     if (!normalized) { setUsernameStatus(null); return }
 
     if (validateUsernameFormat(normalized) !== 'valid') {
@@ -36,11 +44,13 @@ export default function CompleteProfile() {
     setUsernameStatus('checking')
     clearTimeout(timerRef.current)
     timerRef.current = setTimeout(async () => {
-      const ok = await checkUsernameAvailable(normalized)
+      // Your own username (a profile already part set up) is not "taken".
+      const ok = await checkUsernameAvailable(normalized, userId)
+      if (latestUsername.current !== normalized) return
       setUsernameStatus(ok ? 'available' : 'taken')
     }, 500)
     return () => clearTimeout(timerRef.current)
-  }, [username])
+  }, [username, userId])
 
   function hintText() {
     if (!username) return null
@@ -56,8 +66,17 @@ export default function CompleteProfile() {
     return null
   }
 
+  // A profile that could not be read is not known to be empty, and saving
+  // over it could wipe a bio or photo it already has.
+  const profileUnknown = profileLoading || (!!profileError && !profile)
+
+  async function retryLoad() {
+    setRetrying(true)
+    try { await refreshProfile() } finally { setRetrying(false) }
+  }
+
   async function handleSave() {
-    if (!user) return
+    if (!user || profileUnknown) return
     if (usernameStatus !== 'available') return
     const parsedAge = age ? parseInt(age, 10) : null
     if (parsedAge !== null && parsedAge < 13) {
@@ -67,10 +86,13 @@ export default function CompleteProfile() {
     setSaving(true)
     try {
       const validAge = parsedAge && parsedAge >= 13 && parsedAge < 120 ? parsedAge : null
+      // Fills in only what is empty. The account may already have a profile
+      // (sign-up creates one, and a Google or Apple one has no username yet):
+      // a blank field here keeps its bio, and its photo is never touched.
       await upsertProfile(user.id, {
         username: username.toLowerCase().trim(),
-        bio: bio.trim(),
-        avatar_url: '',
+        bio: bio.trim() || profile?.bio || '',
+        avatar_url: profile?.avatar_url || '',
         age: validAge,
       })
       await refreshProfile()
@@ -83,7 +105,7 @@ export default function CompleteProfile() {
   }
 
   const hint = hintText()
-  const canSave = usernameStatus === 'available' && !saving
+  const canSave = usernameStatus === 'available' && !saving && !profileUnknown
 
   return (
     <KeyboardAvoidingView style={s.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -95,6 +117,21 @@ export default function CompleteProfile() {
         <Text style={s.emoji}>👤</Text>
         <Text style={s.title}>Set up your profile</Text>
         <Text style={s.sub}>Choose a username to get started</Text>
+
+        {profileSetupError ? <Text style={s.notice}>{profileSetupError}</Text> : null}
+
+        {!!profileError && !profile && (
+          <View style={s.errorBox}>
+            <Text style={s.errorText}>
+              We couldn't load your profile. Check your connection and try again.
+            </Text>
+            <Pressable onPress={retryLoad} disabled={retrying} hitSlop={8}>
+              {retrying
+                ? <ActivityIndicator color="#8b8bf0" />
+                : <Text style={s.retryText}>Retry</Text>}
+            </Pressable>
+          </View>
+        )}
 
         <TextInput
           style={[s.input, hint ? { marginBottom: 4 } : null]}
@@ -160,6 +197,18 @@ const s = StyleSheet.create({
     fontSize: 15, color: 'rgba(255,255,255,0.45)',
     textAlign: 'center', marginBottom: 36, fontWeight: '500',
   },
+  notice: {
+    fontSize: 13, lineHeight: 19, fontWeight: '600', color: '#fbbf24',
+    textAlign: 'center', marginTop: -20, marginBottom: 24,
+  },
+  errorBox: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: 'rgba(239,68,68,0.12)', borderRadius: 14,
+    borderWidth: 1, borderColor: 'rgba(239,68,68,0.35)',
+    paddingHorizontal: 14, paddingVertical: 12, marginBottom: 16,
+  },
+  errorText: { flex: 1, fontSize: 13, lineHeight: 18, fontWeight: '600', color: '#fca5a5' },
+  retryText: { fontSize: 14, fontWeight: '800', color: '#8b8bf0' },
   input: {
     backgroundColor: 'rgba(255,255,255,0.08)',
     borderRadius: 14, paddingHorizontal: 16, paddingVertical: 15,

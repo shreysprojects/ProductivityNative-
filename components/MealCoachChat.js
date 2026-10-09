@@ -41,7 +41,8 @@ import { askMealCoach } from '../lib/aiMealPlan'
 import { getUserGoals } from '../lib/goalsStorage'
 import { getMealPlan } from '../lib/mealPlanStorage'
 import { compactPlan, planMealCount, dayKeyOf, sumPlanMacros } from '../lib/mealPlan'
-import { getMeals, getRecentNutritionSummary, getRecentLoggedMeals, today } from '../lib/storage'
+import { getRecentNutritionSummary, getRecentLoggedMeals, today } from '../lib/storage'
+import { supabase } from '../lib/supabase'
 import { derivedSource } from '../lib/foodSource'
 
 // The meal coach: a chat about the user's plan and what they eat. Every
@@ -73,9 +74,21 @@ export default function MealCoachChat({ visible, onClose, userId }) {
   const keyboardInset = useKeyboardInset(visible, insets.bottom)
   // Bumped when the sheet closes so a reply to an abandoned question is ignored.
   const runRef = useRef(0)
+  // The question still waiting on a reply, and its request. Closing the
+  // sheet cancels the request and puts the question back in the box, so it
+  // isn't lost with the reply.
+  const pendingRef = useRef(null)
+  const abortRef = useRef(null)
+
+  useEffect(() => () => abortRef.current?.abort(), [])
 
   useEffect(() => {
-    if (!visible) { runRef.current++; return }
+    if (!visible) {
+      runRef.current++
+      abortRef.current?.abort()
+      if (pendingRef.current) { setInput(pendingRef.current); pendingRef.current = null }
+      return
+    }
     setBusy(false)
     AsyncStorage.getItem(storageKey(userId))
       .then(raw => {
@@ -93,7 +106,7 @@ export default function MealCoachChat({ visible, onClose, userId }) {
   // the same context the coach gets.
   function summarize(ctx) {
     const dayKey = dayKeyOf(today())
-    const logged = Math.round(sumPlanMacros(ctx.today?.meals ?? []).calories || 0)
+    const logged = Array.isArray(ctx.today?.meals) ? Math.round(sumPlanMacros(ctx.today.meals).calories || 0) : null
     let planned = null
     if (ctx.plan) {
       const byId = new Map(ctx.plan.meals.map(m => [m.id, m]))
@@ -111,6 +124,19 @@ export default function MealCoachChat({ visible, onClose, userId }) {
 
   const persist = list => AsyncStorage.setItem(storageKey(userId), JSON.stringify(list.slice(-MAX_KEPT))).catch(() => {})
 
+  // Today's log, or null when it can't be read. getMeals() reads a failed
+  // fetch as an empty day, which told the coach nothing had been eaten.
+  async function readTodayMeals(date) {
+    try {
+      const { data, error } = await supabase
+        .from('meals').select('meals').eq('user_id', userId).eq('date', date).maybeSingle()
+      if (error) return null
+      return Array.isArray(data?.meals) ? data.meals : []
+    } catch {
+      return null
+    }
+  }
+
   // Fresh numbers for every question. A source that fails is left out
   // rather than blocking the answer.
   async function gatherContext() {
@@ -118,7 +144,7 @@ export default function MealCoachChat({ visible, onClose, userId }) {
     const [goals, plan, todayMeals, week, recentDays] = await Promise.all([
       getUserGoals(userId).catch(() => null),
       getMealPlan(userId).catch(() => null),
-      getMeals(userId, todayStr).catch(() => []),
+      readTodayMeals(todayStr),
       getRecentNutritionSummary(userId).catch(() => []),
       getRecentLoggedMeals(userId).catch(() => []),
     ])
@@ -128,10 +154,11 @@ export default function MealCoachChat({ visible, onClose, userId }) {
     return {
       goals,
       plan: plan && planMealCount(plan.days) > 0 ? compactPlan(plan) : null,
-      today: {
-        date: todayStr,
-        meals: (todayMeals ?? []).map(food),
-      },
+      // An unreadable log still carries the date (the coach finds today's
+      // planned day by it) and says it is unavailable, not empty.
+      today: todayMeals
+        ? { date: todayStr, meals: todayMeals.map(food) }
+        : { date: todayStr, unavailable: true },
       week,
       // Earlier days this week, per food. Today is sent above.
       recent: (recentDays ?? [])
@@ -148,19 +175,26 @@ export default function MealCoachChat({ visible, onClose, userId }) {
     setMessages(withQuestion)
     setInput('')
     setBusy(true)
+    pendingRef.current = content
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
     try {
       const ctx = await gatherContext()
+      if (run !== runRef.current) return
       setSnapshot(summarize(ctx))
       const { reply } = await askMealCoach({
         ...ctx,
         messages: withQuestion.slice(-12).map(m => ({ role: m.role, content: m.content })),
-      })
+      }, { signal: ctrl.signal })
       if (run !== runRef.current) return
+      pendingRef.current = null
       const done = [...withQuestion, { id: newId(), role: 'assistant', content: String(reply ?? '').trim() }]
       setMessages(done)
       persist(done)
     } catch (e) {
-      if (run !== runRef.current) return
+      // Cancelled because the sheet went away: nothing to tell anyone.
+      if (run !== runRef.current || e?.name === 'AbortError') return
+      pendingRef.current = null
       // The question goes back into the box so it is not lost.
       setMessages(messages)
       setInput(content)
@@ -191,8 +225,9 @@ export default function MealCoachChat({ visible, onClose, userId }) {
               <Text style={[c.headerBtn, { color: theme.accent }]}>Done</Text>
             </Pressable>
             <Text style={[c.headerTitle, { color: theme.text }]}>✦ Meal Coach</Text>
-            <Pressable onPress={clearChat} hitSlop={10} style={[c.headerSide, { alignItems: 'flex-end' }]} disabled={!messages.length}>
-              <Text style={[c.headerBtn, { color: messages.length ? theme.muted : 'transparent' }]}>Clear</Text>
+            {/* Not while a reply is on its way: it would bring the cleared thread back. */}
+            <Pressable onPress={clearChat} hitSlop={10} style={[c.headerSide, { alignItems: 'flex-end' }]} disabled={!messages.length || busy}>
+              <Text style={[c.headerBtn, { color: messages.length ? theme.muted : 'transparent', opacity: busy ? 0.4 : 1 }]}>Clear</Text>
             </Pressable>
           </View>
 
@@ -201,7 +236,7 @@ export default function MealCoachChat({ visible, onClose, userId }) {
               <Text style={[c.snapshotLabel, { color: theme.muted }]}>THE COACH SEES</Text>
               <View style={c.snapshotRow}>
                 <Text style={[c.snapshotItem, { color: theme.text }]}>
-                  Logged today <Text style={c.snapshotNum}>{snapshot.logged.toLocaleString()}</Text> kcal
+                  Logged today <Text style={c.snapshotNum}>{snapshot.logged == null ? 'unavailable' : snapshot.logged.toLocaleString()}</Text>{snapshot.logged == null ? '' : ' kcal'}
                 </Text>
                 <Text style={[c.snapshotItem, { color: theme.text }]}>
                   Plan ({snapshot.dayKey}) <Text style={c.snapshotNum}>{snapshot.planned == null ? 'none' : snapshot.planned.toLocaleString()}</Text>{snapshot.planned == null ? '' : ' kcal'}

@@ -1,18 +1,51 @@
-import { useState, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import {
-  Modal, View, Text, TextInput, Pressable, ActivityIndicator,
+  Modal, View, Text, TextInput, Pressable, ActivityIndicator, AppState, Linking,
   StyleSheet, SafeAreaView, ScrollView, KeyboardAvoidingView, Platform,
 } from 'react-native'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import { MACRO_GROUPS } from './AddMealModal'
 
+// A typed number: a decimal comma counts ("1,5" on a French keyboard).
+function typedNumber(v) {
+  const n = parseFloat(String(v ?? '').replace(',', '.'))
+  return Number.isFinite(n) ? n : null
+}
+
+// Open Food Facts is edited by volunteers, so a number can be anything: a
+// stray exponent (1e400 reads as Infinity), a minus sign, a typo. No real
+// label comes near 5000 kcal, or 5 kg of anything, so every value is kept
+// between 0 and that.
+const MAX_LABEL_VALUE = 5000
+
+function labelNumber(v) {
+  const n = typedNumber(v)
+  return n == null ? null : Math.min(MAX_LABEL_VALUE, Math.max(0, n))
+}
+
+// The pack's serving size in grams, or null when it has no usable one.
+function servingGrams(qty) {
+  const g = typedNumber(qty)
+  return g > 0 && g <= MAX_LABEL_VALUE ? g : null
+}
+
+// What one portion is. With a serving size in grams, a serving. Without one
+// the numbers are Open Food Facts' own per 100 g, so the portion is 100 g,
+// not "1 serving" (a label that only has per-serving numbers stays a serving).
+function portionBasis(n, servingQty) {
+  const grams = servingGrams(servingQty)
+  const per100g = !grams && ['energy-kcal', 'proteins', 'carbohydrates', 'fat']
+    .some(k => labelNumber(n?.[`${k}_100g`]) != null)
+  return { grams, per100g }
+}
+
 export function mapNutriments(n, servingQty) {
-  const scale = servingQty ? servingQty / 100 : 1
+  const { grams, per100g } = portionBasis(n, servingQty)
   const get = (key) => {
-    const srv = n[`${key}_serving`]
-    if (srv != null && srv !== '') return parseFloat(srv) || 0
-    const p100 = n[`${key}_100g`] ?? n[key]
-    if (p100 != null && p100 !== '') return (parseFloat(p100) || 0) * scale
+    const srv = per100g ? null : labelNumber(n[`${key}_serving`])
+    if (srv != null) return srv
+    const p100 = labelNumber(n[`${key}_100g`])
+    if (p100 != null) return grams ? Math.min(MAX_LABEL_VALUE, p100 * grams / 100) : p100
     return 0
   }
   return {
@@ -33,8 +66,16 @@ export function mapNutriments(n, servingQty) {
   }
 }
 
+// How many portions a typed amount stands for: 0 or less is the smallest
+// portion, anything unreadable is one.
+const clampServings = n => Math.min(20, Math.max(0.25, Math.round(n * 100) / 100))
+const servingsOf = text => {
+  const n = typedNumber(text)
+  return n == null ? 1 : clampServings(n)
+}
+
 function scaleMacros(base, servings) {
-  const s = parseFloat(servings) || 1
+  const s = servingsOf(servings)
   const out = {}
   Object.entries(base).forEach(([k, v]) => {
     out[k] = k === 'calories' ? Math.round(v * s) : parseFloat((v * s).toFixed(1))
@@ -42,23 +83,27 @@ function scaleMacros(base, servings) {
   return out
 }
 
-function PortionSelector({ servingSize, servingQty, servings, onChange }) {
-  const label = servingSize || (servingQty ? `${servingQty}g` : '1 serving')
+function PortionSelector({ label, servings, onChange }) {
   return (
     <View style={bc.portionBox}>
       <Text style={bc.portionTitle}>Portion Size</Text>
       <View style={bc.portionRow}>
-        <Pressable style={bc.portionStep} onPress={() => onChange(Math.max(0.25, (parseFloat(servings)||1) - 0.25))}>
+        <Pressable style={bc.portionStep} onPress={() => onChange(String(clampServings(servingsOf(servings) - 0.25)))}>
           <Text style={bc.portionStepText}>−</Text>
         </Pressable>
         <TextInput
           style={bc.portionInput}
           value={String(servings)}
           onChangeText={onChange}
+          // Once typing stops the box shows the amount actually used.
+          onEndEditing={() => {
+            const used = String(servingsOf(servings))
+            if (used !== String(servings)) onChange(used)
+          }}
           keyboardType="decimal-pad"
           selectTextOnFocus
         />
-        <Pressable style={bc.portionStep} onPress={() => onChange(((parseFloat(servings)||1) + 0.25).toFixed(2))}>
+        <Pressable style={bc.portionStep} onPress={() => onChange(String(clampServings(servingsOf(servings) + 0.25)))}>
           <Text style={bc.portionStepText}>+</Text>
         </Pressable>
         <Text style={bc.portionLabel}>× {label}</Text>
@@ -67,8 +112,15 @@ function PortionSelector({ servingSize, servingQty, servings, onChange }) {
   )
 }
 
+// The name in whichever language the entry has one; plenty of products here
+// only carry the English or the French field.
+const nameOf = p => [p?.product_name, p?.product_name_en, p?.product_name_fr]
+  .map(v => String(v ?? '').trim()).find(Boolean) ?? ''
+
+const LOOKUP_TIMEOUT_MS = 12000
+
 export default function BarcodeScanner({ section, sectionLabel, sectionColor, onAdd, onClose, onSearchInstead }) {
-  const [permission, requestPermission] = useCameraPermissions()
+  const [permission, requestPermission, getPermission] = useCameraPermissions()
   const [scanned, setScanned] = useState(false)
   const [loading, setLoading] = useState(false)
   const [product, setProduct] = useState(null)
@@ -77,15 +129,58 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
   const [error, setError] = useState(null)
   const [showEditMacros, setShowEditMacros] = useState(false)
   const [editedMacros, setEditedMacros] = useState(null)
+  // The camera reports a code on frame after frame. State only changes on
+  // the next render, so a ref is what stops the second frame from starting
+  // a second lookup.
+  const busyRef = useRef(false)
+  // The lookup under way ({ ctrl }). Its reply only counts while it is still
+  // the current one: Scan Again or closing the scanner moves on from it.
+  const lookupRef = useRef(null)
 
-  const handleBarcode = useCallback(async ({ data }) => {
-    if (scanned) return
-    setScanned(true)
-    setLoading(true)
-    setError(null)
+  useEffect(() => () => {
+    lookupRef.current?.ctrl.abort()
+    lookupRef.current = null
+  }, [])
+
+  // Android keeps the app running through a trip to Settings, so coming back
+  // with camera access turned on has to be noticed here.
+  useEffect(() => {
+    if (!permission || permission.granted) return
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active') getPermission().catch(() => {})
+    })
+    return () => sub.remove()
+  }, [permission?.granted])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function askForCamera() {
     try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${data}.json`)
+      // Once access has been refused for good, asking again does nothing;
+      // only the Settings app can turn it back on.
+      if (permission?.canAskAgain === false) await Linking.openSettings()
+      else await requestPermission()
+    } catch {}
+  }
+
+  async function handleBarcode({ data }) {
+    if (busyRef.current) return
+    busyRef.current = true
+    setScanned(true)
+    setError(null)
+    const code = String(data ?? '').trim()
+    // Only a retail product code (8 to 14 digits) can be looked up; anything
+    // else would also end up in the URL as it was read.
+    if (!/^\d{8,14}$/.test(code)) {
+      setError("That isn't a product barcode. Scan the barcode on the pack.")
+      return
+    }
+    const lookup = { ctrl: new AbortController() }
+    lookupRef.current = lookup
+    const timer = setTimeout(() => lookup.ctrl.abort(), LOOKUP_TIMEOUT_MS)
+    setLoading(true)
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${encodeURIComponent(code)}.json`, { signal: lookup.ctrl.signal })
       const json = await res.json()
+      if (lookupRef.current !== lookup) return
       if (json.status === 1 && json.product) {
         const p = json.product
         setProduct(p)
@@ -95,12 +190,26 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
         setError('Product not found in database.')
       }
     } catch {
-      setError('Network error — check your connection.')
+      if (lookupRef.current !== lookup) return
+      setError(lookup.ctrl.signal.aborted
+        ? 'The lookup took too long — check your connection.'
+        : 'Network error — check your connection.')
+    } finally {
+      clearTimeout(timer)
+      if (lookupRef.current === lookup) setLoading(false)
     }
-    setLoading(false)
-  }, [scanned])
+  }
 
-  const reset = () => { setScanned(false); setProduct(null); setBaseMacros(null); setError(null); setServings('1'); setShowEditMacros(false); setEditedMacros(null) }
+  const reset = () => {
+    lookupRef.current?.ctrl.abort()
+    lookupRef.current = null
+    busyRef.current = false
+    setScanned(false); setLoading(false); setProduct(null); setBaseMacros(null); setError(null); setServings('1'); setShowEditMacros(false); setEditedMacros(null)
+  }
+
+  const basis = product ? portionBasis(product.nutriments, product.serving_quantity) : null
+  const portionLabel = !basis ? '' : basis.grams ? (product.serving_size || `${basis.grams}g`)
+    : basis.per100g ? '100 g' : (product.serving_size || '1 serving')
 
   const handleAdd = () => {
     if (!product || !baseMacros) return
@@ -108,18 +217,20 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
     if (editedMacros) {
       final = {}
       Object.entries(editedMacros).forEach(([k, v]) => {
-        final[k] = k === 'calories' ? Math.round(parseFloat(v) || 0) : parseFloat((parseFloat(v) || 0).toFixed(1))
+        const n = Math.max(0, typedNumber(v) ?? 0)
+        final[k] = k === 'calories' ? Math.round(n) : parseFloat(n.toFixed(1))
       })
     } else {
       final = scaleMacros(baseMacros, servings)
     }
+    const mult = servingsOf(servings)
     onAdd({
       id: Date.now().toString(36) + Math.random().toString(36).slice(2),
-      name: product.product_name || 'Scanned Product',
+      name: nameOf(product) || 'Scanned Product',
       contents: [
         product.brands,
-        `${parseFloat(servings)||1} serving${parseFloat(servings)!==1?'s':''}`,
-        product.serving_size && `(${product.serving_size} each)`,
+        basis.per100g ? `${Math.round(mult * 100)} g` : `${mult} serving${mult !== 1 ? 's' : ''}`,
+        !basis.per100g && product.serving_size && `(${product.serving_size} each)`,
       ].filter(Boolean).join(' · '),
       section,
       macros: final,
@@ -129,14 +240,19 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
   if (!permission) return null
 
   if (!permission.granted) {
+    const blocked = permission.canAskAgain === false
     return (
       <Modal visible animationType="slide" onRequestClose={onClose}>
         <SafeAreaView style={bc.centered}>
           <Text style={bc.permEmoji}>📷</Text>
           <Text style={bc.permTitle}>Camera Access Needed</Text>
-          <Text style={bc.permDesc}>Allow camera access to scan product barcodes.</Text>
-          <Pressable style={[bc.bigBtn, { backgroundColor: sectionColor }]} onPress={requestPermission}>
-            <Text style={bc.bigBtnText}>Grant Access</Text>
+          <Text style={bc.permDesc}>
+            {blocked
+              ? 'Camera access is turned off for this app. Turn it on in Settings to scan product barcodes.'
+              : 'Allow camera access to scan product barcodes.'}
+          </Text>
+          <Pressable style={[bc.bigBtn, { backgroundColor: sectionColor }]} onPress={askForCamera}>
+            <Text style={bc.bigBtnText}>{blocked ? 'Open Settings' : 'Grant Access'}</Text>
           </Pressable>
           <Pressable onPress={onClose} style={{ marginTop: 14 }}>
             <Text style={bc.link}>Cancel</Text>
@@ -153,9 +269,19 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
           <CameraView
             style={StyleSheet.absoluteFill}
             facing="back"
-            onBarcodeScanned={handleBarcode}
-            barcodeScannerSettings={{ barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upce', 'code128'] }}
+            onBarcodeScanned={scanned ? undefined : handleBarcode}
+            // expo-camera's own names: one it doesn't know makes iOS drop the
+            // whole list and scan every symbology, QR codes included.
+            barcodeScannerSettings={{ barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e', 'code128'] }}
           />
+        )}
+
+        {/* Drawn before the top bar, so ✕ stays in reach during a lookup. */}
+        {loading && (
+          <View style={bc.loadingOverlay}>
+            <ActivityIndicator size="large" color="#fff" />
+            <Text style={bc.loadingText}>Looking up product…</Text>
+          </View>
         )}
 
         <SafeAreaView style={bc.topBar}>
@@ -183,13 +309,6 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
           </View>
         )}
 
-        {loading && (
-          <View style={bc.loadingOverlay}>
-            <ActivityIndicator size="large" color="#fff" />
-            <Text style={bc.loadingText}>Looking up product…</Text>
-          </View>
-        )}
-
         {!loading && error && (
           <View style={bc.resultSheet}>
             <Text style={bc.errorEmoji}>🔍</Text>
@@ -212,12 +331,11 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
         {!loading && product && baseMacros && (
           <View style={bc.resultSheet}>
             <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-              <Text style={bc.productName} numberOfLines={2}>{product.product_name || 'Unknown Product'}</Text>
+              <Text style={bc.productName} numberOfLines={2}>{nameOf(product) || 'Unknown Product'}</Text>
               {!!product.brands && <Text style={bc.productBrand}>{product.brands}</Text>}
 
               <PortionSelector
-                servingSize={product.serving_size}
-                servingQty={product.serving_quantity}
+                label={portionLabel}
                 servings={servings}
                 onChange={v => {
                   setServings(String(v))
@@ -233,7 +351,7 @@ export default function BarcodeScanner({ section, sectionLabel, sectionColor, on
               {(() => {
                 const scaled = scaleMacros(baseMacros, servings)
                 const parsed = editedMacros
-                  ? Object.fromEntries(Object.entries(editedMacros).map(([k, v]) => [k, typeof v === 'string' ? (parseFloat(v) || 0) : v]))
+                  ? Object.fromEntries(Object.entries(editedMacros).map(([k, v]) => [k, typeof v === 'string' ? Math.max(0, typedNumber(v) ?? 0) : v]))
                   : null
                 const display = parsed ?? scaled
 

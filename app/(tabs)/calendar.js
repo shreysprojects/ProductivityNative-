@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView,
   Modal, TextInput, Alert, KeyboardAvoidingView, Platform,
-  Animated, PanResponder, Keyboard, Dimensions,
+  Animated, PanResponder, Keyboard, Dimensions, AppState,
 } from 'react-native'
 import * as Notifications from 'expo-notifications'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -128,6 +128,10 @@ function parseDateInput(str) {
   if (p.length !== 3) return null
   const [mo, da, yr] = p.map(Number)
   if (!mo || !da || !yr || mo > 12 || da > 31 || yr < 2020 || yr > 2050) return null
+  // Only a real date survives the round trip: 09/31 or 02/29/2027 would roll
+  // over into the next month.
+  const d = new Date(yr, mo - 1, da)
+  if (d.getFullYear() !== yr || d.getMonth() !== mo - 1 || d.getDate() !== da) return null
   return `${yr}-${String(mo).padStart(2,'0')}-${String(da).padStart(2,'0')}`
 }
 
@@ -168,7 +172,10 @@ function fmtTime(t) {
 function formatDuration(startTime, endTime) {
   const [sh, sm] = startTime.split(':').map(Number)
   const [eh, em] = endTime.split(':').map(Number)
-  const mins = Math.max(0, (eh * 60 + em) - (sh * 60 + sm))
+  // An end before the start runs past midnight: an event at 11:30 PM ends at
+  // 12:30 AM, an hour later, not "0m".
+  let mins = (eh * 60 + em) - (sh * 60 + sm)
+  if (mins < 0) mins += 1440
   const hours = Math.floor(mins / 60)
   const rest = mins % 60
   if (!hours) return `${rest}m`
@@ -338,7 +345,18 @@ export default function CalendarScreen() {
   const { user } = useAuth()
   const { theme } = useTheme()
   const insets = useSafeAreaInsets()
-  const today = todayStr()
+  // Nothing redraws this screen at midnight, so the date is checked on each
+  // visit, every minute while the tab is in view, and when the app comes back
+  // to the foreground on it. Setting the same day again changes nothing, so
+  // this only re-renders when the date actually turns over.
+  const [today, setToday] = useState(todayStr)
+  useFocusEffect(useCallback(() => {
+    const check = () => setToday(todayStr())
+    check()
+    const id = setInterval(check, 60000)
+    const sub = AppState.addEventListener('change', st => { if (st === 'active') check() })
+    return () => { clearInterval(id); sub.remove() }
+  }, []))
   const now = new Date()
   const { openJournal: openJournalParam } = useLocalSearchParams()
 
@@ -430,13 +448,25 @@ export default function CalendarScreen() {
   const [logSettings, setLogSettings] = useState(DEFAULT_LOG_SETTINGS)
   const [logCounts, setLogCounts]     = useState({})  // day -> logged slot count
   const [logDay, setLogDay]           = useState(todayStr())
+  // A day view left on today moves on to the new day when the date turns over.
+  const lastToday = useRef(today)
+  useEffect(() => {
+    const was = lastToday.current
+    if (was === today) return
+    lastToday.current = today
+    setLogDay(d => (d === was ? today : d))
+  }, [today])
   const [scanOpen, setScanOpen]       = useState(false)
   // Bumped whenever something outside DayLogTimeline writes to the log, so it
   // re-reads instead of showing a stale day.
   const [logRefresh, setLogRefresh]   = useState(0)
 
-  // Classes that finished today and haven't been answered for yet.
+  // Classes that finished today and haven't been answered for yet, and how
+  // many of this round have been answered (so the prompt counts 1 of 3, 2 of 3).
   const [attendQueue, setAttendQueue] = useState([])
+  const [attendAnswered, setAttendAnswered] = useState(0)
+  // The time log's slot sheet is open (the prompt waits for it to close).
+  const [logEditing, setLogEditing] = useState(false)
   // Classes ticked off on the Day section: { `${scheduleId}|${day}`: true }.
   const [classChecks, setClassChecks] = useState({})
   // Search across every day's classes; non-empty swaps the day list for results.
@@ -468,31 +498,60 @@ export default function CalendarScreen() {
       .catch(() => {})
   }, [])
 
+  // The day's workout and meals. Cleared as soon as the day changes, and a
+  // late answer for a day no longer selected is ignored — tapping one day and
+  // then another used to show the first day's data under the second.
   useEffect(() => {
-    if (!selected || !user) { setSelectedWorkout(null); setSelectedMeals([]); return }
+    setSelectedWorkout(null); setSelectedMeals([])
+    if (!selected || !user) return
+    let cancelled = false
     Promise.all([
       getWorkoutLog(user.id, selected),
       getMeals(user.id, selected),
-    ]).then(([w, m]) => { setSelectedWorkout(w); setSelectedMeals(m ?? []) })
-  }, [selected, user])
+    ])
+      .then(([w, m]) => { if (!cancelled) { setSelectedWorkout(w); setSelectedMeals(m ?? []) } })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [selected, user?.id])
+
+  // Each load takes a number, and only the newest may fill the screen.
+  const loadSeq = useRef(0)
+  // The lists as last rendered. A load waits on its slowest network read, so
+  // it notes these as it sets out: a list changed in the meantime (a to-do
+  // added or ticked, a class checked off) is newer than the load's copy, and
+  // that list is left as it is — the next focus reads it again.
+  const shown = useRef(null)
+  shown.current = { tasks, events, scheduleItems, classChecks, journalEntries }
 
   const load = useCallback(async () => {
     if (!user) return
+    const seq = ++loadSeq.current
+    const before = shown.current
+    const untouched = key => shown.current[key] === before[key]
     try {
-      const [hist, str, evts, sched, taskList, jEntries, lSettings, allLogs, dueByWeekday, checks] = await Promise.all([
+      const [hist, str, sched, jEntries, lSettings, allLogs, dueByWeekday, checks] = await Promise.all([
         getHistory(user.id), getStreak(user.id),
-        getCalendarEvents(user.id), getScheduleItems(user.id),
-        getTasks(user.id), getJournalEntries(user.id),
+        getScheduleItems(user.id), getJournalEntries(user.id),
         getLogSettings(user.id),
         // Never let the time-log sync take the whole calendar down with it.
         getAllTimeLogs(user.id).catch(() => ({})),
         loadDueByWeekday(user.id),
         getClassChecks(user.id).catch(() => ({})),
       ])
-      setClassChecks(checks)
+      if (seq !== loadSeq.current) return
+      // To-dos and events are device reads, so they're taken now that the
+      // network is done: anything saved while it was out is in them.
+      const [taskList, evts] = await Promise.all([getTasks(user.id), getCalendarEvents(user.id)])
+      if (seq !== loadSeq.current) return
+      if (untouched('classChecks')) setClassChecks(checks)
       setLogSettings(lSettings)
+      // Only slots on the current grid count, as on the timeline itself — an
+      // entry logged under an older interval would push the day past 100%.
+      const grid = new Set(slotStarts(lSettings).map(String))
       const counts = {}
-      for (const [d, slots] of Object.entries(allLogs)) counts[d] = Object.keys(slots).length
+      for (const [d, slots] of Object.entries(allLogs)) {
+        counts[d] = Object.keys(slots).filter(s => grid.has(s)).length
+      }
       setLogCounts(counts)
       const map = {}, byDate = {}
       hist.forEach(h => {
@@ -509,11 +568,12 @@ export default function CalendarScreen() {
         if (ring) status[date] = ring
       }
       setDayStatus(status)
-      setStreak(str)
-      setEvents(evts)
-      setScheduleItems(sched)
-      setTasks(taskList)
-      setJournalEntries(jEntries)
+      // Null means the streak couldn't be read and was never known here.
+      setStreak(str ?? { current: 0, longest: 0 })
+      if (untouched('events')) setEvents(evts)
+      if (untouched('scheduleItems')) setScheduleItems(sched)
+      if (untouched('tasks')) setTasks(taskList)
+      if (untouched('journalEntries')) setJournalEntries(jEntries)
       // A routine finished on another screen may have written itself into the
       // log while this tab was in the background.
       setLogRefresh(n => n + 1)
@@ -533,9 +593,9 @@ export default function CalendarScreen() {
         router.setParams({ openJournal: undefined })
       }
     } catch {
-      setError(true)
+      if (seq === loadSeq.current) setError(true)
     } finally {
-      setLoading(false)
+      if (seq === loadSeq.current) setLoading(false)
     }
   }, [user, openJournalParam])
 
@@ -851,54 +911,76 @@ export default function CalendarScreen() {
     ...classDragHandlers,
   })).current
 
+  // Taken before the first await: `saving` only disables the button once it
+  // renders, and the permission prompt and reminder below both await first —
+  // a quick double tap used to save the event twice.
+  const savingEvent = useRef(false)
+
   async function handleSaveEvent() {
+    if (savingEvent.current) return
     if (!newTitle.trim()) { Alert.alert('Missing title'); return }
     const dateForEvent = selected || today
     let time = null, notifId = null
     if (!allDay) {
       time = parseFormTime(newH, newM, newAp)
       if (!time) { Alert.alert('Invalid time', 'Hour: 1–12, Minute: 0–59'); return }
-      let permitted = hasPerm
-      if (!permitted) {
-        try {
-          const { status } = await Notifications.requestPermissionsAsync()
-          permitted = status === 'granted'
-          if (permitted) setHasPerm(true)
-        } catch {}
-      }
-      if (permitted) {
-        try {
-          const notifyAt = new Date(new Date(`${dateForEvent}T${time}:00`).getTime() - 10 * 60 * 1000)
-          if (notifyAt > new Date()) {
-            const ti = EVENT_TYPES.find(t => t.id === newType) ?? EVENT_TYPES[2]
-            notifId = await Notifications.scheduleNotificationAsync({
-              content: { title: `${ti.emoji} ${newTitle.trim()}`, body: 'Starting in 10 minutes', sound: true },
-              trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: notifyAt },
-            })
-          }
-        } catch {}
-      }
     }
+    savingEvent.current = true
     setSaving(true)
-    const ev = { id: genId(), title: newTitle.trim(), date: dateForEvent, time, type: newType, notifyMins: 10, notifId }
-    await saveCalendarEvent(user.id, ev)
-    setEvents(prev => [...prev, ev])
-    setAddOpen(false); setSaving(false)
-    setSelected(dateForEvent)
-    const d = new Date(dateForEvent + 'T12:00:00')
-    setViewDate({ year: d.getFullYear(), month: d.getMonth() })
+    try {
+      if (!allDay) {
+        let permitted = hasPerm
+        if (!permitted) {
+          try {
+            const { status } = await Notifications.requestPermissionsAsync()
+            permitted = status === 'granted'
+            if (permitted) setHasPerm(true)
+          } catch {}
+        }
+        if (permitted) {
+          try {
+            const notifyAt = new Date(new Date(`${dateForEvent}T${time}:00`).getTime() - 10 * 60 * 1000)
+            if (notifyAt > new Date()) {
+              const ti = EVENT_TYPES.find(t => t.id === newType) ?? EVENT_TYPES[2]
+              notifId = await Notifications.scheduleNotificationAsync({
+                content: { title: `${ti.emoji} ${newTitle.trim()}`, body: 'Starting in 10 minutes', sound: true },
+                trigger: { type: Notifications.SchedulableTriggerInputTypes.DATE, date: notifyAt },
+              })
+            }
+          } catch {}
+        }
+      }
+      const ev = { id: genId(), title: newTitle.trim(), date: dateForEvent, time, type: newType, notifyMins: 10, notifId }
+      await saveCalendarEvent(user.id, ev)
+      // By id: a focus load that read storage after the save may have it already.
+      setEvents(prev => [...prev.filter(e => e.id !== ev.id), ev])
+      setAddOpen(false)
+      setSelected(dateForEvent)
+      const d = new Date(dateForEvent + 'T12:00:00')
+      setViewDate({ year: d.getFullYear(), month: d.getMonth() })
+    } finally {
+      savingEvent.current = false
+      setSaving(false)
+    }
+  }
+
+  // The event leaves the screen at once; only a failed delete brings it back.
+  async function removeEvent(id, notifId) {
+    const original = events.find(e => e.id === id)
+    setEvents(prev => prev.filter(e => e.id !== id))
+    if (notifId) { try { await Notifications.cancelScheduledNotificationAsync(notifId) } catch {} }
+    try {
+      await deleteCalendarEvent(user.id, id)
+    } catch (e) {
+      if (original) setEvents(prev => (prev.some(x => x.id === id) ? prev : [...prev, original]))
+      Alert.alert('Could not delete', String(e?.message ?? e))
+    }
   }
 
   function handleDeleteEvent(ev) {
     Alert.alert('Delete Event', `Remove "${ev.title}"?`, [
       { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete', style: 'destructive', onPress: async () => {
-          if (ev.notifId) { try { await Notifications.cancelScheduledNotificationAsync(ev.notifId) } catch {} }
-          await deleteCalendarEvent(user.id, ev.id)
-          setEvents(prev => prev.filter(e => e.id !== ev.id))
-        },
-      },
+      { text: 'Delete', style: 'destructive', onPress: () => removeEvent(ev.id, ev.notifId) },
     ])
   }
 
@@ -918,6 +1000,9 @@ export default function CalendarScreen() {
     if (cTo.trim()) {
       semesterEnd = parseDateInput(cTo)
       if (!semesterEnd) { Alert.alert('Invalid date', 'Semester end: use MM/DD/YYYY'); return }
+    }
+    if (semesterStart && semesterEnd && semesterEnd < semesterStart) {
+      Alert.alert('Invalid dates', "Semester end can't be before its start."); return
     }
     setCeSaving(true)
     // Spreading the original first keeps fields the form doesn't own (id,
@@ -947,7 +1032,7 @@ export default function CalendarScreen() {
     await saveScheduleItem(user.id, item)
     setScheduleItems(prev => editingClass
       ? prev.map(i => i.id === item.id ? item : i)
-      : [...prev, item])
+      : [...prev.filter(i => i.id !== item.id), item])
     setClassOpen(false); setCeSaving(false); setEditingClass(null)
   }
 
@@ -980,11 +1065,7 @@ export default function CalendarScreen() {
       {
         text: 'Delete Event',
         style: 'destructive',
-        onPress: async () => {
-          if (ev.notifId) { try { await Notifications.cancelScheduledNotificationAsync(ev.notifId) } catch {} }
-          await deleteCalendarEvent(user.id, ev.id)
-          setEvents(prev => prev.filter(e => e.id !== ev.id))
-        },
+        onPress: () => removeEvent(ev.id, ev.notifId),
       },
     ])
   }
@@ -1012,8 +1093,13 @@ export default function CalendarScreen() {
   // Keep the "class starts soon" reminders in step with the timetable. Keyed
   // off scheduleItems so every path that changes it — load, scan import, edit,
   // delete — re-syncs; the sync itself no-ops when nothing actually changed.
+  // A scan import is the exception: it shows the new timetable before
+  // storage has it, and a sync reads the stored schedule back (and writes the
+  // merge) while the import is still deleting from it. The import syncs once
+  // it's done instead.
+  const importing = useRef(false)
   useEffect(() => {
-    if (!user) return
+    if (!user || importing.current) return
     syncClassNotifications(user.id).catch(() => {})
   }, [user, scheduleItems])
 
@@ -1041,6 +1127,7 @@ export default function CalendarScreen() {
         if (cancelled) return
         const open = new Set(pending)
         setAttendQueue(ended.filter(i => open.has(`class:${i.id}:${day}`)).map(i => ({ ...i, day })))
+        setAttendAnswered(0)
       })
       .catch(() => {})
     return () => { cancelled = true }
@@ -1069,6 +1156,7 @@ export default function CalendarScreen() {
     const item = attendQueue[0]
     if (!item) return
     setAttendQueue(q => q.slice(1))
+    setAttendAnswered(n => n + 1)
     const marker = `class:${item.id}:${item.day}`
     if (!attended || timeToMins(item.startTime) === null) {
       dismissAutoLog(user.id, marker).catch(() => {})
@@ -1108,18 +1196,29 @@ export default function CalendarScreen() {
   }
 
   // A scan is a fresh timetable: it REPLACES the class schedule, so stale
-  // classes from last term can't pile up next to the new ones.
+  // classes from last term can't pile up next to the new ones. Club meetings
+  // share the schedule (tagged meta.clubId) but belong to their clubs, so
+  // they stay — and aren't counted as classes being replaced.
   async function handleImportClasses(items) {
-    const previous = scheduleItems
+    const previous = scheduleItems.filter(i => !i.meta?.clubId)
     const doImport = async () => {
       setScanOpen(false)
       const saved = items.map(i => ({ ...i, id: genId(), semesterStart: null, semesterEnd: null }))
-      setScheduleItems(saved)
-      for (const item of previous) await deleteScheduleItem(user.id, item.id)
-      for (const item of saved) await saveScheduleItem(user.id, item)
+      importing.current = true
+      setScheduleItems(prev => [...prev.filter(i => i.meta?.clubId), ...saved])
+      try {
+        for (const item of previous) await deleteScheduleItem(user.id, item.id)
+        for (const item of saved) await saveScheduleItem(user.id, item)
+      } finally {
+        importing.current = false
+      }
+      // The reminders are rebuilt from storage, which only now holds the new
+      // timetable.
+      syncClassNotifications(user.id).catch(() => {})
       // Land on today's classes so the result of the scan is what's on screen.
-      setLogDay(today)
+      // After switchView, which carries a date picked on the month grid over.
       switchView('day')
+      setLogDay(todayStr())
       Alert.alert(
         'Schedule updated',
         `Your schedule now has ${saved.length} recurring class${saved.length === 1 ? '' : 'es'}.`
@@ -1167,24 +1266,35 @@ export default function CalendarScreen() {
       deadline: editingTask?.deadline ?? null,
     }
     await saveTask(user.id, task)
-    setTasks(prev => editingTask ? prev.map(t => t.id === task.id ? task : t) : [...prev, task])
+    setTasks(prev => editingTask ? prev.map(t => t.id === task.id ? task : t) : [...prev.filter(t => t.id !== task.id), task])
     setTaskModalOpen(false)
     setTSaving(false)
   }
 
+  // Ticking and deleting show at once; only a save that fails puts it back.
   async function handleToggleTask(task) {
     const updated = { ...task, done: !task.done }
-    await saveTask(user.id, updated)
     setTasks(prev => prev.map(t => t.id === task.id ? updated : t))
+    try {
+      await saveTask(user.id, updated)
+    } catch (e) {
+      setTasks(prev => prev.map(t => t === updated ? task : t))
+      Alert.alert('Could not save', String(e?.message ?? e))
+    }
   }
 
   function handleDeleteTask(task, closeModal = false) {
     Alert.alert('Delete Task', `Remove "${task.title}"?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
-        await deleteTask(user.id, task.id)
         setTasks(prev => prev.filter(t => t.id !== task.id))
         if (closeModal) setTaskModalOpen(false)
+        try {
+          await deleteTask(user.id, task.id)
+        } catch (e) {
+          setTasks(prev => (prev.some(t => t.id === task.id) ? prev : [...prev, task]))
+          Alert.alert('Could not delete', String(e?.message ?? e))
+        }
       }},
     ])
   }
@@ -1202,13 +1312,49 @@ export default function CalendarScreen() {
     setJournalOpen(true)
   }
 
+  // Gone from the screen at once, like a to-do; a delete that fails puts it back.
   async function handleDeleteJournal(date) {
-    await deleteJournalEntry(user.id, date)
+    const entry = journalEntries[date]
     setJournalEntries(prev => { const n = { ...prev }; delete n[date]; return n })
+    try {
+      await deleteJournalEntry(user.id, date)
+    } catch (e) {
+      if (entry) setJournalEntries(prev => (prev[date] ? prev : { ...prev, [date]: entry }))
+      Alert.alert('Could not delete', String(e?.message ?? e))
+    }
+  }
+
+  // Any saved entry can be deleted, however recent. `after` runs as it goes.
+  function confirmDeleteJournal(date, after) {
+    Alert.alert(
+      'Delete Entry?',
+      'This journal entry will be permanently deleted.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => { handleDeleteJournal(date); after?.() } },
+      ]
+    )
+  }
+
+  // ✕ and the back gesture: typed text that isn't saved is only thrown away
+  // once you say so.
+  function closeJournal() {
+    const text = jText.trim()
+    if (jReadOnly || !text || text === (journalEntries[jDate]?.text ?? '')) { setJournalOpen(false); return }
+    Alert.alert('Discard your entry?', "What you've written hasn't been saved.", [
+      { text: 'Keep writing', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: () => setJournalOpen(false) },
+    ])
   }
 
   async function handleSaveJournal() {
-    if (!jText.trim() && !jMood) return
+    // Emptied of text and mood, a saved entry is deleted (once confirmed); one
+    // that was never saved just closes.
+    if (!jText.trim() && !jMood) {
+      if (journalEntries[jDate]) confirmDeleteJournal(jDate, () => setJournalOpen(false))
+      else setJournalOpen(false)
+      return
+    }
     setJSaving(true)
     const entry = { mood: jMood, text: jText.trim(), updatedAt: Date.now() }
     await saveJournalEntry(user.id, jDate, entry)
@@ -1356,12 +1502,12 @@ export default function CalendarScreen() {
           {/* Stats */}
           <View style={[s.statRow, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
             <View style={s.stat}>
-              <Text style={[s.statNum, { color: theme.accent }]}>{streak.current}</Text>
+              <Text style={[s.statNum, { color: theme.accent }]}>{streak?.current ?? 0}</Text>
               <Text style={[s.statLabel, { color: theme.subtext }]}>Day streak 🔥</Text>
             </View>
             <View style={[s.statDivider, { backgroundColor: theme.divider }]} />
             <View style={s.stat}>
-              <Text style={[s.statNum, { color: theme.accent }]}>{streak.longest}</Text>
+              <Text style={[s.statNum, { color: theme.accent }]}>{streak?.longest ?? 0}</Text>
               <Text style={[s.statLabel, { color: theme.subtext }]}>Best streak</Text>
             </View>
             <View style={[s.statDivider, { backgroundColor: theme.divider }]} />
@@ -1444,9 +1590,16 @@ export default function CalendarScreen() {
 
             <View style={[s.legendDivider, { backgroundColor: theme.divider }]} />
             <View style={s.legend}>
-              {[['#10b981','All routines done'],['#f59e0b','Partial'],[theme.accent,'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
+              {/* An event's dot takes its type's colour, so the key shows them all. */}
+              {[['#10b981','All routines done'],['#f59e0b','Partial'],[EVENT_TYPES.map(t => t.color),'Event'],['#8b5cf6','Task'],['#0ea5e9','Journal'],...(logSettings.enabled ? [['#14b8a6','Logged']] : [])].map(([c, l]) => (
                 <View key={l} style={s.legendItem}>
-                  <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
+                  {Array.isArray(c) ? (
+                    <View style={s.legendDots}>
+                      {c.map(dc => <View key={dc} style={[s.legendDotSmall, { backgroundColor: dc }]} />)}
+                    </View>
+                  ) : (
+                    <View style={[s.legendDot, { backgroundColor: c }, l === 'Task' && { borderRadius: 2 }]} />
+                  )}
                   <Text style={[s.legendText, { color: theme.muted }]}>{l}</Text>
                 </View>
               ))}
@@ -1548,27 +1701,20 @@ export default function CalendarScreen() {
                   <View style={s.journalSection}>
                     <View style={s.journalSectionHeader}>
                       <Text style={[s.sectionLabel, { color: theme.muted }]}>JOURNAL</Text>
-                      {canWrite ? (
-                        <Pressable onPress={() => openJournal(selected)} hitSlop={10}>
-                          <Text style={{ fontSize: 12, fontWeight: '700', color: theme.accent }}>
-                            {entry ? 'Edit' : '+ Write'}
-                          </Text>
-                        </Pressable>
-                      ) : entry ? (
-                        <Pressable
-                          hitSlop={10}
-                          onPress={() => Alert.alert(
-                            'Delete Entry?',
-                            'This journal entry will be permanently deleted.',
-                            [
-                              { text: 'Cancel', style: 'cancel' },
-                              { text: 'Delete', style: 'destructive', onPress: () => handleDeleteJournal(selected) },
-                            ]
-                          )}
-                        >
-                          <Text style={{ fontSize: 12, fontWeight: '700', color: '#ef4444' }}>Delete</Text>
-                        </Pressable>
-                      ) : null}
+                      <View style={s.journalActions}>
+                        {entry && (
+                          <Pressable hitSlop={10} onPress={() => confirmDeleteJournal(selected)}>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: '#ef4444' }}>Delete</Text>
+                          </Pressable>
+                        )}
+                        {canWrite && (
+                          <Pressable onPress={() => openJournal(selected)} hitSlop={10}>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: theme.accent }}>
+                              {entry ? 'Edit' : '+ Write'}
+                            </Text>
+                          </Pressable>
+                        )}
+                      </View>
                     </View>
                     {entry ? (
                       <Pressable
@@ -1655,7 +1801,9 @@ export default function CalendarScreen() {
               )}
 
               {selectedMeals.length > 0 && (() => {
-                const totalCal = selectedMeals.reduce((sum, m) => sum + (Number(m.calories) || 0), 0)
+                // A meal's numbers live under macros; the sum is rounded, as
+                // adding them up picks up float noise.
+                const totalCal = Math.round(selectedMeals.reduce((sum, m) => sum + (Number(m.macros?.calories) || 0), 0))
                 return (
                   <>
                     <Text style={[s.sectionLabel, { color: theme.muted }]}>
@@ -1665,9 +1813,9 @@ export default function CalendarScreen() {
                       <View key={i} style={[s.routineRow, { borderBottomColor: theme.divider }]}>
                         <View style={[s.routineDot, { backgroundColor: '#22c55e' }]} />
                         <Text style={[s.routineName, { color: theme.text }]}>{meal.name}</Text>
-                        {meal.calories != null && (
+                        {meal.macros?.calories != null && (
                           <Text style={[s.routinePct, { color: theme.muted, fontWeight: '500' }]}>
-                            {meal.calories} kcal
+                            {Math.round(Number(meal.macros.calories) || 0)} kcal
                           </Text>
                         )}
                       </View>
@@ -2029,10 +2177,10 @@ export default function CalendarScreen() {
           key={logDay}
           userId={user.id}
           day={logDay}
-          todayStr={today}
           settings={logSettings}
           refreshKey={logRefresh}
           onImported={load}
+          onEditingChange={setLogEditing}
           onCountsChange={(filled) => setLogCounts(prev => (
             prev[logDay] === filled ? prev : { ...prev, [logDay]: filled }
           ))}
@@ -2083,11 +2231,14 @@ export default function CalendarScreen() {
         onImport={handleImportClasses}
       />
 
-      {attendQueue.length > 0 && !scanOpen && !classOpen && (
+      {/* Waits for every other sheet to close, so it never opens over one
+          (the journal a notification opened, say). */}
+      {attendQueue.length > 0 && !scanOpen && !classOpen && !addOpen && !taskModalOpen &&
+        !journalOpen && deadlinePick === null && !logEditing && (
         <ClassAttendancePrompt
           item={attendQueue[0]}
-          index={0}
-          total={attendQueue.length}
+          index={attendAnswered}
+          total={attendAnswered + attendQueue.length}
           onAttended={() => answerAttendance(true)}
           onSkipped={() => answerAttendance(false)}
           onClose={snoozeAttendance}
@@ -2198,13 +2349,13 @@ export default function CalendarScreen() {
                 />
 
                 <Text style={[s.fieldLabel, { color: theme.muted }]}>{cMulti ? 'LOCATION 1 TYPE' : 'TYPE'}</Text>
-                <View style={s.typeRow}>
+                <View style={s.classTypeRow}>
                   {CLASS_TYPES.map(t => {
                     const on = cType === t
                     return (
                       <Pressable
                         key={t}
-                        style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                        style={[s.classTypeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
                         onPress={() => setCType(t)}
                       >
                         <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
@@ -2224,7 +2375,7 @@ export default function CalendarScreen() {
                   {SCHEDULE_COLORS.map(c => (
                     <Pressable
                       key={c}
-                      style={[s.colorSwatch, { backgroundColor: c }, cColor === c && s.colorSwatchActive]}
+                      style={[s.colorSwatch, { backgroundColor: c }, cColor === c && [s.colorSwatchActive, { borderColor: theme.text }]]}
                       onPress={() => setCColor(c)}
                     />
                   ))}
@@ -2289,13 +2440,13 @@ export default function CalendarScreen() {
                       value={cLoc2} onChangeText={setCLoc2} returnKeyType="done"
                     />
                     <Text style={[s.fieldLabel, { color: theme.muted }]}>LOCATION 2 TYPE (optional)</Text>
-                    <View style={s.typeRow}>
+                    <View style={s.classTypeRow}>
                       {CLASS_TYPES.map(t => {
                         const on = cType2 === t
                         return (
                           <Pressable
                             key={t}
-                            style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                            style={[s.classTypeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
                             onPress={() => setCType2(on ? null : t)}
                           >
                             <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
@@ -2445,13 +2596,13 @@ export default function CalendarScreen() {
       </Modal>
 
       {/* ── Journal modal — full-screen editor so long entries stay visible ── */}
-      <Modal visible={journalOpen} animationType="slide" onRequestClose={() => setJournalOpen(false)}>
+      <Modal visible={journalOpen} animationType="slide" onRequestClose={closeJournal}>
         <KeyboardAvoidingView
           style={[s.journalPage, { backgroundColor: theme.card }]}
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         >
           <View style={[s.journalHeader, { paddingTop: insets.top + 10 }]}>
-            <Pressable onPress={() => setJournalOpen(false)} hitSlop={12}>
+            <Pressable onPress={closeJournal} hitSlop={12}>
               <Text style={[s.journalClose, { color: theme.muted }]}>✕</Text>
             </Pressable>
             <Text style={[s.journalHeaderTitle, { color: theme.text }]} numberOfLines={1}>
@@ -2578,6 +2729,8 @@ const s = StyleSheet.create({
   },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   legendDot: { width: 10, height: 10, borderRadius: 5, flexShrink: 0 },
+  legendDots: { flexDirection: 'row', gap: 2 },
+  legendDotSmall: { width: 6, height: 6, borderRadius: 3 },
   legendText: { fontSize: 11 },
 
   addBtn: { borderRadius: 20, paddingHorizontal: 14, paddingVertical: 7 },
@@ -2692,9 +2845,11 @@ const s = StyleSheet.create({
   },
   dayCheckMark: { color: '#fff', fontWeight: '900', fontSize: 13, lineHeight: 15 },
 
-  // Class search (Day section)
-  typeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 },
-  typeChip: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
+  // Class sheet: type chips. Named apart from the event/priority chips below —
+  // sharing their keys, the later pill style (a border with no colour) won
+  // and drew black outlines round these.
+  classTypeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 },
+  classTypeChip: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
   typeChipText: { fontSize: 12.5, fontWeight: '700' },
   multiRow: { borderRadius: 12, borderWidth: 1, padding: 12, marginBottom: 12, gap: 8 },
   multiQuestion: { fontSize: 13, fontWeight: '600', lineHeight: 18 },
@@ -2846,6 +3001,7 @@ const s = StyleSheet.create({
   // Journal
   journalSection: { marginTop: 12 },
   journalSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  journalActions: { flexDirection: 'row', alignItems: 'center', gap: 18 },
   journalPreview: { borderRadius: 14, padding: 12, borderWidth: 1 },
   journalPreviewText: { fontSize: 13, lineHeight: 18 },
   journalPreviewStats: { fontSize: 11, fontWeight: '600', marginTop: 6 },
@@ -2886,7 +3042,9 @@ const s = StyleSheet.create({
 
   colorRow: { flexDirection: 'row', gap: 10, marginBottom: 16 },
   colorSwatch: { width: 30, height: 30, borderRadius: 15 },
-  colorSwatchActive: { borderWidth: 3, borderColor: '#fff', transform: [{ scale: 1.15 }] },
+  // The ring's colour comes from the theme where it's used: white vanished
+  // against the light card.
+  colorSwatchActive: { borderWidth: 3, transform: [{ scale: 1.15 }] },
 
   semRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
   semInput: { borderRadius: 14, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 10, fontSize: 13 },
