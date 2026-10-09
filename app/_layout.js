@@ -57,7 +57,8 @@ function Inner() {
   const [splashDone, setSplashDone] = useState(false)
 
   return (
-    <View style={{ flex: 1 }}>
+    // Themed background here so route transitions never flash white.
+    <View style={{ flex: 1, backgroundColor: theme.bg }}>
       <StatusBar style={theme.statusBar} />
       <Slot />
       {!splashDone && <SplashOverlay onDone={() => setSplashDone(true)} />}

@@ -114,6 +114,7 @@ export default function TabsLayout() {
         headerShadowVisible: false,
         headerTintColor: theme.text,
         headerTitleStyle: { fontWeight: '700', fontSize: 17 },
+        sceneStyle: { backgroundColor: theme.bg },
       }}
     >
       <Tabs.Screen name="index"    options={{ title: 'My Routines' }} />
