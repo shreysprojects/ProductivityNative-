@@ -11,6 +11,11 @@ name: Build iOS IPA (unsigned, for AltStore)
 on:
   workflow_dispatch:
 
+# The build only reads the repo and uploads an artifact; the job token needs
+# nothing more.
+permissions:
+  contents: read
+
 jobs:
   build-ipa:
     # SDK 56+ needs Xcode 26.4 or newer; the macOS 26 image ships 26.6.
@@ -28,7 +33,8 @@ jobs:
         run: npm ci
 
       # EXPO_PUBLIC_* values are inlined into the JS bundle at build time.
-      # .env is gitignored, so recreate it from repo secrets.
+      # The committed .env holds only the public Supabase values, so the build
+      # writes its own from repo secrets (every EXPO_PUBLIC_* the app reads).
       - name: Write .env from secrets
         run: |
           cat > .env << 'EOF'
@@ -36,6 +42,7 @@ jobs:
           EXPO_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
           EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID }}
           EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID=${{ secrets.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID }}
+          EXPO_PUBLIC_USDA_API_KEY=${{ secrets.EXPO_PUBLIC_USDA_API_KEY }}
           EOF
 
       - name: Generate native iOS project
