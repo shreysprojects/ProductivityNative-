@@ -2175,7 +2175,23 @@ export default function CalendarScreen() {
                   placeholderTextColor={theme.muted}
                   value={cLoc} onChangeText={setCLoc} returnKeyType="next"
                 />
-  
+
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>{cMulti ? 'LOCATION 1 TYPE' : 'TYPE'}</Text>
+                <View style={s.typeRow}>
+                  {CLASS_TYPES.map(t => {
+                    const on = cType === t
+                    return (
+                      <Pressable
+                        key={t}
+                        style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
+                        onPress={() => setCType(t)}
+                      >
+                        <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
+                      </Pressable>
+                    )
+                  })}
+                </View>
+
                 <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
                 <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
 
@@ -2220,22 +2236,6 @@ export default function CalendarScreen() {
                         onPress={() => setCDays(prev => on ? prev.filter(v => v !== d.value) : [...prev, d.value])}
                       >
                         <Text style={[s.dayBtnText, { color: on ? '#fff' : theme.subtext }]}>{d.label}</Text>
-                      </Pressable>
-                    )
-                  })}
-                </View>
-  
-                <Text style={[s.fieldLabel, { color: theme.muted }]}>{cMulti ? 'LOCATION 1 TYPE' : 'TYPE'}</Text>
-                <View style={s.typeRow}>
-                  {CLASS_TYPES.map(t => {
-                    const on = cType === t
-                    return (
-                      <Pressable
-                        key={t}
-                        style={[s.typeChip, { backgroundColor: on ? cColor : (theme.isDark ? '#1c1c32' : '#f0f0f8') }]}
-                        onPress={() => setCType(t)}
-                      >
-                        <Text style={[s.typeChipText, { color: on ? '#fff' : theme.subtext }]}>{t}</Text>
                       </Pressable>
                     )
                   })}
