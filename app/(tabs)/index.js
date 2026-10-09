@@ -12,6 +12,7 @@ import StreakBadge from '../../components/StreakBadge'
 import ClubsSection from '../../components/ClubsSection'
 import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import { getSleep, wakeUp, cancelSleep, sleepDurationText, sleepDurationShort, clockLabel } from '../../lib/sleepStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
@@ -78,6 +79,36 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
   // Stamped on each successful fetch — focus refetches inside the throttle
   // window keep showing what's already here.
   const lastDashLoadRef = useRef(0)
+
+  // Sleep set from the Night routine. The "you've slept for…" line appears once
+  // a minute has passed since that time, and the figure keeps ticking while
+  // it's on screen. Re-read on every focus (not throttled): this is exactly
+  // the thing the user reopens the app to answer.
+  const [sleep, setSleep] = useState(null)      // the pending session, or null
+  const [justWoke, setJustWoke] = useState(null) // "7h 20m" right after tapping I woke up
+  const [, setSleepTick] = useState(0)
+  useFocusEffect(useCallback(() => {
+    if (!user?.id) return
+    getSleep(user.id).then(s => setSleep(s?.session ?? null)).catch(() => {})
+  }, [user?.id]))
+  useEffect(() => {
+    if (!sleep) return
+    const id = setInterval(() => setSleepTick(t => t + 1), 30000)
+    return () => clearInterval(id)
+  }, [sleep])
+  const sleptMs = sleep ? Date.now() - sleep.sleepAt : 0
+  const sleepVisible = !!sleep && sleptMs > 60 * 1000
+
+  function handleWoke() {
+    if (!sleep) return
+    setJustWoke(sleepDurationShort(sleptMs))
+    setSleep(null)
+    wakeUp(user.id).catch(() => {})
+  }
+  function handleSleepCancel() {
+    setSleep(null)
+    cancelSleep(user.id).catch(() => {})
+  }
 
   useEffect(() => {
     if (!user?.id) return
@@ -209,6 +240,27 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
           <Text style={[db.chevron, { color: theme.muted }]}>{collapsed ? '▼' : '▲'}</Text>
         </Pressable>
       </View>
+
+      {/* Sleep set last night — shown whether or not the card is collapsed */}
+      {sleepVisible && (
+        <View style={[db.sleepBanner, { backgroundColor: '#3b82f614', borderColor: '#3b82f640' }]}>
+          <Text style={[db.sleepText, { color: theme.text }]}>
+            🌙 You've slept for <Text style={{ fontWeight: '800', color: '#3b82f6' }}>{sleepDurationText(sleptMs)}</Text>
+            {sleep.wakeGoalAt ? <Text style={{ color: theme.muted }}>  ·  wanted up by {clockLabel(sleep.wakeGoalAt)}</Text> : null}
+          </Text>
+          <View style={db.sleepBtnRow}>
+            <Pressable style={[db.sleepBtn, { backgroundColor: '#3b82f6' }]} onPress={handleWoke}>
+              <Text style={db.sleepBtnText}>I woke up</Text>
+            </Pressable>
+            <Pressable style={[db.sleepBtn, { backgroundColor: '#ef4444' }]} onPress={handleSleepCancel}>
+              <Text style={db.sleepBtnText}>Cancel</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
+      {!!justWoke && !sleep && (
+        <Text style={db.sleepLogged}>✓ Logged {justWoke} of sleep. Good morning!</Text>
+      )}
 
       {!collapsed && (
         <>
@@ -1437,6 +1489,14 @@ const db = StyleSheet.create({
   eventRow:    { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 3 },
   eventTitle:  { flex: 1, fontSize: 13, fontWeight: '500' },
   eventTime:   { fontSize: 11, fontWeight: '600' },
+
+  // Sleep banner
+  sleepBanner: { borderRadius: 14, borderWidth: 1, padding: 12, marginTop: 12 },
+  sleepText: { fontSize: 13.5, fontWeight: '600', lineHeight: 19 },
+  sleepBtnRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  sleepBtn: { flex: 1, borderRadius: 12, paddingVertical: 10, alignItems: 'center' },
+  sleepBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
+  sleepLogged: { fontSize: 12.5, fontWeight: '700', color: '#10b981', marginTop: 10 },
 
   // Rules for today
   rulesHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
