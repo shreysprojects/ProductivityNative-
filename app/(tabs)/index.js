@@ -303,6 +303,7 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
                   onChangeText={v => setDraftRules(prev => prev.map(x => x.id === r.id ? { ...x, text: v } : x))}
                   placeholder="Rule…"
                   placeholderTextColor={theme.muted}
+                  multiline
                   returnKeyType="done"
                 />
                 <Pressable onPress={() => setDraftRules(prev => prev.filter(x => x.id !== r.id))} hitSlop={8}>
@@ -1425,13 +1426,14 @@ const db = StyleSheet.create({
   rulesHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
   rulesTitle: { fontSize: 13, fontWeight: '700' },
   rulesEdit: { fontSize: 12, fontWeight: '700' },
-  ruleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },
+  // flex-start + flexible text so long rules wrap onto the next line
+  ruleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, paddingVertical: 4 },
   ruleNum: {
     width: 20, height: 20, borderRadius: 7,
     alignItems: 'center', justifyContent: 'center',
   },
   ruleNumText: { fontSize: 11, fontWeight: '800' },
-  ruleText: { flex: 1, fontSize: 13, fontWeight: '500', lineHeight: 18 },
+  ruleText: { flex: 1, flexShrink: 1, fontSize: 13, fontWeight: '500', lineHeight: 18, flexWrap: 'wrap' },
 
   rulesSheet: {
     borderTopLeftRadius: 28, borderTopRightRadius: 28,
@@ -1442,10 +1444,10 @@ const db = StyleSheet.create({
   rulesSheetTitle: { fontSize: 20, fontWeight: '800', letterSpacing: -0.3 },
   rulesSheetSub: { fontSize: 13, marginTop: 4, marginBottom: 10 },
   rulesEditRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10,
+    flexDirection: 'row', alignItems: 'flex-start', gap: 10,
     paddingVertical: 10, borderBottomWidth: 1,
   },
-  rulesEditInput: { flex: 1, fontSize: 15, fontWeight: '500', paddingVertical: 2 },
+  rulesEditInput: { flex: 1, fontSize: 15, fontWeight: '500', paddingVertical: 0, paddingTop: 1, lineHeight: 20 },
   rulesDelete: { fontSize: 13, fontWeight: '600', padding: 4 },
   rulesAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 14 },
   rulesAddInput: {
