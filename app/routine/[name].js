@@ -1885,6 +1885,38 @@ export default function RoutineScreen() {
   const editHref = '/setup-routine?name=' + encodeURIComponent(name) + (isAlt ? '&variant=alt' : '')
   const altIsEmpty = isAlt && template.length === 0
 
+  // Muscle-focus banner (or split setup card). Rendered below the hero banner
+  // in the preview, and at the top while a run is in progress or finished.
+  const fitnessSplitBanner = isFitness && !isAlt && (gymSplit ? (
+    <View style={[s.splitBanner, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+      <View style={{ flex: 1 }}>
+        <Text style={[s.splitDay, { color: theme.subtext }]}>{DAY_LABELS[todayIdx]} · Muscle Focus</Text>
+        <View style={s.splitPillsRow}>
+          {normalizeDay(todayMuscle).map(m => (
+            <View key={m} style={[s.splitPill, { backgroundColor: muscleColor(m) }]}>
+              <Text style={[s.splitPillText, { color: muscleTextColor(m) }]}>{m}</Text>
+            </View>
+          ))}
+        </View>
+      </View>
+      <Pressable style={s.splitEditBtn} onPress={() => router.push('/fitness-split')}>
+        <Text style={[s.splitEditText, { color: card.color }]}>Edit Split →</Text>
+      </Pressable>
+    </View>
+  ) : (
+    <Pressable
+      style={[s.splitSetupCard, { backgroundColor: theme.card, borderColor: theme.isDark ? '#1a5c3a' : '#a7f3d0' }]}
+      onPress={() => router.push('/fitness-split')}
+    >
+      <Text style={s.splitSetupEmoji}>🏋️</Text>
+      <View style={{ flex: 1 }}>
+        <Text style={[s.splitSetupTitle, { color: theme.text }]}>Set Up Your Gym Split</Text>
+        <Text style={[s.splitSetupSub, { color: theme.subtext }]}>Choose PPL, Arnold, Upper/Lower and more.</Text>
+      </View>
+      <Text style={[s.splitSetupArrow, { color: card.color }]}>→</Text>
+    </Pressable>
+  ))
+
   // Quick-check progress shown in the preview (tasks ticked without starting).
   const quickDoneCount = run?.steps?.filter(st => st.completedAt).length ?? 0
   const quickPct = template.length ? Math.round((quickDoneCount / template.length) * 100) : 0
@@ -1933,38 +1965,9 @@ export default function RoutineScreen() {
         keyboardShouldPersistTaps="handled"
         automaticallyAdjustKeyboardInsets
       >
-        {/* ── Fitness: Split banner ── */}
-        {isFitness && !isAlt && gymSplit && (
-          <View style={[s.splitBanner, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-            <View style={{ flex: 1 }}>
-              <Text style={[s.splitDay, { color: theme.subtext }]}>{DAY_LABELS[todayIdx]} · Muscle Focus</Text>
-              <View style={s.splitPillsRow}>
-                {normalizeDay(todayMuscle).map(m => (
-                  <View key={m} style={[s.splitPill, { backgroundColor: muscleColor(m) }]}>
-                    <Text style={[s.splitPillText, { color: muscleTextColor(m) }]}>{m}</Text>
-                  </View>
-                ))}
-              </View>
-            </View>
-            <Pressable style={s.splitEditBtn} onPress={() => router.push('/fitness-split')}>
-              <Text style={[s.splitEditText, { color: card.color }]}>Edit Split →</Text>
-            </Pressable>
-          </View>
-        )}
-
-        {isFitness && !isAlt && !gymSplit && (
-          <Pressable
-            style={[s.splitSetupCard, { backgroundColor: theme.card, borderColor: theme.isDark ? '#1a5c3a' : '#a7f3d0' }]}
-            onPress={() => router.push('/fitness-split')}
-          >
-            <Text style={s.splitSetupEmoji}>🏋️</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={[s.splitSetupTitle, { color: theme.text }]}>Set Up Your Gym Split</Text>
-              <Text style={[s.splitSetupSub, { color: theme.subtext }]}>Choose PPL, Arnold, Upper/Lower and more.</Text>
-            </View>
-            <Text style={[s.splitSetupArrow, { color: card.color }]}>→</Text>
-          </Pressable>
-        )}
+        {/* ── Fitness: Split banner (top only while running/done — the preview
+             places it below the hero banner instead) ── */}
+        {run && !run.quick && fitnessSplitBanner}
 
         {/* ── Done ── */}
         {run?.finished && !run.quick && (
@@ -2087,6 +2090,9 @@ export default function RoutineScreen() {
                 <Text style={s.previewBannerQuoteText}>{routineDesc || routineQuote(name)}</Text>
               </View>
             </View>
+
+            {/* Fitness: muscle focus, right under the title banner */}
+            {fitnessSplitBanner}
 
             {/* Tips */}
             {(isMorning || isNight) && (
