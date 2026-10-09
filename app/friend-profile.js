@@ -8,6 +8,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useTheme } from '../lib/ThemeContext'
 import { useAuth } from '../lib/AuthContext'
 import { supabase } from '../lib/supabase'
+import { blockUser, unblockUser, isBlocked } from '../lib/blockedStorage'
 import {
   ROUTINE_DEFAULTS, addRoutine, saveRoutineTemplate, getRoutineNames,
   saveWorkoutPlan, getWorkoutRoutineList,
@@ -122,13 +123,6 @@ function fmtMs(ms) {
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`
 }
 
-function fmtDur(mins) {
-  if (!mins) return null
-  if (mins < 60) return `${mins}m`
-  const h = Math.floor(mins / 60), m = mins % 60
-  return m > 0 ? `${h}h ${m}m` : `${h}h`
-}
-
 function pctColor(p) {
   if (p >= 100) return '#10b981'
   if (p >= 50)  return '#f59e0b'
@@ -148,7 +142,6 @@ function buildSlots(year, month) {
 const CAT = {
   routine:  '#6366f1',
   workout:  '#f97316',
-  deepWork: '#8b5cf6',
   meals:    '#22c55e',
 }
 
@@ -199,7 +192,6 @@ function MonthCalendar({ year, month, byDate, todayStr, theme, onDayPress, onPre
             const cats = []
             if (data?.routines?.length) cats.push(CAT.routine)
             if (data?.workout) cats.push(CAT.workout)
-            if (data?.deepWork?.length) cats.push(CAT.deepWork)
             if (data?.meals?.length) cats.push(CAT.meals)
             const hasData = cats.length > 0
             return (
@@ -232,7 +224,6 @@ function MonthCalendar({ year, month, byDate, todayStr, theme, onDayPress, onPre
         {[
           ['Routine', CAT.routine],
           ['Workout', CAT.workout],
-          ['Deep work', CAT.deepWork],
           ['Food', CAT.meals],
         ].map(([label, color]) => (
           <View key={label} style={fp.legendItem}>
@@ -251,12 +242,11 @@ function DayDetailModal({ date, data, muscleByGroup, theme, onClose }) {
   const insets = useSafeAreaInsets()
   const routines = data?.routines ?? []
   const workout  = data?.workout ?? null
-  const deepWork = data?.deepWork ?? []
   const meals    = data?.meals ?? []
 
   const totalCal  = meals.reduce((s, m) => s + (Number(m.macros?.calories) || 0), 0)
   const totalProt = meals.reduce((s, m) => s + (Number(m.macros?.protein)  || 0), 0)
-  const isEmpty = routines.length === 0 && !workout && deepWork.length === 0 && meals.length === 0
+  const isEmpty = routines.length === 0 && !workout && meals.length === 0
 
   // Primary (dark red) vs secondary (light red) from the saved plan's muscle data.
   const mg = workout?.muscleGroup ? muscleByGroup?.[workout.muscleGroup] : null
@@ -376,37 +366,6 @@ function DayDetailModal({ date, data, muscleByGroup, theme, onClose }) {
             </View>
           )}
 
-          {/* Deep work */}
-          {deepWork.length > 0 && (
-            <View style={[fp.dCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-              <View style={fp.dCardHeader}>
-                <Text style={fp.dSecEmoji}>⚡</Text>
-                <Text style={[fp.dSecTitle, { color: theme.text }]}>Deep Work</Text>
-                <View style={[fp.dBadge, { backgroundColor: '#8b5cf620' }]}>
-                  <Text style={[fp.dBadgeText, { color: '#8b5cf6' }]}>
-                    {fmtDur(deepWork.reduce((s, d) => s + (d.actualMins ?? 0), 0)) ?? '—'}
-                  </Text>
-                </View>
-              </View>
-              {deepWork.map((d, di) => (
-                <View key={d.id ?? di} style={[fp.dSection, di < deepWork.length - 1 && { borderBottomWidth: 1, borderBottomColor: theme.divider }]}>
-                  <View style={fp.dRowBetween}>
-                    <Text style={[fp.dItemTitle, { color: theme.text }]}>{d.taskDesc || 'Focus session'}</Text>
-                    {d.actualMins ? <Text style={[fp.dPct, { color: '#8b5cf6' }]}>{fmtDur(d.actualMins)}</Text> : null}
-                  </View>
-                  {(d.goalMins || d.rating) ? (
-                    <Text style={[fp.dMeta, { color: theme.muted }]}>
-                      {d.goalMins ? `Goal ${fmtDur(d.goalMins)}` : ''}
-                      {d.goalMins && d.rating ? '  ·  ' : ''}
-                      {d.rating ? `${'★'.repeat(Math.max(0, Math.min(5, d.rating)))}` : ''}
-                    </Text>
-                  ) : null}
-                  {d.notes ? <Text style={[fp.dNotes, { color: theme.subtext }]}>{d.notes}</Text> : null}
-                </View>
-              ))}
-            </View>
-          )}
-
           {/* Nutrition */}
           {meals.length > 0 && (
             <View style={[fp.dCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
@@ -465,6 +424,8 @@ export default function FriendProfileScreen() {
   const [byDate, setByDate] = useState({})
   const [canView, setCanView] = useState(true)
   const [loading, setLoading] = useState(true)
+  const [blocked, setBlocked] = useState(false)
+  const [blocking, setBlocking] = useState(false)
 
   const [calYear, setCalYear]   = useState(now.getFullYear())
   const [calMonth, setCalMonth] = useState(now.getMonth())
@@ -500,13 +461,14 @@ export default function FriendProfileScreen() {
     const isFriend = !!friendRes.data
     const allowed = isSelf || vis === 'everyone' || (vis === 'friends' && isFriend)
     setCanView(allowed)
+    setBlocked(isSelf ? false : await isBlocked(viewerId, userId))
 
     if (!allowed) {
       setLoading(false)
       return
     }
 
-    const [streakRes, routineRes, templatesRes, plansRes, histRes, runsRes, wlRes, prodRes, mealsRes] = await Promise.all([
+    const [streakRes, routineRes, templatesRes, plansRes, histRes, runsRes, wlRes, mealsRes] = await Promise.all([
       supabase.from('streaks').select('current, longest').eq('user_id', userId).single(),
       supabase.from('routine_names').select('names').eq('user_id', userId).single(),
       supabase.from('routine_templates').select('routine_name, tasks').eq('user_id', userId),
@@ -514,7 +476,6 @@ export default function FriendProfileScreen() {
       supabase.from('history').select('date, completion, routine_name').eq('user_id', userId).gte('date', cutoff).gt('completion', 0),
       supabase.from('routine_runs').select('routine_name, date, data').eq('user_id', userId).gte('date', cutoff),
       supabase.from('workout_logs').select('date, data').eq('user_id', userId).gte('date', cutoff),
-      supabase.from('productivity_sessions').select('*').eq('user_id', userId).gte('date', cutoff),
       supabase.from('meals').select('date, meals').eq('user_id', userId).gte('date', cutoff),
     ])
 
@@ -550,7 +511,7 @@ export default function FriendProfileScreen() {
     })
 
     const map = {}
-    const ensure = d => (map[d] ??= { routines: [], workout: null, deepWork: [], meals: [] })
+    const ensure = d => (map[d] ??= { routines: [], workout: null, meals: [] })
 
     ;(histRes.data ?? []).forEach(h => {
       ensure(h.date).routines.push({
@@ -564,13 +525,6 @@ export default function FriendProfileScreen() {
       const muscleGroup = row.data?.muscleGroup
       if (!exercises.length && !muscleGroup) return
       ensure(row.date).workout = { muscleGroup, exercises }
-    })
-    ;(prodRes.data ?? []).forEach(r => {
-      if (!r.date) return
-      ensure(r.date).deepWork.push({
-        id: r.id, taskDesc: r.task_desc, goalMins: r.goal_mins,
-        actualMins: r.actual_mins, rating: r.rating, notes: r.notes ?? '',
-      })
     })
     ;(mealsRes.data ?? []).forEach(row => {
       if (Array.isArray(row.meals) && row.meals.length) ensure(row.date).meals = row.meals
@@ -612,6 +566,47 @@ export default function FriendProfileScreen() {
     }
   }
 
+  async function toggleBlock() {
+    if (!viewerId || blocking) return
+    if (blocked) {
+      setBlocking(true)
+      try {
+        await unblockUser(viewerId, userId)
+        setBlocked(false)
+      } catch (e) {
+        Alert.alert('Error', e.message ?? 'Could not unblock right now.')
+      } finally {
+        setBlocking(false)
+      }
+      return
+    }
+    Alert.alert(
+      `Block @${handle}?`,
+      "They won't be able to see your profile or reach you in the community. You can unblock them any time from Settings.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Block',
+          style: 'destructive',
+          onPress: async () => {
+            setBlocking(true)
+            try {
+              await blockUser(viewerId, userId)
+              setBlocked(true)
+              Alert.alert('Blocked', `@${handle} is now blocked.`, [
+                { text: 'OK', onPress: () => router.back() },
+              ])
+            } catch (e) {
+              Alert.alert('Error', e.message ?? 'Could not block right now.')
+            } finally {
+              setBlocking(false)
+            }
+          },
+        },
+      ]
+    )
+  }
+
   const handle = profile?.username ?? username ?? 'User'
   const displayName = profile?.name?.trim() || handle
   const initials = (displayName?.[0] ?? '?').toUpperCase()
@@ -635,7 +630,15 @@ export default function FriendProfileScreen() {
           <Text style={[fp.backBtnText, { color: '#6366f1' }]}>← Back</Text>
         </Pressable>
         <Text style={[fp.headerTitle, { color: theme.text }]} numberOfLines={1}>{displayName}</Text>
-        <View style={fp.headerRight} />
+        <View style={[fp.headerRight, fp.headerRightAction]}>
+          {!isSelf && viewerId ? (
+            <Pressable onPress={toggleBlock} hitSlop={12} disabled={blocking}>
+              <Text style={[fp.headerActionText, { color: blocked ? theme.accent : '#ef4444', opacity: blocking ? 0.5 : 1 }]}>
+                {blocked ? 'Unblock' : 'Block'}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
       </View>
     )
   }
@@ -818,6 +821,8 @@ const fp = StyleSheet.create({
   backBtnText: { fontSize: 16, fontWeight: '600' },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '700' },
   headerRight: { minWidth: 70 },
+  headerRightAction: { alignItems: 'flex-end' },
+  headerActionText: { fontSize: 15, fontWeight: '600' },
 
   profileCard: {
     borderRadius: 20, borderWidth: 1, padding: 20, alignItems: 'center', marginBottom: 20,
