@@ -20,7 +20,7 @@ import {
   getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
-  setLooksInRoutine, syncIntegratedTasks,
+  setLooksInRoutine, syncIntegratedTasks, altRoutineName,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import MuscleMap from '../../components/MuscleMap'
@@ -1554,6 +1554,14 @@ export default function RoutineScreen() {
   const isMorning = name === 'Morning'
   const isNight   = name === 'Night'
 
+  // Main vs Alternative variant. The alternative is a lighter fallback routine
+  // for days the user can't do the main one — same tables, name-suffixed key.
+  const [variant, setVariant] = useState('main')
+  const isAlt = variant === 'alt'
+  const storageName = isAlt ? altRoutineName(name) : name
+  // On first open only, land on whichever variant was worked on today.
+  const autoPickedVariant = useRef(false)
+
   const [template, setTemplate] = useState([])
   const [run, setRun] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -1588,15 +1596,28 @@ export default function RoutineScreen() {
 
   const load = useCallback(async () => {
     if (!user || !name) return
+    // First open only: if today's progress lives on the alternative (and not
+    // the main), land on the Alternative tab so the user sees where they left off.
+    if (!autoPickedVariant.current) {
+      autoPickedVariant.current = true
+      const [mainRun, altRun] = await Promise.all([
+        getTodayRun(user.id, name),
+        getTodayRun(user.id, altRoutineName(name)),
+      ])
+      if (!mainRun && altRun) {
+        setVariant('alt')
+        return // variant change re-triggers load with the alt storage name
+      }
+    }
     const promises = [
-      getRoutineTemplate(user.id, name),
-      getTodayRun(user.id, name),
+      getRoutineTemplate(user.id, storageName),
+      getTodayRun(user.id, storageName),
       isFitness ? getGymSplit(user.id) : Promise.resolve(null),
       getRoutineSettings(user.id, name),
     ]
     let [tmpl, todayRun, split, rSettings] = await Promise.all(promises)
     setRoutineDesc(rSettings?.description ?? '')
-    if (isMorning) {
+    if (isMorning && !isAlt) {
       tmpl = await syncIntegratedTasks(user.id, name, tmpl)
     }
     setTemplate(tmpl)
@@ -1611,9 +1632,15 @@ export default function RoutineScreen() {
       setMorningSettings(ms)
     }
     setLoading(false)
-  }, [user, name, isFitness, isMorning])
+  }, [user, name, storageName, isAlt, isFitness, isMorning])
 
   useFocusEffect(useCallback(() => { load() }, [load]))
+
+  function switchVariant(v) {
+    if (v === variant) return
+    setLoading(true) // blank instead of flashing the other variant's tasks
+    setVariant(v)
+  }
 
   useEffect(() => {
     if (run?.finished) {
@@ -1630,23 +1657,23 @@ export default function RoutineScreen() {
   }
 
   async function handleStart() {
-    const newRun = await startRun(user.id, name)
+    const newRun = await startRun(user.id, storageName)
     setRun(newRun)
   }
 
   // Tick a task off without starting the timer — records the check timestamp.
   async function handlePreviewToggle(taskId) {
-    const updated = await quickCheckToggle(user.id, name, template, taskId)
+    const updated = await quickCheckToggle(user.id, storageName, template, taskId)
     setRun(updated)
   }
 
   async function handleStepDone(elapsedMs) {
-    const updated = await advanceRun(user.id, name, run, elapsedMs)
+    const updated = await advanceRun(user.id, storageName, run, elapsedMs)
     setRun(updated)
   }
 
   async function handleFinish(elapsedMs) {
-    const updated = await completeRun(user.id, name, run, elapsedMs)
+    const updated = await completeRun(user.id, storageName, run, elapsedMs)
     setRun(updated)
     // After the first completed routine, ask for a review once (ever).
     setTimeout(() => { maybePromptReview() }, 1200)
@@ -1662,7 +1689,7 @@ export default function RoutineScreen() {
         i === prev ? { ...s, completedAt: null, elapsedMs: 0, startedAt: Date.now() } : s
       ),
     }
-    await saveRun(user.id, name, updated)
+    await saveRun(user.id, storageName, updated)
     setRun(updated)
   }
 
@@ -1675,7 +1702,7 @@ export default function RoutineScreen() {
           : step
       ),
     }
-    await saveRun(user.id, name, updated)
+    await saveRun(user.id, storageName, updated)
     setRun(updated)
   }
 
@@ -1695,7 +1722,7 @@ export default function RoutineScreen() {
       currentStep: allDone ? run.steps.length - 1 : Math.max(firstUndone, 0),
       ...(allDone ? { finished: true, completedAt: Date.now() } : {}),
     }
-    await saveRun(user.id, name, updated)
+    await saveRun(user.id, storageName, updated)
     setRun(updated)
   }
 
@@ -1708,7 +1735,7 @@ export default function RoutineScreen() {
         {
           text: 'Reset', style: 'destructive',
           onPress: async () => {
-            await resetTodayRun(user.id, name)
+            await resetTodayRun(user.id, storageName)
             setRun(null)
           },
         },
@@ -1717,8 +1744,19 @@ export default function RoutineScreen() {
   }
 
   async function applyAITasks(tasks) {
-    await saveRoutineTemplate(user.id, name, tasks)
+    await saveRoutineTemplate(user.id, storageName, tasks)
     setTemplate(tasks)
+  }
+
+  // Seed the alternative from the current main routine.
+  async function copyMainToAlt() {
+    const mainTmpl = await getRoutineTemplate(user.id, name)
+    if (mainTmpl.length === 0) {
+      Alert.alert('Main routine is empty', 'Add tasks to your main routine first, or build the alternative from scratch.')
+      return
+    }
+    await saveRoutineTemplate(user.id, altRoutineName(name), mainTmpl)
+    setTemplate(mainTmpl)
   }
 
   // Mirror the Looks card into the Morning template (or pull it back out).
@@ -1844,6 +1882,9 @@ export default function RoutineScreen() {
   const todayMuscle = gymSplit?.days?.[todayIdx] ?? 'Rest'
   const todayMuscles = normalizeDay(todayMuscle)
 
+  const editHref = '/setup-routine?name=' + encodeURIComponent(name) + (isAlt ? '&variant=alt' : '')
+  const altIsEmpty = isAlt && template.length === 0
+
   // Quick-check progress shown in the preview (tasks ticked without starting).
   const quickDoneCount = run?.steps?.filter(st => st.completedAt).length ?? 0
   const quickPct = template.length ? Math.round((quickDoneCount / template.length) * 100) : 0
@@ -1863,10 +1904,28 @@ export default function RoutineScreen() {
           <Pressable onPress={() => setAiModalOpen(true)} hitSlop={8} style={s.aiHeaderBtn}>
             <Text style={[s.aiHeaderText, { color: card.color }]}>✦ AI</Text>
           </Pressable>
-          <Pressable onPress={() => router.push('/setup-routine?name=' + name)} style={s.editHeaderBtn}>
+          <Pressable onPress={() => router.push(editHref)} style={s.editHeaderBtn}>
             <Text style={[s.editHeaderText, { color: card.color }]}>Edit</Text>
           </Pressable>
         </View>
+      </View>
+
+      {/* ── Main / Alternative tabs ── */}
+      <View style={[s.variantTabs, { backgroundColor: theme.header, borderBottomColor: theme.headerBorder }]}>
+        {[['main', 'Main'], ['alt', 'Alternative']].map(([key, label]) => {
+          const active = variant === key
+          return (
+            <Pressable
+              key={key}
+              style={[s.variantTab, active && { borderBottomColor: card.color }]}
+              onPress={() => switchVariant(key)}
+            >
+              <Text style={[s.variantTabText, { color: active ? card.color : theme.subtext }]}>
+                {label}
+              </Text>
+            </Pressable>
+          )
+        })}
       </View>
 
       <ScrollView
@@ -1875,7 +1934,7 @@ export default function RoutineScreen() {
         automaticallyAdjustKeyboardInsets
       >
         {/* ── Fitness: Split banner ── */}
-        {isFitness && gymSplit && (
+        {isFitness && !isAlt && gymSplit && (
           <View style={[s.splitBanner, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
             <View style={{ flex: 1 }}>
               <Text style={[s.splitDay, { color: theme.subtext }]}>{DAY_LABELS[todayIdx]} · Muscle Focus</Text>
@@ -1893,7 +1952,7 @@ export default function RoutineScreen() {
           </View>
         )}
 
-        {isFitness && !gymSplit && (
+        {isFitness && !isAlt && !gymSplit && (
           <Pressable
             style={[s.splitSetupCard, { backgroundColor: theme.card, borderColor: theme.isDark ? '#1a5c3a' : '#a7f3d0' }]}
             onPress={() => router.push('/fitness-split')}
@@ -1939,7 +1998,7 @@ export default function RoutineScreen() {
             ))}
             <Pressable
               style={[s.editTmrBtn, { borderColor: theme.cardBorder, backgroundColor: theme.card }]}
-              onPress={() => router.push('/setup-routine?name=' + name)}
+              onPress={() => router.push(editHref)}
             >
               <Text style={[s.editTmrText, { color: card.color }]}>Edit Tomorrow's Routine</Text>
             </Pressable>
@@ -2009,7 +2068,7 @@ export default function RoutineScreen() {
               </View>
               {/* Left-aligned title + count */}
               <View style={s.previewBannerLeft}>
-                <Text style={s.previewBannerTitle}>Today's{'\n'}{name}</Text>
+                <Text style={s.previewBannerTitle}>Today's{'\n'}{isAlt ? 'Alt ' : ''}{name}</Text>
                 <View style={s.previewBannerCountRow}>
                   <View style={s.previewBannerCountCheck}>
                     <Text style={s.previewBannerCountCheckMark}>✓</Text>
@@ -2052,18 +2111,45 @@ export default function RoutineScreen() {
             )}
 
             {/* Progress bar */}
-            <View style={[s.progressCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
-                <Text style={[s.progressLabel, { color: theme.subtext }]}>{quickPct}% complete</Text>
-                <Text style={[s.progressCount, { color: theme.subtext }]}>{quickDoneCount} / {template.length}</Text>
+            {!altIsEmpty && (
+              <View style={[s.progressCard, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <Text style={[s.progressLabel, { color: theme.subtext }]}>{quickPct}% complete</Text>
+                  <Text style={[s.progressCount, { color: theme.subtext }]}>{quickDoneCount} / {template.length}</Text>
+                </View>
+                <View style={[s.progressTrack, { backgroundColor: theme.isDark ? '#ffffff18' : '#e5e7eb' }]}>
+                  <View style={[s.progressFill, { width: `${quickPct}%`, backgroundColor: card.color }]} />
+                </View>
               </View>
-              <View style={[s.progressTrack, { backgroundColor: theme.isDark ? '#ffffff18' : '#e5e7eb' }]}>
-                <View style={[s.progressFill, { width: `${quickPct}%`, backgroundColor: card.color }]} />
+            )}
+
+            {/* Alternative not set up yet */}
+            {altIsEmpty && (
+              <View style={[s.altEmptyCard, { backgroundColor: theme.card, borderColor: card.color + '35' }]}>
+                <Text style={s.altEmptyEmoji}>🔀</Text>
+                <Text style={[s.altEmptyTitle, { color: theme.text }]}>No alternative yet</Text>
+                <Text style={[s.altEmptySub, { color: theme.subtext }]}>
+                  Build a lighter version of your {name} routine for days you're short on time or energy.
+                </Text>
+                <View style={s.altEmptyBtnRow}>
+                  <Pressable
+                    style={[s.altEmptyBtn, { borderColor: card.color }]}
+                    onPress={copyMainToAlt}
+                  >
+                    <Text style={[s.altEmptyBtnText, { color: card.color }]}>Copy main routine</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[s.altEmptyBtn, s.altEmptyBtnFill, { backgroundColor: card.color }]}
+                    onPress={() => router.push(editHref)}
+                  >
+                    <Text style={[s.altEmptyBtnText, { color: '#fff' }]}>Build from scratch</Text>
+                  </Pressable>
+                </View>
               </View>
-            </View>
+            )}
 
         {/* ── Fitness: My Workouts section ── */}
-        {isFitness && (
+        {isFitness && !isAlt && (
           <View style={[s.workoutSection, { borderTopColor: theme.divider }]}>
             <View style={s.workoutHeader}>
               <Text style={[s.workoutTitle, { color: theme.text }]}>💪 My Workouts</Text>
@@ -2277,10 +2363,14 @@ export default function RoutineScreen() {
         )}
 
             {/* Section label */}
-            <View style={s.previewSectionRow}>
-              <Text style={{ fontSize: 16 }}>📋</Text>
-              <Text style={[s.previewSectionLabel, { color: theme.subtext }]}>YOUR TASKS</Text>
-            </View>
+            {!altIsEmpty && (
+              <View style={s.previewSectionRow}>
+                <Text style={{ fontSize: 16 }}>📋</Text>
+                <Text style={[s.previewSectionLabel, { color: theme.subtext }]}>
+                  {isAlt ? 'ALTERNATIVE TASKS' : 'YOUR TASKS'}
+                </Text>
+              </View>
+            )}
 
             {template.map((task, i) => (
               <View key={task.id} style={[s.previewTask, {
@@ -2328,23 +2418,25 @@ export default function RoutineScreen() {
               </View>
             ))}
 
-            <Animated.View style={{ transform: [{ scale: startBtnScale }] }}>
-              <Pressable
-                style={[s.startBtn, { backgroundColor: card.color, shadowColor: card.color }]}
-                onPressIn={startBtnPressIn}
-                onPressOut={startBtnPressOut}
-                onPress={handleStart}
-              >
-                <Text style={s.startBtnSparkle}>✦</Text>
-                <Text style={s.startBtnText}>{card.emoji}  Start {name} Routine  →</Text>
-                <Text style={s.startBtnSparkle}>✦</Text>
-              </Pressable>
-            </Animated.View>
+            {template.length > 0 && (
+              <Animated.View style={{ transform: [{ scale: startBtnScale }] }}>
+                <Pressable
+                  style={[s.startBtn, { backgroundColor: card.color, shadowColor: card.color }]}
+                  onPressIn={startBtnPressIn}
+                  onPressOut={startBtnPressOut}
+                  onPress={handleStart}
+                >
+                  <Text style={s.startBtnSparkle}>✦</Text>
+                  <Text style={s.startBtnText}>{card.emoji}  Start {isAlt ? 'Alt ' : ''}{name} Routine  →</Text>
+                  <Text style={s.startBtnSparkle}>✦</Text>
+                </Pressable>
+              </Animated.View>
+            )}
           </>
         )}
 
-        {/* ── Morning: Goals + Weight + Looks ── */}
-        {isMorning && (
+        {/* ── Morning: Goals + Weight + Looks (main routine only) ── */}
+        {isMorning && !isAlt && (
           <>
             {!morningSettings.hideTodo && (
               <MorningTodoList
@@ -2547,6 +2639,33 @@ const s = StyleSheet.create({
   aiHeaderText: { fontSize: 13, fontWeight: '700' },
   editHeaderBtn: { padding: 4 },
   editHeaderText: { fontSize: 15, fontWeight: '600' },
+
+  variantTabs: {
+    flexDirection: 'row',
+    borderBottomWidth: 1,
+  },
+  variantTab: {
+    flex: 1, alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: 2.5, borderBottomColor: 'transparent',
+  },
+  variantTabText: { fontSize: 14, fontWeight: '700', letterSpacing: -0.1 },
+
+  altEmptyCard: {
+    borderRadius: 20, borderWidth: 1.5,
+    padding: 24, alignItems: 'center',
+    marginTop: 4,
+  },
+  altEmptyEmoji: { fontSize: 40, marginBottom: 10 },
+  altEmptyTitle: { fontSize: 17, fontWeight: '800', letterSpacing: -0.3, marginBottom: 6 },
+  altEmptySub: { fontSize: 13, lineHeight: 19, textAlign: 'center', marginBottom: 18 },
+  altEmptyBtnRow: { flexDirection: 'row', gap: 10, alignSelf: 'stretch' },
+  altEmptyBtn: {
+    flex: 1, borderRadius: 14, borderWidth: 1.5,
+    paddingVertical: 12, alignItems: 'center',
+  },
+  altEmptyBtnFill: { borderWidth: 0 },
+  altEmptyBtnText: { fontSize: 13, fontWeight: '700' },
 
   content: { padding: 16, paddingBottom: 64 },
 
