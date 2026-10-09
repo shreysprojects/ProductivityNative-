@@ -5,6 +5,12 @@ import { useEffect, useState } from 'react'
 import { hasUserSetup } from '../lib/storage'
 import { hasOnboardingDone } from '../lib/goalsStorage'
 
+// Startup gate. These checks decide which screen to land on, and one of them
+// reaches the network — so it gets a deadline. Without one, a slow or
+// unreachable server left the app sitting on this spinner forever, which reads
+// as "the app won't open".
+const CHECK_TIMEOUT_MS = 6000
+
 export default function Root() {
   const { user, loading } = useAuth()
   const [setupChecked, setSetupChecked] = useState(false)
@@ -13,14 +19,36 @@ export default function Root() {
 
   useEffect(() => {
     if (!user) { setSetupChecked(false); return }
-    Promise.all([
-      hasUserSetup(user.id),
-      hasOnboardingDone(user.id),
-    ]).then(([setup, onb]) => {
-      setSetupDone(setup)
-      setOnboardingDone(onb)
-      setSetupChecked(true)
-    })
+    let cancelled = false
+
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), CHECK_TIMEOUT_MS))
+
+    Promise.race([
+      Promise.all([hasUserSetup(user.id), hasOnboardingDone(user.id)]),
+      timeout,
+    ])
+      .then(result => {
+        if (cancelled) return
+        if (Array.isArray(result)) {
+          setSetupDone(result[0])
+          setOnboardingDone(result[1])
+        } else {
+          // Couldn't decide in time. Send an existing user into the app rather
+          // than stranding them here or pushing them back through first-run
+          // setup; every screen loads from its own local cache anyway.
+          setSetupDone(true)
+          setOnboardingDone(true)
+        }
+        setSetupChecked(true)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setSetupDone(true)
+        setOnboardingDone(true)
+        setSetupChecked(true)
+      })
+
+    return () => { cancelled = true }
   }, [user])
 
   if (loading || (user && !setupChecked)) {
