@@ -1515,7 +1515,7 @@ export default function RoutinesScreen() {
             ))}
             <Pressable
               style={[s.addBtn, { borderColor: theme.isDark ? '#28284a' : '#dde0f8' }]}
-              onPress={() => openFromHome('/setup-routine?name=new')}
+              onPress={() => openFromHome('/setup-routine?create=1')}
             >
               <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
             </Pressable>

@@ -42,7 +42,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "test": "node tests/runSteps.test.js && node tests/runLater.test.js && node tests/mealPlan.test.js && node tests/foodSearch.test.js && node tests/foodSource.test.js"
+    "test": "node tests/runSteps.test.js && node tests/runLater.test.js && node tests/mealPlan.test.js && node tests/foodSearch.test.js && node tests/foodSource.test.js && node tests/encoding.test.js"
   },
   "private": true,
   "devDependencies": {

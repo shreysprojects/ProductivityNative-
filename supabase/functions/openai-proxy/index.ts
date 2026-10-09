@@ -105,8 +105,43 @@ const noEmDashDeep = (v: unknown): unknown => {
   return v
 }
 
+// What a request used up: whose limit, which one, and whether a model that
+// costs money was called.
+type Usage = { user: string | null; kind: string | null; paid: boolean }
+
 Deno.serve(async (req) => {
+  const usage: Usage = { user: null, kind: null, paid: false }
+  const res = await handle(req, usage)
+  // Refused before any paid model call (flagged input, a bad or oversized
+  // image, the moderation check itself failing): nothing was spent and the
+  // user got nothing, so the use is given back. The refund is charged to the
+  // day's moderation counter instead, so refusals stay capped. Moderation
+  // actions ('mod') keep theirs: that counter is the cap.
+  if (usage.user && usage.kind && usage.kind !== 'mod' && !usage.paid && res.status >= 400) {
+    try {
+      const admin = createClient(SUPABASE_URL, SERVICE_KEY)
+      const { error } = await admin.rpc('refund_ai_limit', {
+        p_user: usage.user,
+        p_kind: usage.kind,
+        p_mod_max: MAX_MOD_PER_DAY,
+      })
+      if (error) console.error('refund_ai_limit failed:', error)
+    } catch (e) {
+      console.error('refund_ai_limit failed:', e)
+    }
+  }
+  return res
+})
+
+async function handle(req: Request, usage: Usage): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
+
+  // Every model call goes through here. Anything but the free moderation
+  // endpoint costs money, which makes the request's limit use stick.
+  const callOpenAI = (url: string, body: unknown) => {
+    if (!url.endsWith('/moderations')) usage.paid = true
+    return requestOpenAI(url, body)
+  }
 
   const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
@@ -122,6 +157,7 @@ Deno.serve(async (req) => {
     const admin = createClient(SUPABASE_URL, SERVICE_KEY)
     const { data: { user }, error: authErr } = await admin.auth.getUser(auth.slice(7))
     if (authErr || !user) return json({ error: 'unauthorized' }, 401)
+    usage.user = user.id
 
     const body = await req.json()
     const { action } = body
@@ -139,7 +175,11 @@ Deno.serve(async (req) => {
         console.error('consume_ai_limit failed:', error)
         return null
       }
-      return data as { allowed: boolean; count: number }
+      const rl = data as { allowed: boolean; count: number }
+      // Remembered so a request refused before any paid call can give it
+      // back. (count 0 is the owner's exemption: nothing was taken.)
+      if (rl?.allowed && rl.count > 0) usage.kind = kind
+      return rl
     }
 
     const checkImageSize = (b64: string) =>
@@ -1170,7 +1210,7 @@ Deno.serve(async (req) => {
     console.error('openai-proxy error:', e)
     return json({ error: 'internal_error' }, 500)
   }
-})
+}
 
 // ── Meal coach helpers ────────────────────────────────────────────────────────
 
@@ -1615,7 +1655,8 @@ async function findYouTubeDemo(name: string): Promise<{ id: string; title: strin
   }
 }
 
-async function callOpenAI(url: string, body: unknown): Promise<Record<string, unknown>> {
+// Called only through handle()'s callOpenAI, which notes paid calls.
+async function requestOpenAI(url: string, body: unknown): Promise<Record<string, unknown>> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
