@@ -1,0 +1,266 @@
+import { useState, useEffect, useRef } from 'react'
+import { View, Text, Pressable, StyleSheet, Animated } from 'react-native'
+import Svg, { Circle } from 'react-native-svg'
+import { useTheme } from '../lib/ThemeContext'
+
+const RING_R    = 52
+const RING_STR  = 8
+const CIRC      = 2 * Math.PI * RING_R
+
+function fmt(secs) {
+  const m = String(Math.floor(secs / 60)).padStart(2, '0')
+  const s = String(secs % 60).padStart(2, '0')
+  return `${m}:${s}`
+}
+
+function motivationalMsg(step, total) {
+  const pct = step / total
+  if (pct === 0) return "Let's go! 🚀"
+  if (pct < 0.3) return 'Great start! 💪'
+  if (pct < 0.6) return 'Keep going! 🔥'
+  if (pct < 0.85) return 'Almost there! ⚡'
+  return 'Last one! 🎯'
+}
+
+export default function RunRoutine({ run, color = '#2b7fff', onStepDone, onFinish, onGoBack, onToggleSubTask }) {
+  const { theme } = useTheme()
+  const s = makeStyles(theme)
+  const { currentStep, steps } = run
+  const step    = steps[currentStep]
+  const isLast  = currentStep === steps.length - 1
+  const [elapsed, setElapsed] = useState(0)
+
+  const btnScale  = useRef(new Animated.Value(1)).current
+  const cardScale = useRef(new Animated.Value(0.94)).current
+  const cardOpacity = useRef(new Animated.Value(0)).current
+
+  // Pop-in animation on each new task
+  useEffect(() => {
+    cardScale.setValue(0.94)
+    cardOpacity.setValue(0)
+    Animated.parallel([
+      Animated.spring(cardScale, { toValue: 1, useNativeDriver: true, speed: 18, bounciness: 10 }),
+      Animated.timing(cardOpacity, { toValue: 1, duration: 180, useNativeDriver: true }),
+    ]).start()
+  }, [currentStep])
+
+  // Elapsed timer
+  useEffect(() => {
+    const startedAt = step.startedAt || Date.now()
+    const tick = () => setElapsed(Math.floor((Date.now() - startedAt) / 1000))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [currentStep])
+
+  function pressIn() {
+    Animated.spring(btnScale, { toValue: 0.94, useNativeDriver: true, speed: 40, bounciness: 4 }).start()
+  }
+  function pressOut() {
+    Animated.spring(btnScale, { toValue: 1, useNativeDriver: true, speed: 15, bounciness: 12 }).start()
+  }
+
+  const pct      = Math.round((currentStep / steps.length) * 100)
+  const goalSecs = step.timeGoalSecs ?? (step.timeGoalMins ?? 0) * 60
+  const hasGoal  = goalSecs > 0
+  const over     = hasGoal && elapsed > goalSecs
+  const tColor   = over ? '#ef4444' : color
+  const ringOff  = hasGoal ? CIRC * (1 - Math.min(elapsed / goalSecs, 1)) : CIRC
+  const hasSubs  = step.subTasks?.length > 0
+  const subDone  = step.subTasks?.filter(st => st.done).length ?? 0
+  const upcoming = steps.slice(currentStep + 1, currentStep + 4)
+
+  return (
+    <View>
+
+      {/* ── Progress dots ─────────────────────────────────────── */}
+      <View style={s.dotsRow}>
+        {steps.map((_, i) => (
+          <View key={i} style={[
+            s.dot,
+            i < currentStep  && [s.dotDone, { backgroundColor: color }],
+            i === currentStep && [s.dotCurrent, { backgroundColor: color }],
+            i > currentStep  && s.dotFuture,
+          ]} />
+        ))}
+      </View>
+
+      {/* ── Motivational + pct ────────────────────────────────── */}
+      <View style={s.topRow}>
+        <Text style={[s.motivational, { color }]}>{motivationalMsg(currentStep, steps.length)}</Text>
+        <Text style={[s.pctLabel, { color }]}>{pct}%</Text>
+      </View>
+
+      {/* ── Main task card ────────────────────────────────────── */}
+      <Animated.View style={[
+        s.card, { borderColor: color + '38' },
+        { transform: [{ scale: cardScale }], opacity: cardOpacity },
+      ]}>
+        {/* NOW badge */}
+        <View style={[s.nowBadge, { backgroundColor: color }]}>
+          <Text style={s.nowBadgeText}>NOW  ·  {currentStep + 1} / {steps.length}</Text>
+        </View>
+
+        <Text style={s.taskName}>{step.text}</Text>
+
+        {/* Sub-tasks */}
+        {hasSubs && (
+          <View style={s.subSection}>
+            <Text style={[s.subHeader, { color }]}>{subDone} / {step.subTasks.length} steps</Text>
+            {step.subTasks.map(st => (
+              <Pressable key={st.id} style={s.subRow} onPress={() => onToggleSubTask(st.id)}>
+                <View style={[s.subCheck, st.done && { backgroundColor: color, borderColor: color }]}>
+                  {st.done && <Text style={s.subMark}>✓</Text>}
+                </View>
+                <Text style={[s.subText, st.done && s.subDone]}>{st.text}</Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        {/* Timer */}
+        <View style={s.timerWrap}>
+          {hasGoal ? (
+            <View style={s.ringBox}>
+              <Svg width={130} height={130} style={StyleSheet.absoluteFill}>
+                <Circle cx={65} cy={65} r={RING_R} stroke={tColor + '22'} strokeWidth={RING_STR} fill="none" />
+                <Circle cx={65} cy={65} r={RING_R} stroke={tColor} strokeWidth={RING_STR} fill="none"
+                  strokeDasharray={CIRC} strokeDashoffset={ringOff}
+                  strokeLinecap="round" rotation="-90" originX={65} originY={65} />
+              </Svg>
+              <Text style={[s.timerBig, { color: tColor, fontSize: 30 }]}>{fmt(elapsed)}</Text>
+              <Text style={[s.timerSub, { color: over ? '#ef4444' : '#c4c4c4' }]}>
+                {over ? `+${fmt(elapsed - goalSecs)} over` : `/ ${fmt(goalSecs)}`}
+              </Text>
+            </View>
+          ) : (
+            <View style={[s.timerCircle, { borderColor: color + '33' }]}>
+              <Text style={[s.timerBig, { color }]}>{fmt(elapsed)}</Text>
+            </View>
+          )}
+        </View>
+      </Animated.View>
+
+      {/* ── Upcoming pills ───────────────────────────────────── */}
+      {upcoming.length > 0 && (
+        <View style={s.upcomingRow}>
+          {upcoming.map((t, i) => (
+            <View key={t.id} style={[s.upcomingPill, { backgroundColor: color + '10', borderColor: color + '28' }]}>
+              <View style={[s.upcomingNum, { backgroundColor: color + '22' }]}>
+                <Text style={[s.upcomingNumText, { color }]}>{currentStep + i + 2}</Text>
+              </View>
+              <Text style={[s.upcomingText, { color: color + 'cc' }]} numberOfLines={1}>{t.text}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+
+      {/* ── Action button ────────────────────────────────────── */}
+      <Animated.View style={{ transform: [{ scale: btnScale }] }}>
+        <Pressable
+          style={[s.btn, { backgroundColor: isLast ? '#10b981' : color }]}
+          onPressIn={pressIn}
+          onPressOut={pressOut}
+          onPress={() => isLast ? onFinish(elapsed * 1000) : onStepDone(elapsed * 1000)}
+        >
+          <Text style={s.btnText}>
+            {isLast ? 'Finish Routine  ✓' : 'Done, Next Task  →'}
+          </Text>
+        </Pressable>
+      </Animated.View>
+
+      {/* ── Go back ──────────────────────────────────────────── */}
+      {currentStep > 0 && (
+        <Pressable style={s.backBtn} onPress={() => onGoBack?.()}>
+          <Text style={[s.backBtnText, { color: color + 'aa' }]}>← Previous Task</Text>
+        </Pressable>
+      )}
+
+    </View>
+  )
+}
+
+function makeStyles(theme) { return StyleSheet.create({
+  // Progress dots
+  dotsRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    marginBottom: 14, paddingHorizontal: 2,
+  },
+  dot:        { height: 6, flex: 1, borderRadius: 3 },
+  dotDone:    { height: 6, opacity: 0.5 },
+  dotCurrent: { height: 9, flex: 1.8, borderRadius: 5 },
+  dotFuture:  { backgroundColor: theme.divider },
+
+  topRow: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    marginBottom: 14, paddingHorizontal: 2,
+  },
+  motivational: { fontSize: 14, fontWeight: '700' },
+  pctLabel:     { fontSize: 14, fontWeight: '800' },
+
+  // Card
+  card: {
+    backgroundColor: theme.card, borderRadius: 32,
+    paddingHorizontal: 24, paddingTop: 22, paddingBottom: 40,
+    borderWidth: 2, alignItems: 'center', marginBottom: 14,
+    shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
+    shadowOffset: { width: 4, height: 5 }, shadowOpacity: 0.18, shadowRadius: 0, elevation: 10,
+  },
+  nowBadge: {
+    paddingHorizontal: 18, paddingVertical: 8,
+    borderRadius: 20, marginBottom: 18,
+  },
+  nowBadgeText: { fontSize: 11, fontWeight: '900', letterSpacing: 1.8, color: '#fff' },
+  taskName: {
+    fontSize: 30, fontWeight: '800', color: theme.text,
+    textAlign: 'center', marginBottom: 20, lineHeight: 38,
+  },
+
+  // Subtasks
+  subSection: { width: '100%', marginBottom: 16 },
+  subHeader: { fontSize: 12, fontWeight: '700', letterSpacing: 1, textAlign: 'center', marginBottom: 12 },
+  subRow: { flexDirection: 'row', alignItems: 'center', gap: 14, paddingVertical: 10 },
+  subCheck: {
+    width: 32, height: 32, borderRadius: 10, borderWidth: 2,
+    borderColor: theme.cardBorder, alignItems: 'center', justifyContent: 'center',
+  },
+  subMark: { color: '#fff', fontSize: 14, fontWeight: '800' },
+  subText: { flex: 1, fontSize: 17, color: theme.text, fontWeight: '600' },
+  subDone: { color: theme.muted, textDecorationLine: 'line-through' },
+
+  // Timer
+  timerWrap: { marginTop: 4 },
+  ringBox: {
+    width: 130, height: 130, alignItems: 'center', justifyContent: 'center',
+  },
+  timerCircle: {
+    width: 140, height: 140, borderRadius: 70,
+    borderWidth: 2, alignItems: 'center', justifyContent: 'center',
+  },
+  timerBig: { fontSize: 42, fontWeight: '300' },
+  timerSub: { fontSize: 13, fontWeight: '500', marginTop: 4 },
+
+  // Upcoming
+  upcomingRow: { gap: 7, marginBottom: 14 },
+  upcomingPill: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    borderRadius: 14, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 10,
+  },
+  upcomingNum: {
+    width: 24, height: 24, borderRadius: 8,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  upcomingNumText: { fontSize: 12, fontWeight: '800' },
+  upcomingText: { flex: 1, fontSize: 14, fontWeight: '600' },
+
+  backBtn: { alignItems: 'center', paddingVertical: 12 },
+  backBtnText: { fontSize: 14, fontWeight: '600' },
+
+  // Button
+  btn: {
+    borderRadius: 22, padding: 20, alignItems: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.22, shadowRadius: 12, elevation: 8,
+  },
+  btnText: { color: '#fff', fontWeight: '800', fontSize: 17, letterSpacing: 0.3 },
+}) }

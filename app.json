@@ -1,24 +1,47 @@
 {
   "expo": {
-    "name": "ProductivityNative",
+    "name": "LifeLayer",
     "slug": "ProductivityNative",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "scheme": "productivityapp",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.shreyj.productivityapp",
+      "usesAppleSignIn": true
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      "package": "com.shreyj.productivityapp"
     },
     "web": {
+      "bundler": "metro",
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-web-browser",
+      ["expo-camera", {
+        "cameraPermission": "Allow LifeLayer to use the camera to scan food barcodes"
+      }],
+      ["expo-image-picker", {
+        "photosPermission": "Allow LifeLayer to access your photos for AI skin analysis.",
+        "cameraPermission": "Allow LifeLayer to take a photo for AI skin analysis."
+      }],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#5c5ef0",
+          "sounds": []
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": false
     }
   }
 }

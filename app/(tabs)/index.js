@@ -1,0 +1,2174 @@
+import { useState, useCallback, useLayoutEffect, useEffect, useRef } from 'react'
+import {
+  View, Text, TextInput, Pressable, StyleSheet, ScrollView,
+  Modal, Switch, Alert,
+} from 'react-native'
+import AsyncStorage from '@react-native-async-storage/async-storage'
+import Svg, { Polyline, Circle, Line as SvgLine } from 'react-native-svg'
+import { router, useFocusEffect, useNavigation } from 'expo-router'
+import { useAuth } from '../../lib/AuthContext'
+import { useTheme } from '../../lib/ThemeContext'
+import StreakBadge from '../../components/StreakBadge'
+import { getRoutineNames, getRoutineTemplate, getTodayRun, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries } from '../../lib/storage'
+import { loadHabits, saveHabits } from '../../lib/habitsStorage'
+import { routineTheme } from '../../lib/themes'
+import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
+import { useProductivity } from '../../lib/ProductivityContext'
+import { getProductivitySessions, getTodayProductiveMinutes, clearProductivitySessions } from '../../lib/productivityStorage'
+
+const PROD_COLOR    = '#6366f1'
+const HABITS_COLOR  = '#f43f5e'
+const BUILD_COLOR   = '#10b981'
+const DEFAULT_ROUTINES = new Set(['Morning', 'Fitness', 'Night'])
+
+function fmtMinsShort(m) {
+  if (m <= 0) return '0m'
+  if (m >= 60) {
+    const h = Math.floor(m / 60)
+    const rem = m % 60
+    return rem > 0 ? `${h}h ${rem}m` : `${h}h`
+  }
+  return `${m}m`
+}
+
+function formatDate(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00')
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
+function getInsight(sessions) {
+  if (sessions.length < 2) return null
+  const deepS    = sessions.filter(s => s.rating >= 8)
+  const shallowS = sessions.filter(s => s.rating < 8)
+  const deepMins    = deepS.reduce((sum, s) => sum + (s.actualMins || 0), 0)
+  const shallowMins = shallowS.reduce((sum, s) => sum + (s.actualMins || 0), 0)
+  const totalMins   = deepMins + shallowMins
+  if (totalMins === 0) return null
+  const deepPct      = deepMins / totalMins
+  const avgDeepMins  = deepS.length    ? deepMins / deepS.length       : 0
+  const avgShalMins  = shallowS.length ? shallowMins / shallowS.length : 0
+  const recentAvg = sessions.slice(-3).reduce((s, x) => s + x.rating, 0) / Math.min(3, sessions.length)
+  const olderAvg  = sessions.slice(0, 3).reduce((s, x) => s + x.rating, 0) / Math.min(3, sessions.length)
+  const improving = recentAvg > olderAvg + 0.5
+
+  if (shallowMins > deepMins * 3 && shallowMins > 20) {
+    return {
+      label: `${fmtMinsShort(deepMins)} deep vs ${fmtMinsShort(shallowMins)} shallow focus`,
+      tip: 'Most time is low-focus. Try single-task 25 min blocks with phone away.',
+    }
+  }
+  if (deepPct >= 0.6) {
+    return {
+      label: `${Math.round(deepPct * 100)}% of your time is deep focus`,
+      tip: improving ? 'Focus quality is trending up — keep the momentum!' : 'Excellent focus quality. Stay intentional.',
+    }
+  }
+  if (deepS.length > 0 && avgShalMins > avgDeepMins * 1.5) {
+    return {
+      label: `Shorter sessions score higher (avg ${fmtMinsShort(Math.round(avgDeepMins))} for 8+)`,
+      tip: 'Your best sessions are shorter. Try 25 min focused blocks.',
+    }
+  }
+  if (improving) {
+    return {
+      label: 'Focus quality trending up lately',
+      tip: 'Recent sessions score higher than earlier ones. Keep it up!',
+    }
+  }
+  const avg = (sessions.reduce((s, x) => s + x.rating, 0) / sessions.length).toFixed(1)
+  return {
+    label: `${fmtMinsShort(totalMins)} tracked · avg ${avg}/10`,
+    tip: 'Log more sessions to unlock personalized focus insights.',
+  }
+}
+
+function ScoreSparkline({ sessions, theme, selectedIdx, onSelect }) {
+  if (sessions.length < 2) return null
+  const W = 230, H = 64
+  const PAD = { left: 6, right: 6, top: 10, bottom: 10 }
+  const chartW = W - PAD.left - PAD.right
+  const chartH = H - PAD.top - PAD.bottom
+  const pts = sessions.map((s, i) => ({
+    x: PAD.left + (i / (sessions.length - 1)) * chartW,
+    y: PAD.top + chartH - ((s.rating - 1) / 9) * chartH,
+  }))
+  const pointsStr = pts.map(p => `${p.x},${p.y}`).join(' ')
+  return (
+    <Svg width={W} height={H}>
+      <SvgLine x1={PAD.left} y1={PAD.top + chartH / 2} x2={W - PAD.right} y2={PAD.top + chartH / 2}
+        stroke={theme.divider} strokeWidth={1} strokeDasharray="3,3" />
+      <Polyline points={pointsStr} fill="none" stroke={PROD_COLOR} strokeWidth={2}
+        strokeLinecap="round" strokeLinejoin="round" />
+      {pts.map((p, i) => (
+        <Circle
+          key={i}
+          cx={p.x} cy={p.y}
+          r={selectedIdx === i ? 8 : 6}
+          fill={selectedIdx === i ? '#fff' : PROD_COLOR}
+          stroke={PROD_COLOR}
+          strokeWidth={selectedIdx === i ? 2.5 : 0}
+          onPress={() => onSelect(selectedIdx === i ? null : i)}
+        />
+      ))}
+    </Svg>
+  )
+}
+
+function ProductivityCard({ theme, userId }) {
+  const { activeSession, elapsedSeconds, isPaused, pause, resume, openSession } = useProductivity()
+  const [todayMins,      setTodayMins]      = useState(0)
+  const [recentSessions, setRecentSessions] = useState([])
+  const [selectedIdx,    setSelectedIdx]    = useState(null)
+  const wasActive = useRef(false)
+
+  function refreshStats(uid) {
+    getTodayProductiveMinutes(uid).then(setTodayMins)
+    getProductivitySessions(uid, 30).then(sessions => {
+      setRecentSessions([...sessions].reverse())
+      setSelectedIdx(null)
+    })
+  }
+
+  useFocusEffect(useCallback(() => {
+    if (!userId) return
+    refreshStats(userId)
+  }, [userId]))
+
+  useEffect(() => {
+    if (wasActive.current && !activeSession && userId) refreshStats(userId)
+    wasActive.current = !!activeSession
+  }, [activeSession, userId])
+
+  const isActive      = !!activeSession
+  const chartSessions = recentSessions.slice(-7)
+  const selectedSess  = selectedIdx != null ? chartSessions[selectedIdx] : null
+  const insight       = recentSessions.length >= 2 ? getInsight(recentSessions) : null
+  const deepMins    = recentSessions.filter(s => s.rating >= 8).reduce((sum, s) => sum + (s.actualMins || 0), 0)
+  const shallowMins = recentSessions.filter(s => s.rating <  8).reduce((sum, s) => sum + (s.actualMins || 0), 0)
+
+  function fmtElapsed(s) {
+    const m = Math.floor(s / 60)
+    const sec = s % 60
+    return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+  }
+
+  function handleReset() {
+    Alert.alert(
+      'Reset Deep Work Stats',
+      'This will permanently delete all your session history. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Reset', style: 'destructive', onPress: async () => {
+          await clearProductivitySessions(userId)
+          refreshStats(userId)
+        }},
+      ]
+    )
+  }
+
+  return (
+    <View style={[pc.card, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+      <View style={[pc.stripe, { backgroundColor: PROD_COLOR }]} />
+      <View style={pc.body}>
+
+        <View style={pc.headerRow}>
+          <View style={[pc.iconCircle, { backgroundColor: theme.isDark ? '#1e1e38' : '#eef2ff' }]}>
+            <Text style={pc.icon}>🎯</Text>
+          </View>
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={[pc.title, { color: theme.text }]}>Deep Work</Text>
+            <Text style={[pc.sub, { color: theme.subtext }]}>
+              {todayMins > 0 ? `${fmtMinsShort(todayMins)} focused today` : 'No sessions yet today'}
+            </Text>
+          </View>
+          {isActive && (
+            <View style={[pc.liveBadge, { backgroundColor: theme.isDark ? '#1e1e38' : '#eef2ff' }]}>
+              <View style={[pc.liveDot, { backgroundColor: isPaused ? '#fbbf24' : '#6366f1' }]} />
+              <Text style={[pc.liveText, { color: PROD_COLOR }]}>
+                {isPaused ? 'Paused' : 'Live'}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {isActive ? (
+          <View style={[pc.activeRow, { backgroundColor: theme.isDark ? '#1e1e38' : '#eef2ff' }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[pc.activeTask, { color: theme.text }]} numberOfLines={1}>
+                {activeSession.taskDesc || 'Productivity Session'}
+              </Text>
+              <Text style={[pc.activeTimer, { color: PROD_COLOR }]}>
+                {fmtElapsed(elapsedSeconds)} / {activeSession.goalMins}m goal
+              </Text>
+            </View>
+            <Pressable style={[pc.pauseBtn, { borderColor: theme.cardBorder }]} onPress={isPaused ? resume : pause}>
+              <Text style={[pc.pauseBtnText, { color: PROD_COLOR }]}>{isPaused ? '▶' : '⏸'}</Text>
+            </Pressable>
+          </View>
+        ) : chartSessions.length >= 2 ? (
+          <>
+            {insight && (
+              <View style={[pc.insight, { backgroundColor: PROD_COLOR + '12', borderColor: PROD_COLOR + '28' }]}>
+                <Text style={[pc.insightLabel, { color: PROD_COLOR }]}>{insight.label}</Text>
+                <Text style={[pc.insightTip, { color: theme.subtext }]}>{insight.tip}</Text>
+              </View>
+            )}
+
+            <View style={pc.chartRow}>
+              <ScoreSparkline
+                sessions={chartSessions}
+                theme={theme}
+                selectedIdx={selectedIdx}
+                onSelect={setSelectedIdx}
+              />
+              <View style={pc.chartMeta}>
+                <Text style={[pc.chartMetaVal, { color: PROD_COLOR }]}>
+                  {chartSessions[chartSessions.length - 1]?.rating ?? '—'}/10
+                </Text>
+                <Text style={[pc.chartMetaLabel, { color: theme.subtext }]}>Last score</Text>
+              </View>
+            </View>
+
+            {(deepMins > 0 || shallowMins > 0) && (
+              <View style={pc.focusRow}>
+                <View style={[pc.focusChip, { backgroundColor: PROD_COLOR + '18' }]}>
+                  <Text style={[pc.focusVal, { color: PROD_COLOR }]}>{fmtMinsShort(deepMins)}</Text>
+                  <Text style={[pc.focusLbl, { color: PROD_COLOR + 'cc' }]}>deep focus</Text>
+                </View>
+                <View style={[pc.focusChip, { backgroundColor: theme.isDark ? '#28284a' : '#ebebf5' }]}>
+                  <Text style={[pc.focusVal, { color: theme.text }]}>{fmtMinsShort(shallowMins)}</Text>
+                  <Text style={[pc.focusLbl, { color: theme.subtext }]}>shallow focus</Text>
+                </View>
+              </View>
+            )}
+
+            {selectedSess && (
+              <View style={[pc.detailBox, { backgroundColor: theme.isDark ? '#1e1e38' : '#f4f4fc', borderColor: theme.cardBorder }]}>
+                <Text style={[pc.detailTask, { color: theme.text }]} numberOfLines={2}>
+                  {selectedSess.taskDesc || 'No description'}
+                </Text>
+                <View style={pc.detailMeta}>
+                  <Text style={[pc.detailChip, { backgroundColor: PROD_COLOR + '18', color: PROD_COLOR }]}>
+                    {selectedSess.rating}/10
+                  </Text>
+                  <Text style={[pc.detailChip, { backgroundColor: theme.isDark ? '#28284a' : '#e8e8f5', color: theme.subtext }]}>
+                    {fmtMinsShort(selectedSess.actualMins)}
+                  </Text>
+                  <Text style={[pc.detailChip, { backgroundColor: theme.isDark ? '#28284a' : '#e8e8f5', color: theme.subtext }]}>
+                    {formatDate(selectedSess.date)}
+                  </Text>
+                </View>
+              </View>
+            )}
+          </>
+        ) : null}
+
+        <Pressable style={[pc.btn, { backgroundColor: PROD_COLOR }]} onPress={openSession}>
+          <Text style={pc.btnText}>{isActive ? 'View Session  →' : '+ Start Session'}</Text>
+        </Pressable>
+
+        {recentSessions.length > 0 && (
+          <Pressable onPress={handleReset} style={pc.resetLink}>
+            <Text style={[pc.resetLinkText, { color: theme.muted }]}>Reset stats</Text>
+          </Pressable>
+        )}
+
+      </View>
+    </View>
+  )
+}
+
+function fmtMs(ms) {
+  const s = Math.floor(ms / 1000)
+  const m = Math.floor(s / 60)
+  return m > 0 ? `${m}m ${s % 60}s` : `${s}s`
+}
+
+function fmtTime(mins) {
+  const total = ((mins % 1440) + 1440) % 1440
+  const h = Math.floor(total / 60)
+  const m = total % 60
+  const ampm = h >= 12 ? 'PM' : 'AM'
+  const h12 = h % 12 || 12
+  return `${h12}:${String(m).padStart(2, '0')} ${ampm}`
+}
+
+// ── Daily Dashboard ───────────────────────────────────────────────────────
+
+const EVT_EMOJI = { assignment: '📚', meeting: '📅', reminder: '🔔', other: '📌' }
+const CIRC_R      = 22
+const CIRC_STROKE = 5
+const CIRC_CIRCUM = 2 * Math.PI * CIRC_R
+
+function fmtEventTime(t) {
+  if (!t) return ''
+  const [h, m] = t.split(':').map(Number)
+  return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`
+}
+
+function nextRoutineNudge(visible, doneCount, total) {
+  if (total === 0) return 'Add a routine to get started'
+  if (doneCount >= total) return 'All done — outstanding!'
+  const next = visible.find(r => !r.run?.finished)
+  if (!next) return 'Keep it up!'
+  return doneCount === 0
+    ? `Let's start logging your ${next.name} routine!`
+    : `Let's move onto ${next.name} routine!`
+}
+
+function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, theme }) {
+  const [calItems, setCalItems] = useState([])
+  const [pendingTodos, setPendingTodos] = useState([])
+  const [tasksToday, setTasksToday] = useState([])
+  const [todayJournal, setTodayJournal] = useState(null)
+  const [collapsed, setCollapsed] = useState(false)
+
+  useEffect(() => {
+    if (!user?.id) return
+    AsyncStorage.getItem(`@dash_collapsed_${user.id}`).then(v => {
+      if (v === 'true') setCollapsed(true)
+    }).catch(() => {})
+  }, [user?.id])
+
+  function toggleCollapsed() {
+    const next = !collapsed
+    setCollapsed(next)
+    if (user?.id) AsyncStorage.setItem(`@dash_collapsed_${user.id}`, String(next)).catch(() => {})
+  }
+
+  useFocusEffect(useCallback(() => {
+    if (!user?.id) return
+    const key = today()
+    Promise.all([
+      getCalendarEvents(user.id),
+      getDayTodos(user.id, key),
+      getScheduleItems(user.id),
+      getTasks(user.id),
+      getJournalEntries(user.id),
+    ]).then(([events, todos, schedule, allTasks, jEntries]) => {
+      const dow = new Date().getDay()
+      const combined = [
+        ...events.filter(e => e.date === key),
+        ...schedule.filter(s => s.days?.includes(dow)),
+      ].sort((a, b) =>
+        (a.time || a.startTime || '99:99').localeCompare(b.time || b.startTime || '99:99')
+      )
+      setCalItems(combined.slice(0, 4))
+      setPendingTodos(todos.filter(t => !t.done).slice(0, 2))
+      setTasksToday(allTasks.filter(t => !t.done && t.dueDate === key).slice(0, 3))
+      setTodayJournal(jEntries[key] ?? null)
+    })
+  }, [user?.id]))
+
+  const visible   = routines.filter(r => !hiddenSet.has(r.name))
+  const doneCount = visible.filter(r => r.run?.finished).length
+  const total     = visible.length
+  const pct       = total > 0 ? doneCount / total : 0
+  const arcDash   = pct * CIRC_CIRCUM
+
+  const activeStreaks = Object.entries(routineStreaks)
+    .filter(([, v]) => v > 0)
+    .sort(([, a], [, b]) => b - a)
+
+  const displayName = (profile?.name?.trim() || user?.name || 'there').split(' ')[0]
+  const dateLabel   = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+
+  const allItems = [
+    ...calItems,
+    ...tasksToday.map(t => ({ ...t, _isTask: true })),
+    ...pendingTodos.map(t => ({ ...t, _isTodo: true })),
+  ].slice(0, 4)
+
+  return (
+    <View style={[db.card, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+      {/* Header: greeting + circle (when expanded) + collapse toggle */}
+      <View style={db.headerRow}>
+        <View style={{ flex: 1, paddingRight: 8 }}>
+          <Text style={[db.welcome, { color: theme.text }]}>
+            Welcome back,{' '}
+            <Text style={{ color: theme.accent, fontWeight: '800' }}>{displayName}</Text>
+          </Text>
+          <Text style={[db.dateStr, { color: theme.subtext }]}>{dateLabel}</Text>
+          {!collapsed && (
+            <Text style={[db.motivation, { color: theme.muted }]}>
+              {nextRoutineNudge(visible, doneCount, total)}
+            </Text>
+          )}
+        </View>
+        {!collapsed && (
+          <View style={db.circleWrap}>
+            <Svg width={60} height={60}>
+              <Circle cx={30} cy={30} r={CIRC_R} fill="none"
+                stroke={theme.isDark ? '#ffffff12' : '#e5e7eb'} strokeWidth={CIRC_STROKE} />
+              {pct > 0 && (
+                <Circle cx={30} cy={30} r={CIRC_R} fill="none"
+                  stroke={pct >= 1 ? '#10b981' : '#6366f1'}
+                  strokeWidth={CIRC_STROKE}
+                  strokeDasharray={`${arcDash} ${CIRC_CIRCUM}`}
+                  strokeLinecap="round"
+                  transform="rotate(-90 30 30)"
+                />
+              )}
+            </Svg>
+            <View style={db.circleLabel}>
+              <Text style={[db.circleNum, { color: pct >= 1 ? '#10b981' : theme.text }]}>{doneCount}</Text>
+              <Text style={[db.circleDen, { color: theme.muted }]}>/{total}</Text>
+            </View>
+          </View>
+        )}
+        <Pressable onPress={toggleCollapsed} hitSlop={12} style={db.collapseBtn}>
+          <Text style={[db.chevron, { color: theme.muted }]}>{collapsed ? '▼' : '▲'}</Text>
+        </Pressable>
+      </View>
+
+      {!collapsed && (
+        <>
+          {/* Active streaks — no limit, wraps naturally */}
+          {activeStreaks.length > 0 && (
+            <View style={db.streakRow}>
+              {activeStreaks.map(([name, count]) => {
+                const card = routineTheme(name)
+                return (
+                  <View key={name} style={[db.streakChip, { backgroundColor: card.color + '18' }]}>
+                    <Text style={{ fontSize: 11 }}>🔥</Text>
+                    <Text style={[db.streakChipText, { color: card.color }]}>{name} · {count}</Text>
+                  </View>
+                )
+              })}
+            </View>
+          )}
+
+          {/* Today's events & todos */}
+          {allItems.length > 0 && (
+            <>
+              <View style={[db.divider, { backgroundColor: theme.divider }]} />
+              {allItems.map((item, i) => {
+                const isTodo     = !!item._isTodo
+                const isTask     = !!item._isTask
+                const isSchedule = !isTodo && !isTask && item.startTime !== undefined
+                const title = isTodo ? item.text : item.title
+                const time  = isSchedule ? item.startTime : item.time
+                const emoji = isTodo ? '✅' : isTask ? '🎯' : isSchedule ? '📅' : (EVT_EMOJI[item.type] ?? '📌')
+                return (
+                  <View key={item.id ?? i} style={db.eventRow}>
+                    <Text style={{ fontSize: 12 }}>{emoji}</Text>
+                    <Text style={[db.eventTitle, { color: theme.text }]} numberOfLines={1}>{title}</Text>
+                    {time ? <Text style={[db.eventTime, { color: theme.muted }]}>{fmtEventTime(time)}</Text> : null}
+                  </View>
+                )
+              })}
+            </>
+          )}
+
+          {/* Journal status */}
+          <View style={[db.divider, { backgroundColor: theme.divider }]} />
+          <Pressable style={db.eventRow} onPress={() => router.push('/(tabs)/calendar?openJournal=1')}>
+            <Text style={{ fontSize: 12 }}>📔</Text>
+            <Text style={[db.eventTitle, { color: theme.text }]}>Journal</Text>
+            <Text style={[db.eventTime, { color: todayJournal ? '#10b981' : theme.muted }]}>
+              {todayJournal ? '✓ Written' : 'Not yet →'}
+            </Text>
+          </Pressable>
+        </>
+      )}
+    </View>
+  )
+}
+
+function RoutineCard({ name, template, run, todayMuscle, routineStreak, settings, isDefault, isHidden, onHide, onUnhide, onDelete }) {
+  const { theme } = useTheme()
+  const card = routineTheme(name)
+  const isRunning = !isHidden && run && !run.finished
+  const isDone    = !isHidden && run?.finished
+
+  let statusText = isHidden ? 'Hidden · not counted in streak' : `${template.length} tasks`
+  let btnLabel   = 'Start  →'
+  let btnColor   = card.color
+
+  if (isDone) {
+    statusText = `Done in ${fmtMs(run.completedAt - run.startedAt)}`
+    btnLabel   = 'View Summary  →'
+    btnColor   = '#10b981'
+  } else if (isRunning) {
+    statusText = `Task ${run.currentStep + 1} of ${run.steps.length}`
+    btnLabel   = 'Continue  →'
+    btnColor   = '#f59e0b'
+  }
+
+  const todayMuscles = normalizeDay(todayMuscle)
+  const showSplit    = name === 'Fitness' && !isHidden && todayMuscles[0] !== 'Rest'
+
+  const totalGoalMins = Math.round(template.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60) / 60, 0))
+  const timeRange = settings
+    ? totalGoalMins > 0
+      ? `${fmtTime(settings.startTimeMinutes)} – ${fmtTime(settings.startTimeMinutes + totalGoalMins)}`
+      : fmtTime(settings.startTimeMinutes)
+    : null
+
+  return (
+    <Pressable
+      style={[s.card, {
+        backgroundColor: theme.card,
+        borderColor: theme.cardBorder,
+        shadowColor: theme.isDark ? 'transparent' : '#0d1b5e',
+        opacity: isHidden ? 0.55 : 1,
+      }]}
+      onPress={isHidden ? undefined : () => router.push('/routine/' + name)}
+    >
+      <View style={[s.cardStripe, { backgroundColor: card.color }]} />
+      <View style={s.cardContent}>
+        <View style={s.cardTop}>
+          <View style={[s.emojiCircle, { backgroundColor: theme.isDark ? theme.bg : card.bg }]}>
+            <Text style={s.emoji}>{card.emoji}</Text>
+          </View>
+          <View style={{ flex: 1, marginLeft: 14 }}>
+            <View style={s.cardNameRow}>
+              <Text style={[s.cardName, { color: theme.text }]}>{name}</Text>
+              {!isHidden && routineStreak > 0 && (
+                <View style={[s.rStreak, { backgroundColor: theme.isDark ? '#2d1a00' : '#fff3e0' }]}>
+                  <Text style={s.rStreakText}>🔥 {routineStreak}</Text>
+                </View>
+              )}
+            </View>
+            <Text style={[
+              s.cardStatus,
+              { color: theme.subtext },
+              isDone    && { color: '#10b981' },
+              isRunning && { color: '#f59e0b' },
+              isHidden  && { color: theme.muted, fontStyle: 'italic' },
+            ]}>
+              {statusText}
+            </Text>
+            {!isHidden && timeRange && (
+              <Text style={[s.cardTime, { color: theme.muted }]}>🕐 {timeRange}</Text>
+            )}
+          </View>
+          <View style={s.cardTopRight}>
+            {isDone && (
+              <View style={[s.doneBadge, { backgroundColor: theme.isDark ? '#0d2e21' : '#ecfdf5' }]}>
+                <Text style={s.doneBadgeText}>✓</Text>
+              </View>
+            )}
+            {isRunning && (
+              <View style={[s.liveBadge, { backgroundColor: theme.isDark ? '#2d1e08' : '#fff7ed' }]}>
+                <View style={s.liveDot} />
+                <Text style={s.liveText}>Live</Text>
+              </View>
+            )}
+            <Pressable
+              style={[s.cardEditBtn, { borderColor: theme.cardBorder }]}
+              onPress={() => router.push('/setup-routine?name=' + encodeURIComponent(name))}
+              hitSlop={10}
+            >
+              <Text style={[s.cardEditBtnText, { color: card.color }]}>Edit</Text>
+            </Pressable>
+            {isDefault ? (
+              <Pressable
+                style={[s.cardHideBtn, {
+                  borderColor: isHidden ? theme.accent : theme.cardBorder,
+                  backgroundColor: isHidden ? (theme.isDark ? '#1e1e38' : '#eef2ff') : 'transparent',
+                }]}
+                onPress={isHidden ? onUnhide : onHide}
+                hitSlop={10}
+              >
+                <Text style={[s.cardHideBtnText, { color: isHidden ? theme.accent : theme.subtext }]}>
+                  {isHidden ? 'Show' : 'Hide'}
+                </Text>
+              </Pressable>
+            ) : (
+              <Pressable style={s.cardDeleteBtn} onPress={onDelete} hitSlop={10}>
+                <Text style={s.cardDeleteBtnIcon}>🗑</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+
+        {showSplit && (
+          <View style={s.splitPillsRow}>
+            {todayMuscles.map(m => (
+              <View key={m} style={[s.splitPill, { backgroundColor: muscleColor(m) }]}>
+                <Text style={[s.splitPillText, { color: muscleTextColor(m) }]}>{m}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {!isHidden && (
+          <Pressable
+            style={[s.cardBtn, { backgroundColor: btnColor }]}
+            onPress={() => router.push('/routine/' + name)}
+          >
+            <Text style={s.cardBtnText}>{btnLabel}</Text>
+          </Pressable>
+        )}
+      </View>
+    </Pressable>
+  )
+}
+
+// ── Weekly helpers ────────────────────────────────────────────────────────
+
+const WEEKLY_PALETTE = [
+  { color: '#8b5cf6', bg: '#f5f3ff', emoji: '🌅' },
+  { color: '#10b981', bg: '#ecfdf5', emoji: '💰' },
+  { color: '#f59e0b', bg: '#fffbeb', emoji: '📋' },
+  { color: '#3b82f6', bg: '#eff6ff', emoji: '🎯' },
+  { color: '#ec4899', bg: '#fdf2f8', emoji: '⚡' },
+  { color: '#06b6d4', bg: '#ecfeff', emoji: '🏆' },
+]
+
+function weeklyRoutineTheme(index) {
+  const { emoji } = WEEKLY_PALETTE[index % WEEKLY_PALETTE.length]
+  return { color: '#8b5cf6', bg: '#f5f3ff', emoji }
+}
+
+const DAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+const DAY_NAMES  = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+// ── Weekly Goals list (top of Weekly tab) ────────────────────────────────
+
+function WeeklyGoalsList({ userId, theme }) {
+  const [goals, setGoals] = useState([])
+  const [config, setConfig] = useState({ resetDayOfWeek: null, lastResetDate: null })
+  const [adding, setAdding] = useState(false)
+  const [newText, setNewText] = useState('')
+  const [newDueDate, setNewDueDate] = useState('')
+  const [formResetDay, setFormResetDay] = useState(null)
+
+  useEffect(() => {
+    async function loadData() {
+      const [g, c] = await Promise.all([getWeeklyGoals(userId), getWeeklyGoalsConfig(userId)])
+      const todayStr = today()
+      const todayDow = new Date().getDay()
+      if (c.resetDayOfWeek !== null && c.resetDayOfWeek === todayDow && c.lastResetDate !== todayStr) {
+        const reset = g.map(goal => ({ ...goal, done: false }))
+        const newConfig = { ...c, lastResetDate: todayStr }
+        setGoals(reset)
+        setConfig(newConfig)
+        await saveWeeklyGoals(userId, reset)
+        await saveWeeklyGoalsConfig(userId, newConfig)
+      } else {
+        setGoals(g)
+        setConfig(c)
+      }
+    }
+    loadData()
+  }, [userId])
+
+  async function toggle(id) {
+    const next = goals.map(g => g.id === id ? { ...g, done: !g.done } : g)
+    setGoals(next)
+    await saveWeeklyGoals(userId, next)
+  }
+
+  function openAddForm() {
+    setFormResetDay(config.resetDayOfWeek)
+    setNewText('')
+    setNewDueDate('')
+    setAdding(true)
+  }
+
+  async function add() {
+    if (!newText.trim()) { setAdding(false); return }
+    const newGoal = { id: Date.now(), text: newText.trim(), done: false, dueDate: newDueDate.trim() || null }
+    const next = [...goals, newGoal]
+    setGoals(next)
+    await saveWeeklyGoals(userId, next)
+    if (formResetDay !== config.resetDayOfWeek) {
+      const newConfig = { ...config, resetDayOfWeek: formResetDay }
+      setConfig(newConfig)
+      await saveWeeklyGoalsConfig(userId, newConfig)
+    }
+    setNewText('')
+    setNewDueDate('')
+    setAdding(false)
+  }
+
+  async function remove(id) {
+    const next = goals.filter(g => g.id !== id)
+    setGoals(next)
+    await saveWeeklyGoals(userId, next)
+  }
+
+  return (
+    <View style={[wk.goalsCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+      <View style={wk.goalsHeaderRow}>
+        <View style={wk.goalsTitleRow}>
+          <Text style={wk.goalsIcon}>📋</Text>
+          <View>
+            <Text style={[wk.goalsTitle, { color: theme.text }]}>Weekly Goals</Text>
+            <Text style={[wk.goalsSub, { color: theme.subtext }]}>
+              {goals.filter(g => g.done).length} / {goals.length} done
+              {config.resetDayOfWeek !== null ? `  ·  ↺ ${DAY_NAMES[config.resetDayOfWeek]}` : ''}
+            </Text>
+          </View>
+        </View>
+        <Pressable style={[wk.goalsAddBtn, { backgroundColor: '#6366f1' }]} onPress={openAddForm}>
+          <Text style={{ color: '#fff', fontWeight: '800', fontSize: 20, lineHeight: 22 }}>＋</Text>
+        </Pressable>
+      </View>
+      {goals.length === 0 && !adding && (
+        <Text style={[wk.goalsEmpty, { color: theme.subtext }]}>Tap ＋ to add a weekly goal</Text>
+      )}
+      {goals.map(g => (
+        <Pressable key={g.id} style={[wk.goalRow, { borderBottomColor: theme.divider }]} onPress={() => toggle(g.id)}>
+          <View style={[wk.goalCheck, g.done && { backgroundColor: '#6366f1', borderColor: '#6366f1' }]}>
+            {g.done && <Text style={wk.goalCheckMark}>✓</Text>}
+          </View>
+          <Text style={[wk.goalText, { color: theme.text }, g.done && wk.goalTextDone]} numberOfLines={2}>{g.text}</Text>
+          {g.dueDate && (
+            <View style={[wk.goalDueBadge, { backgroundColor: '#6366f120' }]}>
+              <Text style={[wk.goalDueBadgeText, { color: '#6366f1' }]}>{g.dueDate}</Text>
+            </View>
+          )}
+          <Pressable onPress={() => remove(g.id)} hitSlop={12}>
+            <Text style={[wk.goalRemove, { color: theme.muted }]}>✕</Text>
+          </Pressable>
+        </Pressable>
+      ))}
+      {adding && (
+        <View style={wk.goalAddForm}>
+          <TextInput
+            style={[wk.goalAddInput, { color: theme.text, borderColor: '#6366f1', backgroundColor: theme.bg }]}
+            placeholder="What's your goal this week?"
+            placeholderTextColor={theme.muted}
+            value={newText}
+            onChangeText={setNewText}
+            autoFocus
+            returnKeyType="next"
+          />
+          <TextInput
+            style={[wk.goalAddInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg, marginTop: 8 }]}
+            placeholder="Due by (optional, e.g. Jun 3)"
+            placeholderTextColor={theme.muted}
+            value={newDueDate}
+            onChangeText={setNewDueDate}
+            returnKeyType="done"
+            onSubmitEditing={add}
+          />
+          <Text style={[wk.goalResetLabel, { color: theme.subtext }]}>RESET GOALS LIST ON:</Text>
+          <View style={wk.dayRow}>
+            {DAY_LABELS.map((label, i) => (
+              <Pressable
+                key={i}
+                style={[wk.dayCircle,
+                  formResetDay === i
+                    ? { backgroundColor: '#6366f1' }
+                    : { backgroundColor: theme.isDark ? '#2a2a3e' : '#e5e7eb' },
+                ]}
+                onPress={() => setFormResetDay(formResetDay === i ? null : i)}
+              >
+                <Text style={[wk.dayCircleText, { color: formResetDay === i ? '#fff' : theme.subtext }]}>{label}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <View style={wk.goalAddActions}>
+            <Pressable style={[wk.goalAddCancel, { borderColor: theme.cardBorder }]} onPress={() => setAdding(false)}>
+              <Text style={{ color: theme.subtext, fontWeight: '600' }}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[wk.goalAddConfirm, { backgroundColor: '#6366f1', flex: 1, alignItems: 'center' }]} onPress={add}>
+              <Text style={{ color: '#fff', fontWeight: '700' }}>Add Goal</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
+    </View>
+  )
+}
+
+// ── Weekly Routine card (expandable checklist) ───────────────────────────
+
+function WeeklyRoutineCard({ routine, theme, colorIndex, onToggleTask, onDelete, onSaveTask, onUpdate }) {
+  const [expanded, setExpanded] = useState(false)
+  const [isEditing, setIsEditing] = useState(false)
+  const [addingTask, setAddingTask] = useState(false)
+  const [newTaskText, setNewTaskText] = useState('')
+  const [editName, setEditName] = useState('')
+  const [editDays, setEditDays] = useState(Array(7).fill(false))
+  const [editAutoReset, setEditAutoReset] = useState(false)
+  const [editTasks, setEditTasks] = useState([])
+  const { color, bg, emoji } = weeklyRoutineTheme(colorIndex)
+  const doneCount = routine.tasks.filter(t => t.done).length
+  const allDone = doneCount === routine.tasks.length && routine.tasks.length > 0
+  const hasResetDays = routine.autoReset && routine.resetDays?.some(Boolean)
+
+  function openEdit() {
+    setEditName(routine.name)
+    setEditDays(routine.resetDays ?? Array(7).fill(false))
+    setEditAutoReset(routine.autoReset ?? false)
+    setEditTasks(routine.tasks.map(t => ({ ...t })))
+    setExpanded(true)
+    setIsEditing(true)
+  }
+
+  function saveEdit() {
+    if (!editName.trim()) return
+    const validTasks = editTasks.filter(t => t.text.trim())
+    if (!validTasks.length) return
+    onUpdate(routine.id, { name: editName.trim(), resetDays: editDays, autoReset: editAutoReset, tasks: validTasks })
+    setIsEditing(false)
+  }
+
+  function confirmAddTask() {
+    if (!newTaskText.trim()) { setAddingTask(false); return }
+    onSaveTask(routine.id, newTaskText.trim())
+    setNewTaskText('')
+    setAddingTask(false)
+  }
+
+  return (
+    <View style={[wk.card, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+      <View style={[wk.cardStripe, { backgroundColor: color }]} />
+      <View style={{ flex: 1 }}>
+        <Pressable style={wk.cardHeader} onPress={() => !isEditing && setExpanded(e => !e)}>
+          <View style={[wk.cardIcon, { backgroundColor: theme.isDark ? theme.bg : bg }]}>
+            <Text style={wk.cardEmoji}>{emoji}</Text>
+          </View>
+          <View style={{ flex: 1, marginLeft: 14 }}>
+            <Text style={[wk.cardName, { color: theme.text }]}>{routine.name}</Text>
+            <Text style={[wk.cardStatus, { color: allDone ? '#10b981' : theme.subtext }]}>
+              {allDone ? 'All done ✓' : `${doneCount} / ${routine.tasks.length} done`}
+              {hasResetDays ? '  ·  ↺' : ''}
+            </Text>
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginRight: 4 }}>
+            <Pressable style={[wk.cardEditIconBtn, { borderColor: color + '55' }]} onPress={openEdit} hitSlop={10}>
+              <Text style={[wk.cardEditIconText, { color }]}>Edit</Text>
+            </Pressable>
+            <Pressable onPress={onDelete} hitSlop={10}>
+              <Text style={{ fontSize: 13 }}>🗑</Text>
+            </Pressable>
+            {!isEditing && (
+              <Text style={{ color: theme.muted, fontSize: 12 }}>{expanded ? '▲' : '▼'}</Text>
+            )}
+          </View>
+        </Pressable>
+
+        {/* ── Inline edit section ── */}
+        {isEditing && (
+          <View style={[wk.editSection, { borderTopColor: theme.divider }]}>
+            <Text style={[wk.editLabel, { color: theme.subtext }]}>NAME</Text>
+            <TextInput
+              style={[wk.editNameInput, { color: theme.text, borderColor: color + '88', backgroundColor: theme.bg }]}
+              value={editName}
+              onChangeText={setEditName}
+              placeholder="Routine name"
+              placeholderTextColor={theme.muted}
+            />
+            <View style={[wk.editToggleRow, { borderColor: theme.cardBorder }]}>
+              <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>Auto-reset tasks</Text>
+              <Switch
+                value={editAutoReset}
+                onValueChange={v => { setEditAutoReset(v); if (!v) setEditDays(Array(7).fill(false)) }}
+                trackColor={{ false: '#e0e0f0', true: color + 'aa' }}
+                thumbColor="#ffffff"
+                ios_backgroundColor="#e0e0f0"
+              />
+            </View>
+            {editAutoReset && (
+              <>
+                <Text style={[wk.editLabel, { color: theme.subtext }]}>RESET ON THESE DAYS:</Text>
+                <View style={wk.dayRow}>
+                  {DAY_LABELS.map((label, i) => (
+                    <Pressable
+                      key={i}
+                      style={[wk.dayCircle,
+                        editDays[i]
+                          ? { backgroundColor: color }
+                          : { backgroundColor: theme.isDark ? '#2a2a3e' : '#e5e7eb' },
+                      ]}
+                      onPress={() => setEditDays(d => d.map((v, j) => j === i ? !v : v))}
+                    >
+                      <Text style={[wk.dayCircleText, { color: editDays[i] ? '#fff' : theme.subtext }]}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </>
+            )}
+            <Text style={[wk.editLabel, { color: theme.subtext }]}>TASKS</Text>
+            {editTasks.map((task, i) => (
+              <View key={task.id} style={wk.editTaskRow}>
+                <TextInput
+                  style={[wk.editTaskInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+                  value={task.text}
+                  onChangeText={v => setEditTasks(ts => ts.map((t, j) => j === i ? { ...t, text: v } : t))}
+                  placeholder={`Task ${i + 1}`}
+                  placeholderTextColor={theme.muted}
+                />
+                <Pressable onPress={() => setEditTasks(ts => ts.filter((_, j) => j !== i))} hitSlop={10} style={{ padding: 8 }}>
+                  <Text style={{ color: '#ef4444', fontSize: 14 }}>✕</Text>
+                </Pressable>
+              </View>
+            ))}
+            <Pressable style={wk.editAddTask} onPress={() => setEditTasks(ts => [...ts, { id: Date.now(), text: '', done: false }])}>
+              <Text style={[wk.editAddTaskText, { color }]}>＋  Add task</Text>
+            </Pressable>
+            <View style={wk.editActions}>
+              <Pressable style={[wk.editCancel, { borderColor: theme.cardBorder }]} onPress={() => setIsEditing(false)}>
+                <Text style={{ color: theme.subtext, fontWeight: '600', fontSize: 14 }}>Cancel</Text>
+              </Pressable>
+              <Pressable style={[wk.editSave, { backgroundColor: color }]} onPress={saveEdit}>
+                <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
+        {/* ── Task list (expanded, not editing) ── */}
+        {!isEditing && expanded && (
+          <View style={[wk.taskList, { borderTopColor: theme.divider }]}>
+            {routine.tasks.map(task => (
+              <Pressable key={task.id} style={wk.taskRow} onPress={() => onToggleTask(routine.id, task.id)}>
+                <View style={[wk.taskCheck, task.done && { backgroundColor: color, borderColor: color }]}>
+                  {task.done && <Text style={wk.taskMark}>✓</Text>}
+                </View>
+                <Text style={[wk.taskText, { color: theme.text }, task.done && wk.taskTextDone]} numberOfLines={2}>
+                  {task.text}
+                </Text>
+              </Pressable>
+            ))}
+            {addingTask ? (
+              <View style={wk.addTaskRow}>
+                <TextInput
+                  style={[wk.addTaskInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+                  placeholder="New task..."
+                  placeholderTextColor={theme.muted}
+                  value={newTaskText}
+                  onChangeText={setNewTaskText}
+                  autoFocus
+                  returnKeyType="done"
+                  onSubmitEditing={confirmAddTask}
+                />
+                <Pressable style={[wk.addTaskConfirm, { backgroundColor: color }]} onPress={confirmAddTask}>
+                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>Add</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Pressable style={wk.addTaskBtn} onPress={() => setAddingTask(true)}>
+                <Text style={[wk.addTaskBtnText, { color }]}>＋  Add task</Text>
+              </Pressable>
+            )}
+          </View>
+        )}
+      </View>
+    </View>
+  )
+}
+
+// ── Weekly Routine creation modal ────────────────────────────────────────
+
+function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
+  const [name, setName] = useState('')
+  const [tasks, setTasks] = useState([''])
+
+  function reset() { setName(''); setTasks(['']) }
+  function close() { reset(); onClose() }
+
+  function save() {
+    if (!name.trim()) return
+    const taskList = tasks
+      .filter(t => t.trim())
+      .map((t, i) => ({ id: Date.now() + i, text: t.trim(), done: false }))
+    if (!taskList.length) return
+    onSave({ id: String(Date.now()), name: name.trim(), tasks: taskList })
+    reset()
+  }
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
+      <View style={s.settingsOverlay}>
+        <Pressable style={s.settingsBg} onPress={close} />
+        <View style={[wk.modal, { backgroundColor: theme.card }]}>
+          <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+          <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+            <Text style={[wk.modalTitle, { color: theme.text }]}>New Weekly Routine</Text>
+            <Text style={[wk.modalLabel, { color: theme.subtext }]}>NAME</Text>
+            <TextInput
+              style={[wk.modalNameInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+              placeholder="e.g. Sunday Reset Routine"
+              placeholderTextColor={theme.muted}
+              value={name}
+              onChangeText={setName}
+            />
+            <Text style={[wk.modalLabel, { color: theme.subtext }]}>TASKS</Text>
+            {tasks.map((t, i) => (
+              <View key={i} style={wk.modalTaskRow}>
+                <TextInput
+                  style={[wk.modalTaskInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+                  placeholder={`Task ${i + 1}...`}
+                  placeholderTextColor={theme.muted}
+                  value={t}
+                  onChangeText={v => setTasks(prev => prev.map((x, j) => j === i ? v : x))}
+                />
+                {tasks.length > 1 && (
+                  <Pressable onPress={() => setTasks(prev => prev.filter((_, j) => j !== i))} hitSlop={10} style={{ padding: 8 }}>
+                    <Text style={{ color: '#ef4444', fontSize: 14 }}>✕</Text>
+                  </Pressable>
+                )}
+              </View>
+            ))}
+            <Pressable style={wk.modalAddTask} onPress={() => setTasks(t => [...t, ''])}>
+              <Text style={[wk.modalAddTaskText, { color: '#6366f1' }]}>＋  Add another task</Text>
+            </Pressable>
+            <Pressable style={[wk.modalSave, { backgroundColor: '#6366f1' }]} onPress={save}>
+              <Text style={wk.modalSaveText}>Save Routine</Text>
+            </Pressable>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+// ── Habits ────────────────────────────────────────────────────────────────
+
+
+function SobrietyTimer({ startDate, theme }) {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  const totalSecs = Math.max(0, Math.floor((now - new Date(startDate).getTime()) / 1000))
+  const secs = totalSecs % 60
+  const totalMins = Math.floor(totalSecs / 60)
+  const mins = totalMins % 60
+  const totalHrs = Math.floor(totalMins / 60)
+  const hrs = totalHrs % 24
+  const totalDays = Math.floor(totalHrs / 24)
+  const months = Math.floor(totalDays / 30)
+  const days = totalDays % 30
+  const units = []
+  if (months > 0) units.push({ v: months, l: 'mo' })
+  units.push({ v: days, l: 'days' }, { v: hrs, l: 'hrs' }, { v: mins, l: 'min' }, { v: secs, l: 'sec' })
+  return (
+    <View style={hb.timerRow}>
+      {units.map(({ v, l }) => (
+        <View key={l} style={[hb.timerUnit, { backgroundColor: HABITS_COLOR + '14' }]}>
+          <Text style={[hb.timerVal, { color: HABITS_COLOR, fontVariant: ['tabular-nums'] }]}>
+            {String(v).padStart(2, '0')}
+          </Text>
+          <Text style={[hb.timerLabel, { color: theme.muted }]}>{l}</Text>
+        </View>
+      ))}
+    </View>
+  )
+}
+
+function BreakingHabitCard({ habit, theme, onRelapse, onDeleteHistory, onDelete }) {
+  const startFmt = new Date(habit.startDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  const relapseCount = habit.history.filter(h => h.type === 'relapse').length
+  return (
+    <View style={[hb.bCard, { backgroundColor: theme.isDark ? theme.bg : '#fff9fa', borderColor: HABITS_COLOR + '44', shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+      <View style={[hb.bStripe, { backgroundColor: HABITS_COLOR }]} />
+      <View style={hb.bBody}>
+        <View style={hb.bHeader}>
+          <View style={[hb.bIconCircle, { backgroundColor: HABITS_COLOR + '18' }]}>
+            <Text style={{ fontSize: 22 }}>🚫</Text>
+          </View>
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={[hb.bName, { color: theme.text }]}>{habit.name}</Text>
+            <Text style={[hb.bSince, { color: theme.subtext }]}>
+              Clean since {startFmt}{relapseCount > 0 ? `  ·  ${relapseCount} relapse${relapseCount > 1 ? 's' : ''}` : ''}
+            </Text>
+          </View>
+          <Pressable onPress={onDelete} hitSlop={12} style={{ padding: 4 }}>
+            <Text style={{ fontSize: 13 }}>🗑</Text>
+          </Pressable>
+        </View>
+        <SobrietyTimer startDate={habit.startDate} theme={theme} />
+        <View style={hb.bActions}>
+          <Pressable style={[hb.relapseBtn, { borderColor: HABITS_COLOR + '44' }]} onPress={onRelapse}>
+            <Text style={[hb.relapseBtnText, { color: HABITS_COLOR }]}>↩ Relapsed</Text>
+          </Pressable>
+          {habit.history.length > 1 && (
+            <Pressable style={[hb.clearHistoryBtn, { borderColor: theme.cardBorder }]} onPress={onDeleteHistory}>
+              <Text style={[hb.clearHistoryText, { color: theme.muted }]}>Clear history</Text>
+            </Pressable>
+          )}
+        </View>
+      </View>
+    </View>
+  )
+}
+
+function AddBreakingHabitModal({ visible, theme, onClose, onAdd }) {
+  const [name, setName] = useState('')
+  const [reason, setReason] = useState('')
+  function reset() { setName(''); setReason('') }
+  function close() { reset(); onClose() }
+  function save() {
+    if (!name.trim()) return
+    const now = new Date().toISOString()
+    onAdd({ id: Date.now().toString(), name: name.trim(), reason: reason.trim(), startDate: now, history: [{ date: now, type: 'start' }] })
+    reset()
+  }
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
+      <View style={s.settingsOverlay}>
+        <Pressable style={s.settingsBg} onPress={close} />
+        <View style={[hb.modal, { backgroundColor: theme.card }]}>
+          <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+          <Text style={[hb.modalTitle, { color: theme.text }]}>Track a Habit to Break</Text>
+          <Text style={[hb.modalLabel, { color: theme.subtext }]}>HABIT NAME</Text>
+          <TextInput
+            style={[hb.modalInput, { color: theme.text, borderColor: HABITS_COLOR + '88', backgroundColor: theme.bg }]}
+            placeholder="e.g. Smoking, Phone before bed, Nail biting..."
+            placeholderTextColor={theme.muted}
+            value={name} onChangeText={setName} autoFocus
+          />
+          <Text style={[hb.modalLabel, { color: theme.subtext }]}>WHY DO YOU WANT TO BREAK THIS? (optional)</Text>
+          <TextInput
+            style={[hb.modalInput, hb.modalTextArea, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+            placeholder="Your reason will appear when you're about to relapse..."
+            placeholderTextColor={theme.muted}
+            value={reason} onChangeText={setReason}
+            multiline numberOfLines={3} textAlignVertical="top"
+          />
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 4 }}>
+            <Pressable style={[hb.modalCancel, { borderColor: theme.cardBorder }]} onPress={close}>
+              <Text style={{ color: theme.subtext, fontWeight: '600' }}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[hb.modalSave, { backgroundColor: HABITS_COLOR, flex: 1 }]} onPress={save}>
+              <Text style={hb.modalSaveText}>Start Tracking</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+function RelapseConfirmModal({ visible, habit, theme, onConfirm, onCancel }) {
+  if (!habit) return null
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
+      <View style={[s.settingsOverlay, { justifyContent: 'center', padding: 28 }]}>
+        <Pressable style={s.settingsBg} onPress={onCancel} />
+        <View style={[hb.confirmCard, { backgroundColor: theme.card, borderColor: HABITS_COLOR + '44' }]}>
+          <Text style={{ fontSize: 36, textAlign: 'center', marginBottom: 10 }}>😔</Text>
+          <Text style={[hb.confirmTitle, { color: theme.text }]}>Relapsed on {habit.name}?</Text>
+          <Text style={[hb.confirmSub, { color: theme.subtext }]}>Your timer will reset. This will be saved in your history.</Text>
+          {!!habit.reason && (
+            <View style={[hb.reasonBox, { backgroundColor: HABITS_COLOR + '10', borderColor: HABITS_COLOR + '30' }]}>
+              <Text style={[hb.reasonLabel, { color: HABITS_COLOR }]}>Your reason for stopping:</Text>
+              <Text style={[hb.reasonText, { color: theme.text }]}>{habit.reason}</Text>
+            </View>
+          )}
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+            <Pressable style={[hb.confirmCancel, { borderColor: theme.cardBorder, flex: 1 }]} onPress={onCancel}>
+              <Text style={{ color: theme.text, fontWeight: '700', textAlign: 'center' }}>Actually No</Text>
+            </Pressable>
+            <Pressable style={[hb.confirmRelapseBtn, { flex: 1 }]} onPress={onConfirm}>
+              <Text style={{ color: '#fff', fontWeight: '700', textAlign: 'center' }}>Yes, Reset</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+
+function HabitsTab({ userId, theme, habits, onHabitsChange }) {
+  const [addBreakingOpen, setAddBreakingOpen] = useState(false)
+  const [relapseTarget, setRelapseTarget] = useState(null)
+  const [addingBuilding, setAddingBuilding] = useState(false)
+  const [newBuildingName, setNewBuildingName] = useState('')
+  const [editingTips, setEditingTips] = useState(false)
+  const [tipsText, setTipsText] = useState(habits.tips || '')
+  useEffect(() => { setTipsText(habits.tips || '') }, [habits.tips])
+
+  async function update(next) { onHabitsChange(next); await saveHabits(userId, next) }
+
+  async function handleAddBreaking(habit) {
+    await update({ ...habits, breaking: [...habits.breaking, habit] })
+    setAddBreakingOpen(false)
+  }
+
+  async function confirmRelapse() {
+    if (!relapseTarget) return
+    const now = new Date().toISOString()
+    await update({
+      ...habits,
+      breaking: habits.breaking.map(h =>
+        h.id !== relapseTarget.id ? h : {
+          ...h, startDate: now,
+          history: [...h.history, { date: now, type: 'relapse' }, { date: now, type: 'start' }],
+        }
+      ),
+    })
+    setRelapseTarget(null)
+  }
+
+  async function handleDeleteHistory(habitId) {
+    Alert.alert('Clear History?', 'This erases past relapse history but keeps your current streak.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Clear', style: 'destructive', onPress: async () => {
+        await update({
+          ...habits,
+          breaking: habits.breaking.map(h =>
+            h.id !== habitId ? h : { ...h, history: [{ date: h.startDate, type: 'start' }] }
+          ),
+        })
+      }},
+    ])
+  }
+
+  async function handleDeleteBreaking(habitId) {
+    Alert.alert('Delete Habit?', 'This permanently removes this habit and all its history.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        await update({ ...habits, breaking: habits.breaking.filter(h => h.id !== habitId) })
+      }},
+    ])
+  }
+
+  async function handleAddBuilding() {
+    if (!newBuildingName.trim()) { setAddingBuilding(false); return }
+    await update({
+      ...habits,
+      building: [...habits.building, { id: Date.now().toString(), name: newBuildingName.trim(), addedDate: new Date().toISOString() }],
+    })
+    setNewBuildingName(''); setAddingBuilding(false)
+  }
+
+  async function handleDeleteBuilding(id) {
+    await update({ ...habits, building: habits.building.filter(h => h.id !== id) })
+  }
+
+  async function saveTips() {
+    await update({ ...habits, tips: tipsText })
+    setEditingTips(false)
+  }
+
+  return (
+    <>
+      {/* Breaking habits */}
+      <View style={[hb.sectionCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+        <View style={hb.sectionHeader}>
+          <View style={hb.sectionTitleRow}>
+            <Text style={{ fontSize: 24 }}>🚫</Text>
+            <View style={{ marginLeft: 12 }}>
+              <Text style={[hb.sectionTitle, { color: theme.text }]}>Habits to Break</Text>
+              <Text style={[hb.sectionSub, { color: theme.subtext }]}>Sobriety-style tracking</Text>
+            </View>
+          </View>
+          <Pressable style={[hb.sectionAddBtn, { backgroundColor: HABITS_COLOR }]} onPress={() => setAddBreakingOpen(true)}>
+            <Text style={{ color: '#fff', fontWeight: '800', fontSize: 18, lineHeight: 20 }}>＋</Text>
+          </Pressable>
+        </View>
+        {habits.breaking.length === 0 ? (
+          <Text style={[hb.emptyText, { color: theme.subtext }]}>Add habits you're working to quit — smoking, doom-scrolling, etc.</Text>
+        ) : habits.breaking.map(habit => (
+          <BreakingHabitCard key={habit.id} habit={habit} theme={theme}
+            onRelapse={() => setRelapseTarget(habit)}
+            onDeleteHistory={() => handleDeleteHistory(habit.id)}
+            onDelete={() => handleDeleteBreaking(habit.id)}
+          />
+        ))}
+      </View>
+
+      {/* Building habits */}
+      <View style={[hb.sectionCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+        <View style={hb.sectionHeader}>
+          <View style={hb.sectionTitleRow}>
+            <Text style={{ fontSize: 24 }}>🌱</Text>
+            <View style={{ marginLeft: 12 }}>
+              <Text style={[hb.sectionTitle, { color: theme.text }]}>My Habits</Text>
+              <Text style={[hb.sectionSub, { color: theme.subtext }]}>Habits you're building</Text>
+            </View>
+          </View>
+          <Pressable style={[hb.sectionAddBtn, { backgroundColor: BUILD_COLOR }]} onPress={() => setAddingBuilding(true)}>
+            <Text style={{ color: '#fff', fontWeight: '800', fontSize: 18, lineHeight: 20 }}>＋</Text>
+          </Pressable>
+        </View>
+        {habits.building.length === 0 && !addingBuilding && (
+          <Text style={[hb.emptyText, { color: theme.subtext }]}>Add habits to develop — daily exercise, reading, journaling, etc.</Text>
+        )}
+        {habits.building.map(h => (
+          <View key={h.id} style={[hb.buildRow, { borderBottomColor: theme.divider }]}>
+            <View style={[hb.buildDot, { backgroundColor: BUILD_COLOR }]} />
+            <Text style={[hb.buildName, { color: theme.text }]}>{h.name}</Text>
+            <Pressable onPress={() => handleDeleteBuilding(h.id)} hitSlop={12}>
+              <Text style={{ color: theme.muted, fontSize: 14 }}>✕</Text>
+            </Pressable>
+          </View>
+        ))}
+        {addingBuilding && (
+          <View style={hb.buildAddRow}>
+            <TextInput
+              style={[hb.buildInput, { color: theme.text, borderColor: BUILD_COLOR + '88', backgroundColor: theme.bg }]}
+              placeholder="New habit to develop..."
+              placeholderTextColor={theme.muted}
+              value={newBuildingName} onChangeText={setNewBuildingName}
+              autoFocus returnKeyType="done" onSubmitEditing={handleAddBuilding}
+            />
+            <Pressable style={[hb.buildConfirm, { backgroundColor: BUILD_COLOR }]} onPress={handleAddBuilding}>
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>Add</Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
+
+      {/* Tips for myself */}
+      <View style={[hb.sectionCard, { backgroundColor: theme.card, borderColor: theme.cardBorder, shadowColor: theme.isDark ? 'transparent' : '#0d1b5e' }]}>
+        <View style={[hb.sectionHeader, { marginBottom: (editingTips || habits.tips) ? 12 : 0 }]}>
+          <View style={hb.sectionTitleRow}>
+            <Text style={{ fontSize: 24 }}>💡</Text>
+            <View style={{ marginLeft: 12 }}>
+              <Text style={[hb.sectionTitle, { color: theme.text }]}>Tips for Myself</Text>
+              <Text style={[hb.sectionSub, { color: theme.subtext }]}>Notes to stay on track</Text>
+            </View>
+          </View>
+          <Pressable style={[hb.editTipsBtn, { borderColor: theme.cardBorder }]} onPress={() => editingTips ? saveTips() : setEditingTips(true)}>
+            <Text style={{ color: theme.accent, fontWeight: '700', fontSize: 13 }}>{editingTips ? 'Save' : 'Edit'}</Text>
+          </Pressable>
+        </View>
+        {editingTips ? (
+          <TextInput
+            style={[hb.tipsInput, { color: theme.text, borderColor: theme.accent + '55', backgroundColor: theme.bg }]}
+            placeholder="Write reminders, strategies, or mantras for yourself..."
+            placeholderTextColor={theme.muted}
+            value={tipsText} onChangeText={setTipsText}
+            multiline numberOfLines={6} autoFocus textAlignVertical="top"
+          />
+        ) : habits.tips ? (
+          <Text style={[hb.tipsDisplay, { color: theme.text }]}>{habits.tips}</Text>
+        ) : (
+          <Text style={[hb.emptyText, { color: theme.subtext }]}>Tap Edit to write reminders, strategies, or mantras to help you stay consistent.</Text>
+        )}
+      </View>
+
+      <AddBreakingHabitModal visible={addBreakingOpen} theme={theme} onClose={() => setAddBreakingOpen(false)} onAdd={handleAddBreaking} />
+      <RelapseConfirmModal visible={!!relapseTarget} habit={relapseTarget} theme={theme} onConfirm={confirmRelapse} onCancel={() => setRelapseTarget(null)} />
+    </>
+  )
+}
+
+// ── Main screen ───────────────────────────────────────────────────────────
+
+export default function RoutinesScreen() {
+  const { user, profile, signOut } = useAuth()
+  const { theme, toggleDark, unit, toggleUnit } = useTheme()
+  const navigation = useNavigation()
+  const [routines, setRoutines] = useState([])
+  const [streak, setStreak] = useState({ current: 0, longest: 0 })
+  const [routineStreaks, setRoutineStreaks] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [todayMuscle, setTodayMuscle] = useState(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [hiddenSet, setHiddenSet] = useState(new Set())
+  const [activeTab, setActiveTab] = useState('daily')
+  const [weeklyRoutines, setWeeklyRoutines] = useState([])
+  const [weeklyModalOpen, setWeeklyModalOpen] = useState(false)
+  const [habits, setHabits] = useState({ breaking: [], building: [], tips: '' })
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerStyle: { backgroundColor: theme.header },
+      headerShadowVisible: false,
+      headerTitle: () => (
+        <Text style={{ fontSize: 17, fontWeight: '800', color: theme.text, letterSpacing: -0.3 }}>My Routines</Text>
+      ),
+      headerRight: () => (
+        <Pressable
+          onPress={() => setSettingsOpen(true)}
+          style={{ marginRight: 16, padding: 6, borderRadius: 10, backgroundColor: theme.isDark ? '#1e1e38' : '#f0f0f8' }}
+        >
+          <Text style={{ fontSize: 18 }}>⚙️</Text>
+        </Pressable>
+      ),
+    })
+  }, [navigation, theme])
+
+  const load = useCallback(async () => {
+    if (!user) return
+    const [names, hiddenArr, str, split, rStreaks] = await Promise.all([
+      getRoutineNames(user.id),
+      getHiddenDefaults(user.id),
+      getStreak(user.id),
+      getGymSplit(user.id),
+      getRoutineStreaks(user.id),
+    ])
+    const [templates, runs, settingsArr] = await Promise.all([
+      Promise.all(names.map(n => getRoutineTemplate(user.id, n))),
+      Promise.all(names.map(n => getTodayRun(user.id, n))),
+      Promise.all(names.map(n => getRoutineSettings(user.id, n))),
+    ])
+    setRoutines(names.map((name, i) => ({ name, template: templates[i], run: runs[i], settings: settingsArr[i] })))
+    setHiddenSet(new Set(hiddenArr))
+    setStreak(str)
+    setRoutineStreaks(rStreaks)
+    const muscle = split?.days?.[todaySplitIndex()] ?? null
+    setTodayMuscle(muscle)
+    const wkRoutines = await getWeeklyRoutines(user.id)
+    const todayStr = today()
+    const todayDow = new Date().getDay()
+    let wkUpdated = false
+    const wkReset = wkRoutines.map(r => {
+      if (r.autoReset && r.resetDays?.[todayDow] && r.lastResetDate !== todayStr) {
+        wkUpdated = true
+        return { ...r, tasks: r.tasks.map(t => ({ ...t, done: false })), lastResetDate: todayStr }
+      }
+      return r
+    })
+    if (wkUpdated) await saveWeeklyRoutines(user.id, wkReset)
+    setWeeklyRoutines(wkReset)
+    const h = await loadHabits(user.id)
+    setHabits(h)
+    setLoading(false)
+  }, [user])
+
+  async function handleHide(name) {
+    Alert.alert(
+      `Hide ${name} Routine?`,
+      "This routine won't count toward your streak while hidden. You can show it again at any time.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Hide Routine', style: 'destructive', onPress: async () => {
+          const next = new Set(hiddenSet)
+          next.add(name)
+          setHiddenSet(next)
+          await setHiddenDefaults(user.id, [...next])
+        }},
+      ]
+    )
+  }
+
+  async function handleUnhide(name) {
+    const next = new Set(hiddenSet)
+    next.delete(name)
+    setHiddenSet(next)
+    await setHiddenDefaults(user.id, [...next])
+  }
+
+  function handleDeleteCustom(name) {
+    Alert.alert(
+      `Delete "${name}"?`,
+      'This will permanently remove the routine and all its tasks. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: async () => {
+          await deleteRoutine(user.id, name)
+          load()
+        }},
+      ]
+    )
+  }
+
+  async function handleWeeklyToggleTask(routineId, taskId) {
+    const next = weeklyRoutines.map(r =>
+      r.id !== routineId ? r : {
+        ...r,
+        tasks: r.tasks.map(t => t.id === taskId ? { ...t, done: !t.done } : t),
+      }
+    )
+    setWeeklyRoutines(next)
+    await saveWeeklyRoutines(user.id, next)
+  }
+
+  async function handleWeeklySaveTask(routineId, text) {
+    const next = weeklyRoutines.map(r =>
+      r.id !== routineId ? r : {
+        ...r,
+        tasks: [...r.tasks, { id: Date.now(), text, done: false }],
+      }
+    )
+    setWeeklyRoutines(next)
+    await saveWeeklyRoutines(user.id, next)
+  }
+
+  function handleWeeklyDeleteRoutine(routineId) {
+    Alert.alert('Delete Routine?', 'This will remove this weekly routine.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        const next = weeklyRoutines.filter(r => r.id !== routineId)
+        setWeeklyRoutines(next)
+        await saveWeeklyRoutines(user.id, next)
+      }},
+    ])
+  }
+
+  async function handleWeeklyAddRoutine(routine) {
+    const next = [...weeklyRoutines, routine]
+    setWeeklyRoutines(next)
+    await saveWeeklyRoutines(user.id, next)
+    setWeeklyModalOpen(false)
+  }
+
+  async function handleWeeklyUpdateRoutine(routineId, updates) {
+    const next = weeklyRoutines.map(r => r.id !== routineId ? r : { ...r, ...updates })
+    setWeeklyRoutines(next)
+    await saveWeeklyRoutines(user.id, next)
+  }
+
+  useFocusEffect(useCallback(() => { load() }, [load]))
+
+  if (loading) return <View style={[s.page, { backgroundColor: theme.bg }]} />
+
+  const visibleRoutines = routines.filter(r => !hiddenSet.has(r.name))
+  const doneCount = visibleRoutines.filter(r => r.run?.finished).length
+  const allDone = doneCount > 0 && doneCount === visibleRoutines.length
+
+  return (
+    <View style={[s.page, { backgroundColor: theme.bg }]}>
+      <ScrollView contentContainerStyle={s.content}>
+
+        <DailyDashboard
+          user={user}
+          profile={profile}
+          routines={routines}
+          hiddenSet={hiddenSet}
+          routineStreaks={routineStreaks}
+          theme={theme}
+        />
+
+        {/* Tab switcher */}
+        <View style={[wk.tabRow, { backgroundColor: theme.isDark ? '#1e1e2e' : '#ececf8' }]}>
+          <Pressable
+            style={[wk.tab, activeTab === 'daily' && [wk.tabActive, { backgroundColor: theme.card }]]}
+            onPress={() => setActiveTab('daily')}
+          >
+            <Text style={[wk.tabText, { color: activeTab === 'daily' ? '#4f46e5' : theme.subtext, fontSize: 13 }]}>Daily</Text>
+          </Pressable>
+          <Pressable
+            style={[wk.tab, activeTab === 'weekly' && [wk.tabActive, { backgroundColor: theme.card }]]}
+            onPress={() => setActiveTab('weekly')}
+          >
+            <Text style={[wk.tabText, { color: activeTab === 'weekly' ? '#4f46e5' : theme.subtext, fontSize: 13 }]}>Weekly</Text>
+          </Pressable>
+          <Pressable
+            style={[wk.tab, activeTab === 'habits' && [wk.tabActive, { backgroundColor: theme.card }]]}
+            onPress={() => setActiveTab('habits')}
+          >
+            <Text style={[wk.tabText, { color: activeTab === 'habits' ? HABITS_COLOR : theme.subtext, fontSize: 13 }]}>Habits</Text>
+          </Pressable>
+        </View>
+
+        {activeTab === 'habits' ? (
+          <HabitsTab userId={user.id} theme={theme} habits={habits} onHabitsChange={setHabits} />
+        ) : activeTab === 'daily' ? (
+          <>
+            {allDone && <StreakBadge streak={streak} />}
+            {allDone && (
+              <View style={[s.allDoneBanner, { backgroundColor: theme.isDark ? '#0d2e21' : '#ecfdf5', borderColor: theme.isDark ? '#1a5c3a' : '#a7f3d0' }]}>
+                <Text style={s.allDoneEmoji}>🎉</Text>
+                <Text style={[s.allDoneText, { color: theme.isDark ? '#34d399' : '#065f46' }]}>
+                  All routines done for today!
+                </Text>
+              </View>
+            )}
+            <ProductivityCard theme={theme} userId={user?.id} />
+            {routines.length > 1 && (
+              <Pressable
+                onPress={() => router.push('/reorder-routines')}
+                hitSlop={8}
+                style={{ alignSelf: 'flex-end', flexDirection: 'row', alignItems: 'center', gap: 4, paddingVertical: 6, paddingHorizontal: 4, marginBottom: 2 }}
+              >
+                <Text style={{ color: theme.accent, fontWeight: '700', fontSize: 13 }}>⇅ Reorder</Text>
+              </Pressable>
+            )}
+            {routines.map(({ name, template, run, settings }) => (
+              <RoutineCard
+                key={name}
+                name={name}
+                template={template}
+                run={run}
+                todayMuscle={name === 'Fitness' ? todayMuscle : null}
+                routineStreak={routineStreaks[name] ?? 0}
+                settings={settings}
+                isDefault={DEFAULT_ROUTINES.has(name)}
+                isHidden={hiddenSet.has(name)}
+                onHide={() => handleHide(name)}
+                onUnhide={() => handleUnhide(name)}
+                onDelete={() => handleDeleteCustom(name)}
+              />
+            ))}
+            <Pressable
+              style={[s.addBtn, { borderColor: theme.isDark ? '#28284a' : '#dde0f8' }]}
+              onPress={() => router.push('/setup-routine?name=new')}
+            >
+              <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
+            </Pressable>
+          </>
+        ) : (
+          <>
+            <WeeklyGoalsList userId={user.id} theme={theme} />
+            {weeklyRoutines.map((routine, i) => (
+              <WeeklyRoutineCard
+                key={routine.id}
+                routine={routine}
+                theme={theme}
+                colorIndex={i}
+                onToggleTask={handleWeeklyToggleTask}
+                onDelete={() => handleWeeklyDeleteRoutine(routine.id)}
+                onSaveTask={handleWeeklySaveTask}
+                onUpdate={handleWeeklyUpdateRoutine}
+              />
+            ))}
+            <Pressable
+              style={[s.addBtn, { borderColor: theme.isDark ? '#28284a' : '#dde0f8' }]}
+              onPress={() => setWeeklyModalOpen(true)}
+            >
+              <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add Weekly Routine</Text>
+            </Pressable>
+          </>
+        )}
+
+      </ScrollView>
+
+      <Modal
+        visible={settingsOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSettingsOpen(false)}
+      >
+        <View style={s.settingsOverlay}>
+          <Pressable style={s.settingsBg} onPress={() => setSettingsOpen(false)} />
+          <View style={[s.settingsSheet, { backgroundColor: theme.card }]}>
+            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+            <Text style={[s.settingsTitle, { color: theme.text }]}>Settings</Text>
+
+            <View style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
+              <View style={s.settingsRowLeft}>
+                <Text style={s.settingsRowIcon}>🌙</Text>
+                <Text style={[s.settingsRowLabel, { color: theme.text }]}>Dark Mode</Text>
+              </View>
+              <Switch
+                value={theme.isDark}
+                onValueChange={toggleDark}
+                trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
+                thumbColor="#ffffff"
+                ios_backgroundColor="#e0e0f0"
+              />
+            </View>
+
+            <View style={[s.settingsRow, { borderBottomColor: theme.divider }]}>
+              <View style={s.settingsRowLeft}>
+                <Text style={s.settingsRowIcon}>⚖️</Text>
+                <Text style={[s.settingsRowLabel, { color: theme.text }]}>Weight Unit</Text>
+              </View>
+              <Pressable
+                onPress={toggleUnit}
+                style={[s.unitPill, { backgroundColor: theme.isDark ? '#28284a' : '#ebebf5' }]}
+              >
+                <Text style={[s.unitPillText, { color: theme.accent }]}>{unit.toUpperCase()}</Text>
+              </Pressable>
+            </View>
+
+            <Pressable
+              style={s.signOutRow}
+              onPress={() => { setSettingsOpen(false); signOut() }}
+            >
+              <Text style={s.settingsRowIcon}>🚪</Text>
+              <Text style={s.signOutText}>Sign Out</Text>
+            </Pressable>
+
+            <Pressable
+              style={[s.closeBtn, { borderColor: theme.cardBorder }]}
+              onPress={() => setSettingsOpen(false)}
+            >
+              <Text style={[s.closeBtnText, { color: theme.subtext }]}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <WeeklyRoutineModal
+        visible={weeklyModalOpen}
+        theme={theme}
+        onClose={() => setWeeklyModalOpen(false)}
+        onSave={handleWeeklyAddRoutine}
+      />
+
+
+    </View>
+  )
+}
+
+const s = StyleSheet.create({
+  page: { flex: 1 },
+  content: { padding: 16, paddingBottom: 36 },
+
+  card: {
+    flexDirection: 'row',
+    borderRadius: 22,
+    marginBottom: 14,
+    borderWidth: 2,
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18,
+    shadowRadius: 0,
+    elevation: 6,
+    overflow: 'hidden',
+  },
+  cardStripe: { width: 6 },
+  cardContent: { flex: 1, padding: 16, paddingTop: 22 },
+  cardTop: { flexDirection: 'row', alignItems: 'center', marginBottom: 14 },
+  emojiCircle: {
+    width: 50, height: 50, borderRadius: 15,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  emoji: { fontSize: 26 },
+  cardNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  cardName: { fontSize: 18, fontWeight: '700', letterSpacing: -0.2 },
+  defaultCornerTag: {
+    position: 'absolute', top: 9, left: 18,
+    fontSize: 9, fontWeight: '500', letterSpacing: 0.5, opacity: 0.55,
+  },
+  rStreak: { borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
+  rStreakText: { fontSize: 12, fontWeight: '700', color: '#ea580c' },
+  cardStatus: { fontSize: 13, marginTop: 2, fontWeight: '500' },
+
+  cardTopRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  cardTime: { fontSize: 11, fontWeight: '500', marginTop: 3 },
+  cardEditBtn: {
+    paddingHorizontal: 10, paddingVertical: 5,
+    borderRadius: 10, borderWidth: 1,
+  },
+  cardEditBtnText: { fontSize: 11, fontWeight: '700' },
+  cardHideBtn: {
+    paddingHorizontal: 10, paddingVertical: 5,
+    borderRadius: 10, borderWidth: 1,
+  },
+  cardHideBtnText: { fontSize: 11, fontWeight: '600' },
+  cardDeleteBtn: { paddingHorizontal: 8, paddingVertical: 6 },
+  cardDeleteBtnIcon: { fontSize: 13 },
+
+  doneBadge: {
+    width: 30, height: 30, borderRadius: 15,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  doneBadgeText: { color: '#10b981', fontWeight: '800', fontSize: 14 },
+  liveBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: 20,
+  },
+  liveDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: '#f97316' },
+  liveText: { fontSize: 12, fontWeight: '700', color: '#f97316' },
+
+  splitPillsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 10 },
+  splitPill: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5 },
+  splitPillText: { fontSize: 12, fontWeight: '700' },
+
+  cardBtn: {
+    borderRadius: 14, paddingVertical: 13, paddingHorizontal: 16, alignItems: 'center',
+  },
+  cardBtnText: { color: '#fff', fontWeight: '700', fontSize: 15, letterSpacing: 0.1 },
+
+  allDoneBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    borderRadius: 16, padding: 14, marginBottom: 14, borderWidth: 1,
+  },
+  allDoneEmoji: { fontSize: 24 },
+  allDoneText: { fontSize: 15, fontWeight: '700' },
+
+  addBtn: {
+    borderRadius: 18, padding: 16, alignItems: 'center', marginTop: 4,
+    borderWidth: 1.5, borderStyle: 'dashed',
+  },
+  addBtnText: { fontWeight: '700', fontSize: 15 },
+
+  // Settings modal
+  settingsOverlay: { flex: 1, justifyContent: 'flex-end' },
+  settingsBg: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  settingsSheet: {
+    borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    paddingTop: 10, paddingHorizontal: 24, paddingBottom: 40,
+    shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
+  },
+  settingsHandle: {
+    width: 40, height: 4, borderRadius: 2,
+    alignSelf: 'center', marginBottom: 20,
+  },
+  settingsTitle: {
+    fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 20,
+  },
+  settingsRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 16, borderBottomWidth: 1,
+  },
+  settingsRowLeft: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  settingsRowIcon: { fontSize: 20 },
+  settingsRowLabel: { fontSize: 16, fontWeight: '500' },
+  signOutRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingVertical: 16,
+  },
+  signOutText: { fontSize: 16, fontWeight: '600', color: '#ef4444' },
+  closeBtn: {
+    borderRadius: 14, paddingVertical: 14, alignItems: 'center',
+    borderWidth: 1.5, marginTop: 8,
+  },
+  closeBtnText: { fontWeight: '600', fontSize: 15 },
+
+  unitPill: {
+    paddingHorizontal: 16, paddingVertical: 8,
+    borderRadius: 20,
+  },
+  unitPillText: { fontSize: 14, fontWeight: '800', letterSpacing: 1 },
+})
+
+const db = StyleSheet.create({
+  card: {
+    borderRadius: 22, borderWidth: 2, padding: 16, marginBottom: 14,
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  },
+  headerRow:  { flexDirection: 'row', alignItems: 'center' },
+  welcome:    { fontSize: 15, fontWeight: '700', letterSpacing: -0.2 },
+  dateStr:    { fontSize: 12, fontWeight: '500', marginTop: 2 },
+  motivation: { fontSize: 12, fontStyle: 'italic', marginTop: 4 },
+  circleWrap:  { alignItems: 'center', justifyContent: 'center' },
+  circleLabel: {
+    position: 'absolute', flexDirection: 'row',
+    alignItems: 'baseline', justifyContent: 'center',
+  },
+  circleNum: { fontSize: 16, fontWeight: '800' },
+  circleDen: { fontSize: 10, fontWeight: '700' },
+  streakRow:  { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  streakChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10,
+  },
+  streakChipText: { fontSize: 11, fontWeight: '700' },
+  collapseBtn: { paddingLeft: 10, alignSelf: 'flex-start', paddingTop: 3 },
+  chevron:     { fontSize: 12, fontWeight: '700' },
+  divider:     { height: StyleSheet.hairlineWidth, marginVertical: 9 },
+  eventRow:    { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 3 },
+  eventTitle:  { flex: 1, fontSize: 13, fontWeight: '500' },
+  eventTime:   { fontSize: 11, fontWeight: '600' },
+})
+
+const pc = StyleSheet.create({
+  card: {
+    flexDirection: 'row', borderRadius: 22, marginBottom: 14,
+    borderWidth: 2, overflow: 'hidden',
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  },
+  stripe: { width: 6 },
+  body: { flex: 1, padding: 16 },
+  headerRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
+  iconCircle: {
+    width: 46, height: 46, borderRadius: 13,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  icon: { fontSize: 24 },
+  title: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2 },
+  sub: { fontSize: 12, marginTop: 2, fontWeight: '500' },
+  liveBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: 20,
+  },
+  liveDot: { width: 7, height: 7, borderRadius: 4 },
+  liveText: { fontSize: 12, fontWeight: '700' },
+  activeRow: {
+    flexDirection: 'row', alignItems: 'center',
+    borderRadius: 12, padding: 12, marginBottom: 12, gap: 10,
+  },
+  activeTask: { fontSize: 13, fontWeight: '600', marginBottom: 2 },
+  activeTimer: { fontSize: 15, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  pauseBtn: {
+    width: 36, height: 36, borderRadius: 18, borderWidth: 1.5,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  pauseBtnText: { fontSize: 14, fontWeight: '700' },
+  chartRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 8 },
+  chartMeta: { alignItems: 'flex-end' },
+  chartMetaVal: { fontSize: 18, fontWeight: '800' },
+  chartMetaLabel: { fontSize: 11, fontWeight: '500', marginTop: 2 },
+  insight: {
+    borderRadius: 12, padding: 10, marginBottom: 10, borderWidth: 1,
+  },
+  insightLabel: { fontSize: 12, fontWeight: '700', marginBottom: 3 },
+  insightTip:   { fontSize: 12, fontWeight: '500', lineHeight: 17 },
+  focusRow:  { flexDirection: 'row', gap: 8, marginBottom: 10 },
+  focusChip: { flex: 1, borderRadius: 12, paddingVertical: 8, paddingHorizontal: 10 },
+  focusVal:  { fontSize: 15, fontWeight: '800' },
+  focusLbl:  { fontSize: 11, fontWeight: '600', marginTop: 2 },
+  detailBox: {
+    borderRadius: 12, padding: 10, marginBottom: 10, borderWidth: 1,
+  },
+  detailTask: { fontSize: 13, fontWeight: '600', marginBottom: 8 },
+  detailMeta: { flexDirection: 'row', gap: 6 },
+  detailChip: {
+    fontSize: 12, fontWeight: '600',
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8,
+  },
+  btn: { borderRadius: 14, paddingVertical: 13, alignItems: 'center' },
+  btnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  resetLink: { alignItems: 'center', paddingTop: 10 },
+  resetLinkText: { fontSize: 12, fontWeight: '500' },
+})
+
+const wk = StyleSheet.create({
+  // Tab switcher
+  tabRow: {
+    flexDirection: 'row', borderRadius: 16, padding: 4,
+    marginBottom: 16, gap: 4,
+  },
+  tab: {
+    flex: 1, paddingVertical: 10,
+    alignItems: 'center', borderRadius: 12,
+  },
+  tabActive: {
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08, shadowRadius: 4, elevation: 2,
+  },
+  tabText: { fontSize: 14, fontWeight: '700' },
+
+  // Weekly Goals card
+  goalsCard: {
+    borderRadius: 22, borderWidth: 2,
+    paddingHorizontal: 18, paddingVertical: 16, marginBottom: 14,
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  },
+  goalsHeaderRow: {
+    flexDirection: 'row', alignItems: 'center',
+    justifyContent: 'space-between', marginBottom: 14,
+  },
+  goalsTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  goalsIcon: { fontSize: 28 },
+  goalsTitle: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2 },
+  goalsSub: { fontSize: 12, fontWeight: '500', marginTop: 2 },
+  goalsAddBtn: {
+    width: 34, height: 34, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  goalsEmpty: {
+    fontSize: 14, fontStyle: 'italic',
+    textAlign: 'center', paddingVertical: 16,
+  },
+  goalRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  goalCheck: {
+    width: 26, height: 26, borderRadius: 8, borderWidth: 2,
+    borderColor: '#d1d5db', alignItems: 'center', justifyContent: 'center',
+  },
+  goalCheckMark: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  goalText: { flex: 1, fontSize: 15, fontWeight: '500' },
+  goalTextDone: { color: '#ccc', textDecorationLine: 'line-through' },
+  goalRemove: { fontSize: 14 },
+  goalAddInput: {
+    borderWidth: 1.5, borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 10, fontSize: 15,
+  },
+  goalAddConfirm: {
+    paddingHorizontal: 16, paddingVertical: 11, borderRadius: 12,
+  },
+  goalDueBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
+  goalDueBadgeText: { fontSize: 11, fontWeight: '600' },
+  goalAddForm: { paddingTop: 10 },
+  goalResetLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 8, marginTop: 12 },
+  goalAddActions: { flexDirection: 'row', gap: 8, marginTop: 12, marginBottom: 4 },
+  goalAddCancel: {
+    paddingHorizontal: 16, paddingVertical: 11, borderRadius: 12, borderWidth: 1.5,
+    alignItems: 'center', justifyContent: 'center',
+  },
+
+  // Weekly Routine card
+  card: {
+    flexDirection: 'row', borderRadius: 22, marginBottom: 14,
+    borderWidth: 2, overflow: 'hidden',
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  },
+  cardStripe: { width: 6 },
+  cardHeader: {
+    flexDirection: 'row', alignItems: 'center',
+    padding: 16, paddingTop: 18,
+  },
+  cardIcon: {
+    width: 48, height: 48, borderRadius: 14,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  cardEmoji: { fontSize: 24 },
+  cardName: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2 },
+  cardStatus: { fontSize: 13, fontWeight: '500', marginTop: 2 },
+  taskList: {
+    paddingHorizontal: 16, paddingBottom: 14,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  taskRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10,
+  },
+  taskCheck: {
+    width: 28, height: 28, borderRadius: 9, borderWidth: 2,
+    borderColor: '#d1d5db', alignItems: 'center', justifyContent: 'center',
+  },
+  taskMark: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  taskText: { flex: 1, fontSize: 15, fontWeight: '500' },
+  taskTextDone: { color: '#ccc', textDecorationLine: 'line-through' },
+  addTaskRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 8 },
+  addTaskInput: {
+    flex: 1, borderWidth: 1.5, borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 9, fontSize: 14,
+  },
+  addTaskConfirm: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 12 },
+  addTaskBtn: { paddingVertical: 12, alignItems: 'center' },
+  addTaskBtnText: { fontSize: 14, fontWeight: '700' },
+
+  // Creation modal
+  modal: {
+    borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    paddingTop: 10, paddingHorizontal: 24, paddingBottom: 48,
+    maxHeight: '82%',
+    shadowColor: '#000', shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
+  },
+  modalTitle: {
+    fontSize: 20, fontWeight: '700', letterSpacing: -0.3,
+    marginBottom: 20, marginTop: 8,
+  },
+  modalLabel: {
+    fontSize: 11, fontWeight: '700', letterSpacing: 0.9,
+    marginBottom: 8,
+  },
+  modalNameInput: {
+    borderWidth: 1.5, borderRadius: 14,
+    paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 16, marginBottom: 20,
+  },
+  modalTaskRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  modalTaskInput: {
+    flex: 1, borderWidth: 1.5, borderRadius: 14,
+    paddingHorizontal: 14, paddingVertical: 11, fontSize: 15,
+  },
+  modalAddTask: { paddingVertical: 12, marginBottom: 4 },
+  modalAddTaskText: { fontWeight: '700', fontSize: 15 },
+  modalSave: {
+    borderRadius: 16, paddingVertical: 15,
+    alignItems: 'center', marginTop: 8,
+  },
+  modalSaveText: { color: '#fff', fontWeight: '800', fontSize: 16 },
+
+  // Shared day-of-week circles
+  dayRow: { flexDirection: 'row', gap: 6, marginBottom: 14, justifyContent: 'center' },
+  dayCircle: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
+  dayCircleText: { fontSize: 12, fontWeight: '700' },
+
+  // Routine card edit button
+  cardEditIconBtn: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 9, borderWidth: 1 },
+  cardEditIconText: { fontSize: 11, fontWeight: '700' },
+
+  // Inline edit section
+  editSection: {
+    paddingHorizontal: 16, paddingTop: 12, paddingBottom: 16,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  editLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.9, marginBottom: 8 },
+  editNameInput: {
+    borderWidth: 1.5, borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 10, fontSize: 15, marginBottom: 16,
+  },
+  editToggleRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 12, paddingHorizontal: 12, marginBottom: 14,
+    borderWidth: 1, borderRadius: 12,
+  },
+  editTaskRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  editTaskInput: {
+    flex: 1, borderWidth: 1.5, borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 9, fontSize: 14,
+  },
+  editAddTask: { paddingVertical: 10, marginBottom: 14 },
+  editAddTaskText: { fontWeight: '700', fontSize: 14 },
+  editActions: { flexDirection: 'row', gap: 8 },
+  editCancel: {
+    paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, borderWidth: 1.5,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  editSave: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+})
+
+const hb = StyleSheet.create({
+  sectionCard: {
+    borderRadius: 22, borderWidth: 2,
+    paddingHorizontal: 18, paddingVertical: 16, marginBottom: 14,
+    shadowOffset: { width: 4, height: 5 },
+    shadowOpacity: 0.18, shadowRadius: 0, elevation: 6,
+  },
+  sectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
+  sectionTitleRow: { flexDirection: 'row', alignItems: 'center' },
+  sectionTitle: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2 },
+  sectionSub: { fontSize: 12, fontWeight: '500', marginTop: 2 },
+  sectionAddBtn: { width: 34, height: 34, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  emptyText: { fontSize: 14, fontStyle: 'italic', textAlign: 'center', paddingVertical: 8, paddingBottom: 4 },
+
+  bCard: {
+    flexDirection: 'row', borderRadius: 18, marginBottom: 12,
+    borderWidth: 1.5, overflow: 'hidden',
+    shadowOffset: { width: 2, height: 3 }, shadowOpacity: 0.1, shadowRadius: 0, elevation: 3,
+  },
+  bStripe: { width: 5 },
+  bBody: { flex: 1, padding: 14 },
+  bHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
+  bIconCircle: { width: 44, height: 44, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
+  bName: { fontSize: 16, fontWeight: '700' },
+  bSince: { fontSize: 11, marginTop: 2, fontWeight: '500' },
+
+  timerRow: { flexDirection: 'row', gap: 6, marginBottom: 12, flexWrap: 'wrap' },
+  timerUnit: { borderRadius: 10, paddingHorizontal: 10, paddingVertical: 7, alignItems: 'center', minWidth: 50 },
+  timerVal: { fontSize: 18, fontWeight: '800' },
+  timerLabel: { fontSize: 10, fontWeight: '600', marginTop: 1 },
+
+  bActions: { flexDirection: 'row', gap: 8 },
+  relapseBtn: { flex: 1, paddingVertical: 9, borderRadius: 12, alignItems: 'center', borderWidth: 1.5 },
+  relapseBtnText: { fontSize: 13, fontWeight: '700' },
+  clearHistoryBtn: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 12, borderWidth: 1.5 },
+  clearHistoryText: { fontSize: 12, fontWeight: '600' },
+
+  buildRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  buildDot: { width: 8, height: 8, borderRadius: 4 },
+  buildName: { flex: 1, fontSize: 15, fontWeight: '500' },
+  buildAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 8 },
+  buildInput: { flex: 1, borderWidth: 1.5, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, fontSize: 14 },
+  buildConfirm: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 12 },
+
+  editTipsBtn: { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 10, borderWidth: 1.5 },
+  tipsInput: { borderWidth: 1.5, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, lineHeight: 22, minHeight: 120 },
+  tipsDisplay: { fontSize: 15, lineHeight: 22 },
+
+  modal: {
+    borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    paddingTop: 10, paddingHorizontal: 24, paddingBottom: 48, maxHeight: '82%',
+    shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.15, shadowRadius: 20, elevation: 20,
+  },
+  modalTitle: { fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 20, marginTop: 8 },
+  modalLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.9, marginBottom: 8 },
+  modalInput: { borderWidth: 1.5, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 16, marginBottom: 20 },
+  modalTextArea: { minHeight: 80, textAlignVertical: 'top' },
+  modalCancel: { paddingHorizontal: 16, paddingVertical: 13, borderRadius: 14, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center' },
+  modalSave: { borderRadius: 14, paddingVertical: 13, alignItems: 'center' },
+  modalSaveText: { color: '#fff', fontWeight: '800', fontSize: 16 },
+
+  confirmCard: {
+    borderRadius: 24, borderWidth: 2, padding: 24,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.2, shadowRadius: 20, elevation: 20,
+  },
+  confirmTitle: { fontSize: 20, fontWeight: '700', textAlign: 'center', marginBottom: 8 },
+  confirmSub: { fontSize: 14, textAlign: 'center', lineHeight: 20, marginBottom: 12 },
+  reasonBox: { borderRadius: 12, borderWidth: 1, padding: 12, marginBottom: 4 },
+  reasonLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, marginBottom: 6 },
+  reasonText: { fontSize: 14, lineHeight: 20, fontStyle: 'italic' },
+  confirmCancel: { paddingVertical: 13, borderRadius: 14, borderWidth: 1.5 },
+  confirmRelapseBtn: { paddingVertical: 13, borderRadius: 14, backgroundColor: '#f43f5e' },
+
+  aiCenter: { alignItems: 'center', paddingVertical: 30 },
+  aiLoadingText: { fontSize: 16, fontWeight: '500' },
+  aiAdviceBox: { borderRadius: 16, borderWidth: 1, padding: 16, marginBottom: 4 },
+  aiAdviceText: { fontSize: 15, lineHeight: 23 },
+  aiSubtext: { fontSize: 14, lineHeight: 20, marginBottom: 16 },
+})
+
