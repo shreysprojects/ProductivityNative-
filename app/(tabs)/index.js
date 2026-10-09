@@ -11,6 +11,7 @@ import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
 import { getRoutineNames, getRoutineTemplate, getTodayRunEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyGoals, saveWeeklyGoals, getWeeklyRoutines, saveWeeklyRoutines, getWeeklyGoalsConfig, saveWeeklyGoalsConfig, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
+import { syncRoutineNotifications } from '../../lib/routineNotifications'
 import { routineTheme } from '../../lib/themes'
 import { todaySplitIndex, muscleColor, muscleTextColor, normalizeDay } from '../../lib/splitData'
 import { useProductivity } from '../../lib/ProductivityContext'
@@ -1215,6 +1216,8 @@ export default function RoutinesScreen() {
     setSections(sec)
     setActiveTab(prev => (prev === 'weekly' && !sec.weekly) ? 'daily' : prev)
     setLoading(false)
+    // Keep routine start-time reminders in sync (no-op unless schedule changed).
+    syncRoutineNotifications(user.id)
   }, [user])
 
   async function handleHide(name) {
