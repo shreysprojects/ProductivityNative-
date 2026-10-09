@@ -26,6 +26,7 @@ import {
 import AIRoutineModal from '../../components/AIRoutineModal'
 import ImageViewerModal from '../../components/ImageViewerModal'
 import MuscleMap from '../../components/MuscleMap'
+import ExerciseVideo from '../../components/ExerciseVideo'
 import { supabase } from '../../lib/supabase'
 import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
 import { autoLogSpan } from '../../lib/timeLogging'
@@ -2807,6 +2808,8 @@ export default function RoutineScreen() {
                         )}
                         {previewExDetail.gifUrl ? (
                           <Image source={{ uri: previewExDetail.gifUrl }} style={s.exDetailGif} contentFit="contain" autoplay />
+                        ) : previewExDetail.videoId ? (
+                          <ExerciseVideo videoId={previewExDetail.videoId} style={{ marginBottom: 16 }} />
                         ) : (
                           <View style={s.exDetailNoGif}>
                             <Text style={{ fontSize: 48 }}>🏋️</Text>

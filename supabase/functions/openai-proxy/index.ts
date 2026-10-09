@@ -794,7 +794,10 @@ Deno.serve(async (req) => {
       const primary = canon(parsed.primary).slice(0, 3)
       const secondary = canon(parsed.secondary).filter(mu => !primary.includes(mu)).slice(0, 4)
       const note = noEmDash(String(parsed.note ?? '').trim()).slice(0, 200)
-      return json({ primary, secondary, note })
+      // Only a recognised exercise gets a demo video, and the video comes from
+      // a real YouTube search, never from the model.
+      const video = primary.length > 0 ? await findYouTubeDemo(name) : null
+      return json({ primary, secondary, note, video })
     }
 
     return json({ error: 'unknown_action' }, 400)
@@ -803,6 +806,36 @@ Deno.serve(async (req) => {
     return json({ error: 'internal_error' }, 500)
   }
 })
+
+// First video result for "<exercise> exercise how to" on YouTube, read from the
+// search page's embedded data. No API key needed; best effort, null on any
+// failure (YouTube changing its markup just means no video, never an error).
+async function findYouTubeDemo(name: string): Promise<{ id: string; title: string } | null> {
+  try {
+    const q = encodeURIComponent(`${name} exercise how to`)
+    // sp=EgIQAQ%3D%3D restricts results to videos.
+    const res = await fetch(`https://www.youtube.com/results?search_query=${q}&sp=EgIQAQ%253D%253D&hl=en`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    })
+    if (!res.ok) return null
+    const html = await res.text()
+    const m = /"videoRenderer":\{"videoId":"([A-Za-z0-9_-]{11})"/.exec(html)
+    if (!m) return null
+    const id = m[1]
+    // The title sits a little after the id inside the same renderer.
+    const after = html.slice(m.index, m.index + 6000)
+    const t = /"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"/.exec(after)
+    let title = ''
+    if (t) { try { title = JSON.parse(`"${t[1]}"`) } catch { title = t[1] } }
+    return { id, title: String(title).slice(0, 120) }
+  } catch (e) {
+    console.error('findYouTubeDemo failed:', e)
+    return null
+  }
+}
 
 async function callOpenAI(url: string, body: unknown): Promise<Record<string, unknown>> {
   const res = await fetch(url, {
