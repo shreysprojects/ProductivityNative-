@@ -1,7 +1,7 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import {
   View, Text, TextInput, Pressable, Modal, ScrollView, StyleSheet,
-  Alert, KeyboardAvoidingView, Platform,
+  Alert, KeyboardAvoidingView, Platform, Animated, PanResponder, Keyboard, Dimensions,
 } from 'react-native'
 import { useFocusEffect } from 'expo-router'
 import { useTheme } from '../lib/ThemeContext'
@@ -124,14 +124,72 @@ function ClubEditor({ club, isNew, meetings, theme, onSave, onClose }) {
 
   const live = meetings.filter(m => !removed.has(m.id))
 
+  // Drag-down-to-dismiss, same mechanics as the calendar's class sheet: the
+  // handle and title are a real grab area, and the form itself can be pulled
+  // down once it is scrolled to the top. Starting a drag closes the keyboard,
+  // since that is what the user is reaching past.
+  const dragY = useRef(new Animated.Value(0)).current
+  const backdrop = useRef(dragY.interpolate({
+    inputRange: [0, 260], outputRange: [1, 0], extrapolate: 'clamp',
+  })).current
+  const atTop = useRef(true)
+  // Slide the rest of the way out, then let the parent unmount the modal.
+  const closeSheet = () => {
+    Keyboard.dismiss()
+    Animated.timing(dragY, {
+      toValue: Dimensions.get('window').height, duration: 180, useNativeDriver: true,
+    }).start(() => onClose())
+  }
+  // The pan handlers are created once, so they reach the latest close through a ref.
+  const closeRef = useRef(closeSheet)
+  closeRef.current = closeSheet
+  const dragHandlers = useRef({
+    onPanResponderGrant: () => { Keyboard.dismiss() },
+    onPanResponderMove: (_, g) => { dragY.setValue(Math.max(0, g.dy)) },
+    // The ScrollView asks for the gesture back once it starts moving; refusing
+    // keeps a pull that began as a dismissal a dismissal.
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderRelease: (_, g) => {
+      // A long pull or a quick flick closes; anything shorter snaps back.
+      if (g.dy > 120 || (g.dy > 40 && g.vy > 0.6)) closeRef.current()
+      else Animated.spring(dragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+    onPanResponderTerminate: () => {
+      Animated.spring(dragY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start()
+    },
+  }).current
+  // The handle and title: always draggable.
+  const handlePan = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    ...dragHandlers,
+  })).current
+  // The form body: only a clear downward pull from the top of the scroll, so
+  // ordinary scrolling and field taps are untouched.
+  const bodyPan = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => atTop.current && g.dy > 8 && g.dy > Math.abs(g.dx),
+    ...dragHandlers,
+  })).current
+
   return (
-    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible transparent animationType="slide" onRequestClose={closeSheet}>
       <KeyboardAvoidingView style={c.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <Pressable style={c.overlayBg} onPress={onClose} />
-        <View style={[c.sheet, { backgroundColor: theme.card }]}>
-          <View style={[c.handle, { backgroundColor: theme.divider }]} />
-          <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 8 }}>
+        <Animated.View pointerEvents="none" style={[c.overlayBg, { opacity: backdrop }]} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={closeSheet} />
+        <Animated.View style={[c.sheet, { backgroundColor: theme.card, transform: [{ translateY: dragY }] }]}>
+          <View {...handlePan.panHandlers} style={c.grabArea}>
+            <View style={[c.handle, { backgroundColor: theme.divider }]} />
             <Text style={[c.sheetTitle, { color: theme.text }]}>{isNew ? 'Add a club or society' : `Edit ${club.name}`}</Text>
+          </View>
+          <View {...bodyPan.panHandlers} style={c.bodyWrap}>
+          <ScrollView
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={{ paddingBottom: 8 }}
+            bounces={false}
+            scrollEventThrottle={16}
+            onScroll={e => { atTop.current = e.nativeEvent.contentOffset.y <= 0 }}
+          >
 
             <Text style={[c.fieldLabel, { color: theme.muted }]}>NAME</Text>
             <TextInput
@@ -227,11 +285,12 @@ function ClubEditor({ club, isNew, meetings, theme, onSave, onClose }) {
             <Pressable style={[c.saveBtn, { backgroundColor: CLUB_COLOR }]} onPress={save}>
               <Text style={c.saveBtnText}>{isNew ? 'Add club' : 'Save changes'}</Text>
             </Pressable>
-            <Pressable style={c.cancelBtn} onPress={onClose}>
+            <Pressable style={c.cancelBtn} onPress={closeSheet}>
               <Text style={[c.cancelText, { color: theme.subtext }]}>Cancel</Text>
             </Pressable>
           </ScrollView>
-        </View>
+          </View>
+        </Animated.View>
       </KeyboardAvoidingView>
     </Modal>
   )
@@ -436,6 +495,12 @@ const c = StyleSheet.create({
     borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingTop: 10, paddingHorizontal: 22, paddingBottom: 34,
     maxHeight: '90%',
   },
+  // Full-bleed header strip so the grab target is the whole width, not the
+  // 40px bar. Negative margin cancels the sheet's own side padding.
+  grabArea: { marginHorizontal: -22, paddingHorizontal: 22, paddingTop: 4 },
+  // Lets the form shrink inside the sheet's maxHeight so the ScrollView stays
+  // bounded now that the header sits outside it.
+  bodyWrap: { flexShrink: 1 },
   handle: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 18 },
   sheetTitle: { fontSize: 20, fontWeight: '800', letterSpacing: -0.3, marginBottom: 14 },
   fieldLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, marginBottom: 8, marginTop: 4 },
