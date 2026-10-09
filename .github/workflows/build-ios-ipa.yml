@@ -13,14 +13,15 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-15
+    # SDK 56+ needs Xcode 26.4 or newer; the macOS 26 image ships 26.6.
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
