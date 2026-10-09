@@ -664,7 +664,7 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
           Alert.alert('Inappropriate Image', 'Please only upload appropriate photos for skin analysis.')
           return
         }
-        if (detail?.error === 'moderation_unavailable') {
+        if (detail?.error === 'limit_unavailable' || detail?.error === 'moderation_unavailable') {
           Alert.alert('Try again', detail.reason)
           return
         }

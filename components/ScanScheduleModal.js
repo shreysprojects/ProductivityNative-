@@ -88,10 +88,18 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
           Alert.alert('Limit reached', detail.reason)
           return
         }
-        throw new Error(detail?.message ?? detail?.error ?? error.message)
+        if (detail?.error === 'limit_unavailable') {
+          Alert.alert('Try again', detail.reason)
+          return
+        }
+        throw new Error(detail?.reason ?? detail?.message ?? detail?.error ?? error.message)
       }
       if (data?.error === 'daily_limit') {
         Alert.alert('Limit reached', data.reason)
+        return
+      }
+      if (data?.error === 'limit_unavailable') {
+        Alert.alert('Try again', data.reason)
         return
       }
       const classes = Array.isArray(data?.classes) ? data.classes : []

@@ -104,7 +104,27 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'create_routine', routineName, surveyQA },
       })
-      if (error) throw new Error(error.message ?? 'Request failed')
+      if (error) {
+        // Limits/flags come back as non-2xx, so the reason is on the error body.
+        let detail = null
+        try { detail = await error.context?.json() } catch {}
+        if (detail?.error === 'daily_limit') {
+          setPhase('survey')
+          Alert.alert('Daily limit reached', detail.reason)
+          return
+        }
+        if (detail?.error === 'flagged') {
+          setPhase('survey')
+          Alert.alert('Inappropriate content', 'Your input contains harmful content. Please keep your routine goals safe and healthy.')
+          return
+        }
+        if (detail?.error === 'limit_unavailable' || detail?.error === 'moderation_unavailable') {
+          setPhase('survey')
+          Alert.alert('Try again', detail.reason)
+          return
+        }
+        throw new Error(detail?.reason ?? error.message ?? 'Request failed')
+      }
       if (data?.error === 'daily_limit') {
         setPhase('survey')
         Alert.alert('Daily limit reached', data.reason)
@@ -132,7 +152,27 @@ export default function AIRoutineModal({ visible, onClose, routineName, existing
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'advise_routine', routineName, tasks },
       })
-      if (error) throw new Error(error.message ?? 'Request failed')
+      if (error) {
+        // Limits/flags come back as non-2xx, so the reason is on the error body.
+        let detail = null
+        try { detail = await error.context?.json() } catch {}
+        if (detail?.error === 'daily_limit') {
+          setPhase('choice')
+          Alert.alert('Daily limit reached', detail.reason)
+          return
+        }
+        if (detail?.error === 'flagged') {
+          setPhase('choice')
+          Alert.alert('Inappropriate content', 'Your tasks contain harmful content. Please keep your routine safe and healthy.')
+          return
+        }
+        if (detail?.error === 'limit_unavailable' || detail?.error === 'moderation_unavailable') {
+          setPhase('choice')
+          Alert.alert('Try again', detail.reason)
+          return
+        }
+        throw new Error(detail?.reason ?? error.message ?? 'Request failed')
+      }
       if (data?.error === 'daily_limit') {
         setPhase('choice')
         Alert.alert('Daily limit reached', data.reason)
