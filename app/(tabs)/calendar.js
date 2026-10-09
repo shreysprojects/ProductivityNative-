@@ -698,7 +698,8 @@ export default function CalendarScreen() {
       {/* View toggle bar */}
       <View style={[s.toggleBar, { backgroundColor: theme.card, borderBottomColor: theme.divider }]}>
         <View style={[s.togglePill, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0f8' }]}>
-          {['month', 'week', 'tasks'].map(mode => (
+          {/* 'tasks' HIDDEN for now (not deleted) — restore: ['month', 'week', 'tasks'] */}
+          {['month', 'week'].map(mode => (
             <Pressable
               key={mode}
               style={[s.toggleOpt, viewMode === mode && { backgroundColor: theme.accent }]}

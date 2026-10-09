@@ -1,11 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, StyleSheet, ScrollView,
-  TextInput, ActivityIndicator, FlatList,
+  TextInput, ActivityIndicator, FlatList, Alert,
 } from 'react-native'
 import { Image } from 'expo-image'
+import * as ImagePicker from 'expo-image-picker'
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator'
 import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
+import { supabase } from '../lib/supabase'
 import { getWorkoutPlan, saveWorkoutPlan, getWorkoutLog, today } from '../lib/storage'
 import { WGER_CATEGORIES, fetchExercisesByCategory, searchExercises } from '../lib/wgerApi'
 
@@ -147,6 +150,58 @@ function initialCategory(muscleGroup) {
   return WGER_CATEGORIES.find(c => c.id === bodyPart) ?? WGER_CATEGORIES[0]
 }
 
+// ── Screenshot import: match AI-extracted names to library exercises ───────
+
+function normalizeExName(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/\(.*?\)/g, ' ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Tries the full extracted name, then its last two words ("bench press"),
+// then just the movement word ("pushdown") as progressively looser queries.
+// Hits are scored by word overlap against the name PLUS tagged muscles,
+// equipment, and body part — so "Tricep Rope Pushdown" matches a library
+// "Cable Pushdown" that's tagged triceps. Returns null when nothing is a
+// confident match.
+async function findLibraryMatch(extractedName) {
+  const target = normalizeExName(extractedName)
+  if (!target) return null
+  const targetWords = target.split(' ').filter(w => w.length > 2)
+
+  const words = target.split(' ')
+  const queries = [target]
+  if (words.length > 2) queries.push(words.slice(-2).join(' '))
+  if (words.length > 1) queries.push(words[words.length - 1])
+
+  for (const q of queries) {
+    if (q.length < 3) continue
+    let results = []
+    try { results = await searchExercises(q, 25) } catch { results = [] }
+    if (!results.length) continue
+
+    let best = null
+    let bestScore = 0
+    for (const r of results) {
+      const haystack = normalizeExName([
+        r.name, r.category, r.equipment,
+        ...r.muscles.map(m => m.name),
+        ...r.musclesSecondary.map(m => m.name),
+      ].join(' '))
+      const score = normalizeExName(r.name) === target
+        ? 100
+        : (targetWords.filter(w => haystack.includes(w)).length / Math.max(targetWords.length, 1)) * 50 - r.name.length * 0.01
+      if (score > bestScore) { best = r; bestScore = score }
+    }
+    // Accept only if at least half the significant words appear in the hit.
+    if (best && bestScore >= 25) return best
+  }
+  return null
+}
+
 export default function WorkoutLibrary() {
   const { muscleGroup } = useLocalSearchParams()
   const { user } = useAuth()
@@ -164,6 +219,7 @@ export default function WorkoutLibrary() {
   const [loadError, setLoadError] = useState(false)
   const [preview, setPreview] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [doneToday, setDoneToday] = useState(new Set())
   const searchTimer = useRef(null)
 
@@ -270,6 +326,99 @@ export default function WorkoutLibrary() {
     }
   }
 
+  // Pick screenshots of a workout from another app, extract the exercises
+  // with AI, and rebuild the workout here in the same order.
+  async function importFromScreenshots() {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Photo library access is required to pick screenshots.')
+      return
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: 'images',
+      allowsMultipleSelection: true,
+      selectionLimit: 4,
+      orderedSelection: true,
+    })
+    if (result.canceled || !result.assets?.length) return
+
+    setImporting(true)
+    try {
+      // Screenshots are usually huge PNGs — downscale and re-encode as JPEG
+      // so the upload stays small (and OCR stays fast).
+      const images = []
+      for (const asset of result.assets) {
+        const width = Math.min(asset.width || 900, 900)
+        const shrunk = await manipulateAsync(
+          asset.uri,
+          [{ resize: { width } }],
+          { compress: 0.7, format: SaveFormat.JPEG, base64: true }
+        )
+        if (shrunk.base64) images.push(shrunk.base64)
+      }
+      if (!images.length) return
+
+      const { data, error } = await supabase.functions.invoke('openai-proxy', {
+        body: { action: 'extract_workout', images },
+      })
+      if (error) {
+        // Non-2xx responses land here — pull the real reason out of the body.
+        let detail = null
+        try { detail = await error.context?.json() } catch {}
+        if (detail?.error === 'daily_limit') {
+          Alert.alert('Limit reached', detail.reason)
+          return
+        }
+        throw new Error(detail?.message ?? detail?.error ?? error.message)
+      }
+      if (data?.error === 'daily_limit') {
+        Alert.alert('Limit reached', data.reason)
+        return
+      }
+      const extracted = Array.isArray(data?.exercises) ? data.exercises : []
+      if (!extracted.length) {
+        Alert.alert(
+          'No workout found',
+          "Couldn't read a workout from those screenshots. Try clearer screenshots that show the exercise list."
+        )
+        return
+      }
+
+      // Match each extracted exercise against the library, keeping order.
+      const matched = []
+      const missing = []
+      for (const ex of extracted) {
+        const hit = await findLibraryMatch(ex.name)
+        if (hit) matched.push({ ...hit, sets: ex.sets ?? 3, reps: ex.reps ?? 10, restSeconds: 90 })
+        else missing.push(ex.name)
+      }
+
+      const have = new Set(plan.map(e => e.id))
+      const fresh = matched.filter(m => {
+        if (have.has(m.id)) return false
+        have.add(m.id)
+        return true
+      })
+      const dupCount = matched.length - fresh.length
+      if (fresh.length) setPlan(prev => [...prev, ...fresh])
+
+      const lines = []
+      if (fresh.length) lines.push(`Added ${fresh.length} of ${extracted.length} exercises in order from your screenshots.`)
+      if (dupCount) lines.push(`${dupCount} already in this workout — skipped.`)
+      if (missing.length) {
+        lines.push(`Not found in the exercise library:\n• ${missing.join('\n• ')}\n\nUse search to add a close alternative for these.`)
+      }
+      Alert.alert(
+        missing.length ? 'Imported — some missing' : 'Workout imported ✓',
+        lines.join('\n\n')
+      )
+    } catch (e) {
+      Alert.alert('Import failed', e.message ?? 'Something went wrong. Please try again.')
+    } finally {
+      setImporting(false)
+    }
+  }
+
   const displayed = searchResults !== null ? searchResults : exercises
   const isSearching = search.trim().length > 0
 
@@ -300,6 +449,26 @@ export default function WorkoutLibrary() {
           returnKeyType="search"
           clearButtonMode="while-editing"
         />
+        <Pressable
+          style={[s.importBtn, importing && { opacity: 0.7 }]}
+          onPress={importFromScreenshots}
+          disabled={importing}
+        >
+          {importing
+            ? <ActivityIndicator size="small" color={COLOR} />
+            : <Text style={{ fontSize: 15 }}>📸</Text>}
+          <View style={{ flex: 1 }}>
+            <Text style={s.importBtnTitle}>
+              {importing ? 'Reading screenshots…' : '✦ Import from screenshots'}
+            </Text>
+            {!importing && (
+              <Text style={s.importBtnSub}>
+                Pick up to 4 screenshots of a workout from another app — AI rebuilds it here.
+              </Text>
+            )}
+          </View>
+          {!importing && <Text style={{ color: COLOR, fontSize: 16, fontWeight: '600' }}>→</Text>}
+        </Pressable>
       </View>
 
       {!isSearching && (
@@ -429,6 +598,14 @@ const s = StyleSheet.create({
     paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, color: '#111',
     borderWidth: 1, borderColor: '#e5e7eb',
   },
+  importBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    borderRadius: 12, borderWidth: 1.5, borderStyle: 'dashed',
+    borderColor: COLOR + '55', backgroundColor: COLOR + '0c',
+    paddingHorizontal: 12, paddingVertical: 10, marginTop: 10,
+  },
+  importBtnTitle: { fontSize: 13, fontWeight: '700', color: COLOR },
+  importBtnSub: { fontSize: 11, color: '#888', marginTop: 1 },
 
   catScroll: { backgroundColor: '#fff', maxHeight: 56 },
   catRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 10, gap: 8, flexDirection: 'row' },

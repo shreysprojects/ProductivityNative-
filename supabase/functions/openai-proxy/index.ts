@@ -8,10 +8,12 @@ const CORS = {
 const OPENAI_KEY   = Deno.env.get('OPENAI_API_KEY')!
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_KEY  = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-const MAX_PER_DAY     = 3
-const MAX_MOD_PER_DAY = 60
+const MAX_PER_DAY          = 3
+const MAX_MOD_PER_DAY      = 60
+const MAX_EXTRACT_PER_WEEK = 10
 
-// Actions that consume the daily generative rate limit
+// Actions that consume the daily generative rate limit.
+// extract_workout has its own weekly cap (ai_workout_limits) instead.
 const GENERATIVE = new Set(['create_routine', 'advise_routine', 'analyze_looks'])
 
 // Moderation actions capped separately (moderate_routine & moderate_profile_picture
@@ -77,6 +79,29 @@ Deno.serve(async (req) => {
       await admin
         .from('ai_mod_limits')
         .upsert({ user_id: user.id, date: today, count: current + 1 })
+    } else if (action === 'extract_workout') {
+      // Weekly cap (Mon–Sun, UTC), separate from the daily generative limit.
+      const monday = new Date()
+      monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7))
+      const weekStart = monday.toISOString().slice(0, 10)
+
+      const { data: rl } = await admin
+        .from('ai_workout_limits')
+        .select('count')
+        .eq('user_id', user.id)
+        .eq('week_start', weekStart)
+        .maybeSingle()
+
+      const current = (rl as { count: number } | null)?.count ?? 0
+      if (current >= MAX_EXTRACT_PER_WEEK) {
+        return json(
+          { error: 'daily_limit', reason: `Weekly limit of ${MAX_EXTRACT_PER_WEEK} screenshot imports reached. It resets on Monday.` },
+          429,
+        )
+      }
+      await admin
+        .from('ai_workout_limits')
+        .upsert({ user_id: user.id, week_start: weekStart, count: current + 1 })
     }
 
     // ── Dispatch ────────────────────────────────────────────────────────────
@@ -234,6 +259,45 @@ Deno.serve(async (req) => {
       } catch { return json({ allowed: true }) }
     }
 
+    if (action === 'extract_workout') {
+      const images: string[] = (Array.isArray(body.images) ? body.images : [])
+        .filter((b: unknown) => typeof b === 'string' && b.length > 0)
+        .slice(0, 4)
+      if (!images.length) return json({ error: 'no_images' }, 400)
+
+      const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
+        model: 'gpt-4o-mini',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'The attached screenshots show a workout plan from a fitness app. Extract every exercise in the EXACT order shown — the screenshots are provided in order, so exercises from earlier screenshots come first.\n\nReturn ONLY valid JSON:\n{"exercises":[{"name":"exercise name","sets":3,"reps":10}]}\n\nRules:\n- Use standard full exercise names, expanding abbreviations (RDL → Romanian Deadlift, OHP → Overhead Press, DB → Dumbbell, BB → Barbell).\n- Keep the equipment in the name when shown (e.g. "Dumbbell Bench Press").\n- If sets or reps are not visible for an exercise, use sets 3 and reps 10. For rep ranges like 8-12 use the lower bound.\n- Skip duplicates if the same exercise appears in overlapping screenshots.\n- If the images do not show a workout, return {"exercises":[]}.' },
+            ...images.map(b64 => ({
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${b64}`, detail: 'high' },
+            })),
+          ],
+        }],
+        max_tokens: 1200,
+        response_format: { type: 'json_object' },
+      })
+
+      const choice = chat.choices?.[0]
+      if (choice?.finish_reason === 'content_filter' || choice?.message?.refusal) {
+        return json({ error: 'inappropriate' })
+      }
+      const parsed = JSON.parse(choice?.message?.content ?? '{}')
+      const raw: Array<{ name?: string; sets?: number; reps?: number }> =
+        Array.isArray(parsed.exercises) ? parsed.exercises : []
+      const exercises = raw
+        .map(e => ({
+          name: String(e.name ?? '').trim().slice(0, 80),
+          sets: Math.min(Math.max(1, Math.round(Number(e.sets) || 3)), 10),
+          reps: Math.min(Math.max(1, Math.round(Number(e.reps) || 10)), 100),
+        }))
+        .filter(e => e.name)
+      return json({ exercises })
+    }
+
     if (action === 'analyze_looks') {
       const base64: string = body.base64 ?? ''
       const chat = await callOpenAI('https://api.openai.com/v1/chat/completions', {
@@ -260,7 +324,7 @@ Deno.serve(async (req) => {
     return json({ error: 'unknown_action' }, 400)
   } catch (e) {
     console.error('openai-proxy error:', e)
-    return json({ error: 'internal_error' }, 500)
+    return json({ error: 'internal_error', message: String((e as Error)?.message ?? e) }, 500)
   }
 })
 

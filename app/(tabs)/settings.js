@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import {
   View, Text, Pressable, ScrollView, TextInput,
-  StyleSheet, Alert, ActivityIndicator,
+  StyleSheet, Alert, ActivityIndicator, Switch,
   KeyboardAvoidingView, Platform,
 } from 'react-native'
 import { Image } from 'expo-image'
@@ -18,6 +18,7 @@ import { muscleColor, muscleTextColor } from '../../lib/splitData'
 import {
   checkUsernameAvailable, upsertProfile, pickAndUploadAvatar,
 } from '../../lib/profileStorage'
+import { getSections, saveSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 
 const ACCENT = '#6366f1'
 const DAY_ABBR = ['S', 'M', 'T', 'W', 'T', 'F', 'S']
@@ -79,7 +80,7 @@ function validateUsernameFormat(u) {
 
 export default function SettingsScreen() {
   const { user, profile, refreshProfile, signOut, deleteAccount } = useAuth()
-  const { theme, toggleDark, unit: appUnit } = useTheme()
+  const { theme, toggleDark, unit: appUnit, toggleUnit } = useTheme()
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -124,6 +125,19 @@ export default function SettingsScreen() {
   const [customProtein, setCustomProtein] = useState('')
   const [customCarbs, setCustomCarbs]     = useState('')
   const [customFat, setCustomFat]         = useState('')
+
+  // App sections (drives the hidden SECTIONS / BOTTOM TABS toggle groups)
+  const [sections, setSections] = useState({ ...DEFAULT_SECTIONS })
+
+  useFocusEffect(useCallback(() => {
+    if (user) getSections(user.id).then(setSections)
+  }, [user]))
+
+  async function toggleSection(name) {
+    const next = { ...sections, [name]: !sections[name] }
+    setSections(next)
+    await saveSections(user.id, next)
+  }
 
   // Load profile into local state once per session
   useEffect(() => {
@@ -435,6 +449,8 @@ export default function SettingsScreen() {
             onChangeText={setLocalBio}
           />
 
+          {/* "Show full data to" visibility picker — HIDDEN for now via `false &&` (not deleted) */}
+          {false && (<>
           <FieldLabel theme={theme}>Show full data to</FieldLabel>
           <View style={[st.visRow, { backgroundColor: theme.isDark ? theme.input : '#f0f0f8', borderColor: theme.inputBorder }]}>
             {[
@@ -458,6 +474,7 @@ export default function SettingsScreen() {
               ? 'Only accepted friends can see your calendar, routines, and workouts.'
               : 'No one can see your activity — your profile shows only your name and bio.'}
           </Text>
+          </>)}
 
           <Pressable
             style={[st.profileSaveBtn, { backgroundColor: ACCENT }, savingProfile && { opacity: 0.6 }]}
@@ -692,7 +709,8 @@ export default function SettingsScreen() {
           )}
         </View>
 
-        {/* ── Nutrition Targets ──────────────────────────────────────── */}
+        {/* ── Nutrition Targets ── HIDDEN for now via `false &&` (not deleted) ── */}
+        {false && (<>
         <SectionHeader title="NUTRITION TARGETS" theme={theme} />
         <View style={[st.card, { backgroundColor: theme.card, borderColor: theme.cardBorder }]}>
           {isCustom ? (
@@ -752,6 +770,7 @@ export default function SettingsScreen() {
             </Text>
           </Pressable>
         </View>
+        </>)}
 
         {/* ── App Preferences ───────────────────────────────────────── */}
         <SectionHeader title="APP PREFERENCES" theme={theme} />
@@ -762,6 +781,54 @@ export default function SettingsScreen() {
               <View style={[st.toggleKnob, { alignSelf: theme.isDark ? 'flex-end' : 'flex-start' }]} />
             </View>
           </Pressable>
+
+          <View style={[st.prefRow, { marginTop: 14 }]}>
+            <Text style={[st.prefLabel, { color: theme.text }]}>Weight Unit</Text>
+            <Pressable
+              onPress={toggleUnit}
+              style={[st.unitPill, { backgroundColor: theme.isDark ? '#28284a' : '#ebebf5' }]}
+            >
+              <Text style={[st.unitPillText, { color: theme.accent }]}>{appUnit.toUpperCase()}</Text>
+            </Pressable>
+          </View>
+
+          {/* SECTIONS + BOTTOM TABS toggle groups — HIDDEN for now via `false &&` (not deleted) */}
+          {false && (<>
+          <Text style={[st.prefGroupLabel, { color: theme.muted }]}>SECTIONS</Text>
+          {[
+            ['weekly', '🗓️', 'Weekly tab'],
+            ['productivity', '📚', 'Deep Work card'],
+          ].map(([key, icon, label]) => (
+            <View key={key} style={st.prefRow}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>{icon}  {label}</Text>
+              <Switch
+                value={sections[key]}
+                onValueChange={() => toggleSection(key)}
+                trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
+                thumbColor="#ffffff"
+                ios_backgroundColor="#e0e0f0"
+              />
+            </View>
+          ))}
+
+          <Text style={[st.prefGroupLabel, { color: theme.muted }]}>BOTTOM TABS</Text>
+          {[
+            ['tabMeals', '🍽️', 'Nutrition'],
+            ['tabCalendar', '📅', 'Calendar'],
+            ['tabExplore', '🧭', 'Explore'],
+          ].map(([key, icon, label]) => (
+            <View key={key} style={st.prefRow}>
+              <Text style={[st.prefLabel, { color: theme.text }]}>{icon}  {label}</Text>
+              <Switch
+                value={sections[key] !== false}
+                onValueChange={() => toggleSection(key)}
+                trackColor={{ false: '#e0e0f0', true: '#5c5ef0' }}
+                thumbColor="#ffffff"
+                ios_backgroundColor="#e0e0f0"
+              />
+            </View>
+          ))}
+          </>)}
         </View>
 
         {/* ── Save ──────────────────────────────────────────────────── */}
@@ -918,6 +985,14 @@ const st = StyleSheet.create({
     justifyContent: 'space-between', paddingVertical: 4,
   },
   prefLabel: { fontSize: 15, fontWeight: '600' },
+  prefGroupLabel: {
+    fontSize: 11, fontWeight: '800', letterSpacing: 1.2,
+    marginTop: 18, marginBottom: 6,
+  },
+  unitPill: {
+    borderRadius: 10, paddingHorizontal: 14, paddingVertical: 7,
+  },
+  unitPillText: { fontSize: 14, fontWeight: '800', letterSpacing: 1 },
   toggle: { width: 44, height: 24, borderRadius: 12, padding: 3, justifyContent: 'center' },
   toggleKnob: { width: 18, height: 18, borderRadius: 9, backgroundColor: '#fff' },
 
