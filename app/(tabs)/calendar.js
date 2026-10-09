@@ -2176,7 +2176,40 @@ export default function CalendarScreen() {
                   value={cLoc} onChangeText={setCLoc} returnKeyType="next"
                 />
   
-                <Text style={[s.fieldLabel, { color: theme.muted }]}>DAYS</Text>
+                <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
+                <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
+
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>END TIME</Text>
+                <TimeInput h={cEH} m={cEM} ap={cEAp} onH={setCEH} onM={setCEM} onAp={setCEAp} theme={theme} />
+
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>COLOR</Text>
+                <View style={s.colorRow}>
+                  {SCHEDULE_COLORS.map(c => (
+                    <Pressable
+                      key={c}
+                      style={[s.colorSwatch, { backgroundColor: c }, cColor === c && s.colorSwatchActive]}
+                      onPress={() => setCColor(c)}
+                    />
+                  ))}
+                </View>
+
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>SEMESTER DATE RANGE (optional)</Text>
+                <View style={s.semRow}>
+                  <TextInput
+                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
+                    value={cFrom} onChangeText={setCFrom} keyboardType="numbers-and-punctuation" maxLength={10}
+                  />
+                  <Text style={[s.semArrow, { color: theme.muted }]}>→</Text>
+                  <TextInput
+                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
+                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
+                    value={cTo} onChangeText={setCTo} keyboardType="numbers-and-punctuation" maxLength={10}
+                  />
+                </View>
+                <Text style={[s.hint, { color: theme.muted }]}>Leave blank to show every week indefinitely</Text>
+
+                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>DAYS</Text>
                 <View style={s.daysRow}>
                   {WEEK_DAY_BTNS.map(d => {
                     const on = cDays.includes(d.value)
@@ -2251,39 +2284,6 @@ export default function CalendarScreen() {
                     </View>
                   </>
                 )}
-
-                <Text style={[s.fieldLabel, { color: theme.muted }]}>START TIME</Text>
-                <TimeInput h={cSH} m={cSM} ap={cSAp} onH={setCSH} onM={setCSM} onAp={setCSAp} theme={theme} />
-  
-                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>END TIME</Text>
-                <TimeInput h={cEH} m={cEM} ap={cEAp} onH={setCEH} onM={setCEM} onAp={setCEAp} theme={theme} />
-  
-                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>COLOR</Text>
-                <View style={s.colorRow}>
-                  {SCHEDULE_COLORS.map(c => (
-                    <Pressable
-                      key={c}
-                      style={[s.colorSwatch, { backgroundColor: c }, cColor === c && s.colorSwatchActive]}
-                      onPress={() => setCColor(c)}
-                    />
-                  ))}
-                </View>
-  
-                <Text style={[s.fieldLabel, { color: theme.muted, marginTop: 12 }]}>SEMESTER DATE RANGE (optional)</Text>
-                <View style={s.semRow}>
-                  <TextInput
-                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
-                    value={cFrom} onChangeText={setCFrom} keyboardType="numbers-and-punctuation" maxLength={10}
-                  />
-                  <Text style={[s.semArrow, { color: theme.muted }]}>→</Text>
-                  <TextInput
-                    style={[s.semInput, { flex: 1, backgroundColor: theme.input, borderColor: theme.inputBorder, color: theme.text }]}
-                    placeholder="MM/DD/YYYY" placeholderTextColor={theme.muted}
-                    value={cTo} onChangeText={setCTo} keyboardType="numbers-and-punctuation" maxLength={10}
-                  />
-                </View>
-                <Text style={[s.hint, { color: theme.muted }]}>Leave blank to show every week indefinitely</Text>
   
                 <Pressable
                   style={[s.saveBtn, { backgroundColor: theme.accent, opacity: cSaving ? 0.6 : 1, marginBottom: 8 }]}
