@@ -9,6 +9,7 @@ import { router, useFocusEffect, useNavigation } from 'expo-router'
 import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
+import ClubsSection from '../../components/ClubsSection'
 import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { syncRoutineNotifications } from '../../lib/routineNotifications'
@@ -63,7 +64,7 @@ function nextRoutineNudge(visible, doneCount, total) {
     : `Let's move onto ${next.name} routine!`
 }
 
-function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, theme }) {
+function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hiddenSet, routineStreaks, theme }) {
   const [calItems, setCalItems] = useState([])
   const [pendingTodos, setPendingTodos] = useState([])
   const [tasksToday, setTasksToday] = useState([])
@@ -154,6 +155,10 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
     .filter(([, v]) => v > 0)
     .sort(([, a], [, b]) => b - a)
 
+  // Whenever routines stay out of the X/Y circle (they're optional), but a
+  // finished one still deserves a mention up here.
+  const wheneverDone = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && r.run?.finished)
+
   const displayName = (profile?.name?.trim() || user?.name || 'there').split(' ')[0]
   const dateLabel   = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
 
@@ -219,6 +224,18 @@ function DailyDashboard({ user, profile, routines, hiddenSet, routineStreaks, th
                   </View>
                 )
               })}
+            </View>
+          )}
+
+          {/* Whenever routines finished today */}
+          {wheneverDone.length > 0 && (
+            <View style={db.streakRow}>
+              {wheneverDone.map(r => (
+                <View key={r.name} style={[db.streakChip, { backgroundColor: WHENEVER_COLOR + '18' }]}>
+                  <Text style={{ fontSize: 11 }}>🌊</Text>
+                  <Text style={[db.streakChipText, { color: '#0e7490' }]}>{r.name} · done today ✓</Text>
+                </View>
+              ))}
             </View>
           )}
 
@@ -912,7 +929,19 @@ export default function RoutinesScreen() {
   const load = useCallback(async ({ force = false } = {}) => {
     if (!user) return
     // A focus refetch inside the throttle window keeps rendering cached state.
-    if (!force && hasLoadedRef.current && Date.now() - lastLoadAtRef.current < REFETCH_MS) return
+    if (!force && hasLoadedRef.current && Date.now() - lastLoadAtRef.current < REFETCH_MS) {
+      // Inside the throttle window, still refresh today's runs: a routine
+      // finished seconds ago has to read as done the moment the user lands
+      // back here. One query plus the device mirrors, so it is cheap.
+      const names = routinesRef.current.map(r => r.name)
+      if (names.length) {
+        try {
+          const runs = await getTodayRunsEither(user.id, names)
+          setRoutines(prev => prev.map(r => ({ ...r, run: runs[r.name] ?? null })))
+        } catch {}
+      }
+      return
+    }
     try {
       // Only the per-routine reads depend on the names list — everything else
       // runs in one parallel batch right behind the single names query.
@@ -974,6 +1003,11 @@ export default function RoutinesScreen() {
       setLoading(false)
     }
   }, [user])
+
+  // The routine list as of the last render, for the throttled runs refresh
+  // above (load's closure can't see state without re-creating itself).
+  const routinesRef = useRef([])
+  useEffect(() => { routinesRef.current = routines }, [routines])
 
   async function handleHide(name) {
     Alert.alert(
@@ -1089,6 +1123,7 @@ export default function RoutinesScreen() {
   const visibleEveryday = everydayRoutines.filter(r => !hiddenSet.has(r.name))
   const doneCount = visibleEveryday.filter(r => r.run?.finished).length
   const allDone = doneCount > 0 && doneCount === visibleEveryday.length
+  const wheneverDoneCount = wheneverRoutines.filter(r => !hiddenSet.has(r.name) && r.run?.finished).length
 
   return (
     <KeyboardAvoidingView
@@ -1101,6 +1136,7 @@ export default function RoutinesScreen() {
           user={user}
           profile={profile}
           routines={everydayRoutines}
+          wheneverRoutines={wheneverRoutines}
           hiddenSet={hiddenSet}
           routineStreaks={routineStreaks}
           theme={theme}
@@ -1178,7 +1214,11 @@ export default function RoutinesScreen() {
                 <Text style={s.groupHeaderEmoji}>🌊</Text>
                 <Text style={[s.groupHeaderText, { color: WHENEVER_COLOR }]}>WHENEVER</Text>
               </View>
-              <Text style={[s.groupHeaderHint, { color: theme.muted }]}>for when you feel like it</Text>
+              <Text style={[s.groupHeaderHint, { color: wheneverDoneCount > 0 ? '#10b981' : theme.muted }]}>
+                {wheneverDoneCount > 0
+                  ? `${wheneverDoneCount} done today ✓`
+                  : 'for when you feel like it'}
+              </Text>
               <View style={[s.groupRule, { backgroundColor: WHENEVER_COLOR + '2a' }]} />
             </View>
             {wheneverRoutines.length === 0 && (
@@ -1209,6 +1249,9 @@ export default function RoutinesScreen() {
             >
               <Text style={[s.addBtnText, { color: theme.accent }]}>＋  Add New Routine</Text>
             </Pressable>
+
+            {/* ── Clubs & societies — weekly meetings go to the calendar ── */}
+            <ClubsSection userId={user?.id} />
           </>
         ) : (
           <>
