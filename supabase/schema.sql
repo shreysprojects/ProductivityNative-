@@ -104,7 +104,9 @@ CREATE TABLE IF NOT EXISTS public.exercises (
   equipment          TEXT,
   difficulty         TEXT,
   description        TEXT,
-  gif_url            TEXT
+  gif_url            TEXT,
+  youtube_id         TEXT,
+  instructions       TEXT[]
 );
 
 -- ── Row Level Security ──────────────────────────────────────────────────────
