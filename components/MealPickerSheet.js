@@ -1,4 +1,5 @@
-import { Modal, View, Text, Pressable, StyleSheet, TouchableWithoutFeedback } from 'react-native'
+import { Modal, View, Text, Pressable, StyleSheet, Animated } from 'react-native'
+import { useSheetDrag } from '../lib/useSheetDrag'
 
 const OPTIONS = [
   {
@@ -34,48 +35,47 @@ const OPTIONS = [
 ]
 
 export default function MealPickerSheet({ sectionLabel, sectionColor, onSelect, onClose }) {
+  const drag = useSheetDrag(onClose)
   return (
-    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
-      <TouchableWithoutFeedback onPress={onClose}>
-        <View style={p.overlay}>
-          <TouchableWithoutFeedback>
-            <View style={p.sheet}>
-              <View style={p.handle} />
-              <Text style={p.title}>Add to <Text style={{ color: sectionColor }}>{sectionLabel}</Text></Text>
+    <Modal visible transparent animationType="slide" onRequestClose={drag.close}>
+      <View style={p.overlay}>
+        <Animated.View pointerEvents="none" style={[p.overlayBg, { opacity: drag.backdrop }]} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} />
+        <Animated.View style={[p.sheet, { transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={p.handle} />
+            <Text style={p.title}>Add to <Text style={{ color: sectionColor }}>{sectionLabel}</Text></Text>
+          </View>
 
-              {OPTIONS.map((opt, i) => (
-                <Pressable
-                  key={opt.key}
-                  style={[p.row, i < OPTIONS.length - 1 && p.rowBorder]}
-                  onPress={() => onSelect(opt.key)}
-                >
-                  <View style={[p.iconWrap, { backgroundColor: sectionColor + '18' }]}>
-                    <Text style={p.icon}>{opt.icon}</Text>
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={p.rowTitle}>{opt.title}</Text>
-                    <Text style={p.rowDesc}>{opt.desc}</Text>
-                  </View>
-                  <Text style={[p.arrow, { color: sectionColor }]}>›</Text>
-                </Pressable>
-              ))}
+          {OPTIONS.map((opt, i) => (
+            <Pressable
+              key={opt.key}
+              style={[p.row, i < OPTIONS.length - 1 && p.rowBorder]}
+              onPress={() => onSelect(opt.key)}
+            >
+              <View style={[p.iconWrap, { backgroundColor: sectionColor + '18' }]}>
+                <Text style={p.icon}>{opt.icon}</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={p.rowTitle}>{opt.title}</Text>
+                <Text style={p.rowDesc}>{opt.desc}</Text>
+              </View>
+              <Text style={[p.arrow, { color: sectionColor }]}>›</Text>
+            </Pressable>
+          ))}
 
-              <Pressable style={p.cancelBtn} onPress={onClose}>
-                <Text style={p.cancelText}>Cancel</Text>
-              </Pressable>
-            </View>
-          </TouchableWithoutFeedback>
-        </View>
-      </TouchableWithoutFeedback>
+          <Pressable style={p.cancelBtn} onPress={drag.close}>
+            <Text style={p.cancelText}>Cancel</Text>
+          </Pressable>
+        </Animated.View>
+      </View>
     </Modal>
   )
 }
 
 const p = StyleSheet.create({
-  overlay: {
-    flex: 1, backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'flex-end',
-  },
+  overlay: { flex: 1, justifyContent: 'flex-end' },
+  overlayBg: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.4)' },
   sheet: {
     backgroundColor: '#fff', borderTopLeftRadius: 28, borderTopRightRadius: 28,
     paddingBottom: 36, paddingTop: 12,

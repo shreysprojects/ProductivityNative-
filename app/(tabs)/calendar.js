@@ -20,6 +20,7 @@ import {
 } from '../../lib/storage'
 import { readingStats } from '../../lib/textStats'
 import { getClassChecks, setClassCheck, classCheckKey } from '../../lib/classChecks'
+import { useSheetDrag } from '../../lib/useSheetDrag'
 import DayLogTimeline from '../../components/DayLogTimeline'
 import ScanScheduleModal from '../../components/ScanScheduleModal'
 import ClassAttendancePrompt from '../../components/ClassAttendancePrompt'
@@ -419,6 +420,9 @@ export default function CalendarScreen() {
   const [tDueDateRaw, setTDueDateRaw]   = useState('')
   const [tPriority, setTPriority]       = useState('none')
   const [tSaving, setTSaving]           = useState(false)
+  // Pull-down-to-dismiss for the event and task sheets (the class sheet has its own).
+  const eventDrag = useSheetDrag(() => setAddOpen(false), { visible: addOpen })
+  const taskDrag = useSheetDrag(() => setTaskModalOpen(false), { visible: taskModalOpen })
 
   // Time logging
   const [logSettings, setLogSettings] = useState(DEFAULT_LOG_SETTINGS)
@@ -2077,12 +2081,15 @@ export default function CalendarScreen() {
       )}
 
       {/* ── Add Event modal ────────────────────────────────────────────────── */}
-      <Modal visible={addOpen} transparent animationType="slide" onRequestClose={() => setAddOpen(false)}>
+      <Modal visible={addOpen} transparent animationType="slide" onRequestClose={eventDrag.close}>
         <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <Pressable style={[StyleSheet.absoluteFillObject, s.modalBg]} onPress={() => setAddOpen(false)} />
-          <View style={[s.modalSheet, { backgroundColor: theme.card }]}>
-            <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
-            <Text style={[s.modalTitle, { color: theme.text }]}>Add Event</Text>
+          <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFillObject, s.modalBg, { opacity: eventDrag.backdrop }]} />
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={eventDrag.close} />
+          <Animated.View style={[s.modalSheet, { backgroundColor: theme.card, transform: [{ translateY: eventDrag.dragY }] }]}>
+            <View {...eventDrag.handlePan.panHandlers} style={eventDrag.grabStyle}>
+              <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
+              <Text style={[s.modalTitle, { color: theme.text }]}>Add Event</Text>
+            </View>
 
             <View style={[s.dateBadge, { backgroundColor: theme.isDark ? '#1c1c32' : '#f0f0fa', borderColor: theme.inputBorder }]}>
               <Text style={s.dateBadgeEmoji}>📆</Text>
@@ -2128,7 +2135,7 @@ export default function CalendarScreen() {
             <Pressable style={[s.saveBtn, { backgroundColor: theme.accent, opacity: saving ? 0.6 : 1 }]} onPress={handleSaveEvent} disabled={saving}>
               <Text style={s.saveBtnText}>{saving ? 'Saving…' : 'Save Event'}</Text>
             </Pressable>
-          </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
 
@@ -2305,13 +2312,16 @@ export default function CalendarScreen() {
       </Modal>
 
       {/* ── Add / Edit Task modal ──────────────────────────────────────────── */}
-      <Modal visible={taskModalOpen} transparent animationType="slide" onRequestClose={() => setTaskModalOpen(false)}>
+      <Modal visible={taskModalOpen} transparent animationType="slide" onRequestClose={taskDrag.close}>
         <KeyboardAvoidingView style={s.modalKAV} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <Pressable style={[StyleSheet.absoluteFillObject, s.modalBg]} onPress={() => setTaskModalOpen(false)} />
-          <View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card }]}>
+          <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFillObject, s.modalBg, { opacity: taskDrag.backdrop }]} />
+          <Pressable style={StyleSheet.absoluteFillObject} onPress={taskDrag.close} />
+          <Animated.View style={[s.modalSheet, s.classSheet, { backgroundColor: theme.card, transform: [{ translateY: taskDrag.dragY }] }]}>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-              <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
-              <Text style={[s.modalTitle, { color: theme.text }]}>{editingTask ? 'Edit Task' : 'New Task'}</Text>
+              <View {...taskDrag.handlePan.panHandlers} style={taskDrag.grabStyle}>
+                <View style={[s.modalHandle, { backgroundColor: theme.divider }]} />
+                <Text style={[s.modalTitle, { color: theme.text }]}>{editingTask ? 'Edit Task' : 'New Task'}</Text>
+              </View>
 
               <Text style={[s.fieldLabel, { color: theme.muted }]}>TITLE</Text>
               <TextInput
@@ -2385,7 +2395,7 @@ export default function CalendarScreen() {
                 </Pressable>
               )}
             </ScrollView>
-          </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
 

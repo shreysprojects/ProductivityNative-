@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import {
   View, Text, Pressable, ScrollView, Modal,
-  StyleSheet, ActivityIndicator, Alert,
+  StyleSheet, ActivityIndicator, Alert, Animated,
 } from 'react-native'
+import { useSheetDrag } from '../lib/useSheetDrag'
 import * as ImagePicker from 'expo-image-picker'
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator'
 import { useTheme } from '../lib/ThemeContext'
@@ -187,13 +188,17 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
 
   const keptCount = found ? found.length - skipped.size : 0
 
+  const drag = useSheetDrag(close, { visible })
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={drag.close}>
       <View style={sc.wrap}>
-        <Pressable style={StyleSheet.absoluteFillObject} onPress={close} />
-        <View style={[sc.sheet, { backgroundColor: theme.card }]}>
-          <View style={[sc.handle, { backgroundColor: theme.divider }]} />
-          <Text style={[sc.title, { color: theme.text }]}>Import class schedule</Text>
+        <Pressable style={StyleSheet.absoluteFillObject} onPress={drag.close} />
+        <Animated.View style={[sc.sheet, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={[sc.handle, { backgroundColor: theme.divider }]} />
+            <Text style={[sc.title, { color: theme.text }]}>Import class schedule</Text>
+          </View>
 
           {!found ? (
             <>
@@ -274,10 +279,10 @@ export default function ScanScheduleModal({ visible, onClose, onImport }) {
             </>
           )}
 
-          <Pressable onPress={close} hitSlop={8} style={sc.cancelBtn}>
+          <Pressable onPress={drag.close} hitSlop={8} style={sc.cancelBtn}>
             <Text style={[sc.cancelText, { color: theme.muted }]}>Cancel</Text>
           </Pressable>
-        </View>
+        </Animated.View>
       </View>
     </Modal>
   )

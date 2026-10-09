@@ -1,7 +1,7 @@
 import { useState, useCallback, useLayoutEffect, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, Pressable, StyleSheet, ScrollView,
-  Modal, Switch, Alert, KeyboardAvoidingView, Platform,
+  Modal, Switch, Alert, KeyboardAvoidingView, Platform, Animated,
 } from 'react-native'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import Svg, { Circle } from 'react-native-svg'
@@ -10,6 +10,7 @@ import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import StreakBadge from '../../components/StreakBadge'
 import ClubsSection from '../../components/ClubsSection'
+import { useSheetDrag } from '../../lib/useSheetDrag'
 import { getRoutineNames, getRoutineTemplates, getTodayRunsEither, getStreak, getGymSplit, getRoutineStreaks, deleteRoutine, getHiddenDefaults, setHiddenDefaults, getRoutineSettings, getWeeklyRoutines, saveWeeklyRoutines, today, getDayTodos, getCalendarEvents, getScheduleItems, getTasks, getJournalEntries, getRoutineGroupMap, getDayRules, saveDayRules } from '../../lib/storage'
 import { getSections, DEFAULT_SECTIONS } from '../../lib/sectionsStorage'
 import { getSleep, wakeUp, cancelSleep, sleepDurationText, sleepDurationShort, clockLabel } from '../../lib/sleepStorage'
@@ -122,6 +123,9 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
     setCollapsed(next)
     if (user?.id) AsyncStorage.setItem(`@dash_collapsed_${user.id}`, String(next)).catch(() => {})
   }
+
+  // Pulling the rules sheet down saves, the same as tapping outside it.
+  const rulesDrag = useSheetDrag(() => saveRules(), { visible: rulesOpen })
 
   function openRulesEditor() {
     setDraftRules(rules.map(r => ({ ...r })))
@@ -357,13 +361,16 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
         visible={rulesOpen}
         transparent
         animationType="slide"
-        onRequestClose={saveRules}
+        onRequestClose={rulesDrag.close}
       >
         <KeyboardAvoidingView style={s.settingsOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <Pressable style={s.settingsBg} onPress={saveRules} />
-          <View style={[db.rulesSheet, { backgroundColor: theme.card }]}>
-            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
-            <Text style={[db.rulesSheetTitle, { color: theme.text }]}>📜  Rules for today</Text>
+          <Animated.View pointerEvents="none" style={[s.settingsBg, { opacity: rulesDrag.backdrop }]} />
+          <Pressable style={StyleSheet.absoluteFill} onPress={rulesDrag.close} />
+          <Animated.View style={[db.rulesSheet, { backgroundColor: theme.card, transform: [{ translateY: rulesDrag.dragY }] }]}>
+            <View {...rulesDrag.handlePan.panHandlers} style={rulesDrag.grabStyle}>
+              <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+              <Text style={[db.rulesSheetTitle, { color: theme.text }]}>📜  Rules for today</Text>
+            </View>
             <Text style={[db.rulesSheetSub, { color: theme.muted }]}>
               Your ground rules for each day. They stay until you change them.
             </Text>
@@ -406,7 +413,7 @@ function DailyDashboard({ user, profile, routines, wheneverRoutines = [], hidden
             <Pressable style={[db.rulesDoneBtn, { backgroundColor: theme.accent }]} onPress={saveRules}>
               <Text style={db.rulesDoneBtnText}>Done</Text>
             </Pressable>
-          </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
     </View>
@@ -895,12 +902,17 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
     reset()
   }
 
+  const drag = useSheetDrag(close, { visible })
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={drag.close}>
       <KeyboardAvoidingView style={s.settingsOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <Pressable style={s.settingsBg} onPress={close} />
-        <View style={[wk.modal, { backgroundColor: theme.card }]}>
-          <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+        <Animated.View pointerEvents="none" style={[s.settingsBg, { opacity: drag.backdrop }]} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} />
+        <Animated.View style={[wk.modal, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={[s.settingsHandle, { backgroundColor: theme.divider }]} />
+          </View>
           <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
             <Text style={[wk.modalTitle, { color: theme.text }]}>New Weekly Routine</Text>
             <Text style={[wk.modalLabel, { color: theme.subtext }]}>NAME</Text>
@@ -935,7 +947,7 @@ function WeeklyRoutineModal({ visible, theme, onClose, onSave }) {
               <Text style={wk.modalSaveText}>Save Routine</Text>
             </Pressable>
           </ScrollView>
-        </View>
+        </Animated.View>
       </KeyboardAvoidingView>
     </Modal>
   )

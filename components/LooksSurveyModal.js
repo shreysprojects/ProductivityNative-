@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { Modal, View, Text, Pressable, ScrollView, StyleSheet } from 'react-native'
+import { Modal, View, Text, Pressable, ScrollView, StyleSheet, Animated } from 'react-native'
+import { useSheetDrag } from '../lib/useSheetDrag'
 import { useTheme } from '../lib/ThemeContext'
 
 const ACCENT = '#ec4899'
@@ -120,12 +121,17 @@ export default function LooksSurveyModal({ visible, onClose, onComplete }) {
     finish({})
   }
 
+  const drag = useSheetDrag(onClose, { visible })
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={drag.close}>
       <View style={ls.overlay}>
-        <Pressable style={ls.bg} onPress={onClose} />
-        <View style={[ls.sheet, { backgroundColor: theme.card }]}>
-          <View style={[ls.handle, { backgroundColor: theme.divider }]} />
+        <Animated.View pointerEvents="none" style={[ls.bg, { opacity: drag.backdrop }]} />
+        <Pressable style={StyleSheet.absoluteFill} onPress={drag.close} />
+        <Animated.View style={[ls.sheet, { backgroundColor: theme.card, transform: [{ translateY: drag.dragY }] }]}>
+          <View {...drag.handlePan.panHandlers} style={drag.grabStyle}>
+            <View style={[ls.handle, { backgroundColor: theme.divider }]} />
+          </View>
 
           <View style={ls.progressRow}>
             {QUESTIONS.map((_, i) => (
@@ -176,7 +182,7 @@ export default function LooksSurveyModal({ visible, onClose, onComplete }) {
           <Pressable style={ls.skipBtn} onPress={skip}>
             <Text style={[ls.skipText, { color: theme.muted }]}>Skip — use a basic routine</Text>
           </Pressable>
-        </View>
+        </Animated.View>
       </View>
     </Modal>
   )

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image, ActivityIndicator } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform, ScrollView, Image, ActivityIndicator, Animated } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import * as ImagePicker from 'expo-image-picker'
 import {
@@ -21,6 +21,7 @@ const EVERYDAY_COLOR = '#f59e0b'
 const WHENEVER_COLOR = '#06b6d4'
 import { routineTheme } from '../lib/themes'
 import ImageViewerModal from '../components/ImageViewerModal'
+import { useSheetDrag } from '../lib/useSheetDrag'
 
 const DAY_INITIALS = ['M', 'T', 'W', 'T', 'F', 'S', 'S']
 const DAY_NAMES    = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -234,6 +235,9 @@ export default function SetupRoutine() {
   const [copyTask,         setCopyTask]         = useState(null)
   const [copyTargets,      setCopyTargets]      = useState(null)
   const [copying,          setCopying]          = useState(false)
+  // Pull-down-to-dismiss for the two sheets.
+  const emojiDrag = useSheetDrag(() => { setShowEmojiPicker(false); setEmojiTargetId(null) }, { visible: showEmojiPicker })
+  const copyDrag = useSheetDrag(() => { if (!copying) setCopyTask(null) }, { visible: !!copyTask })
 
   // Whenever routines have no day/time schedule.
   const isWhenever = isNew ? newGroup === 'whenever' : routineGroup === 'whenever'
@@ -1091,12 +1095,14 @@ export default function SetupRoutine() {
         visible={showEmojiPicker}
         transparent
         animationType="slide"
-        onRequestClose={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }}
+        onRequestClose={emojiDrag.close}
       >
         <KeyboardAvoidingView style={s.emojiOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => { setShowEmojiPicker(false); setEmojiTargetId(null) }} />
-          <View style={s.emojiSheet}>
-            <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
+          <Pressable style={StyleSheet.absoluteFill} onPress={emojiDrag.close} />
+          <Animated.View style={[s.emojiSheet, { transform: [{ translateY: emojiDrag.dragY }] }]}>
+            <View {...emojiDrag.handlePan.panHandlers} style={emojiDrag.grabStyle}>
+              <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
+            </View>
             <View style={s.emojiHeaderRow}>
               <Text style={s.emojiHeaderTitle}>Choose an icon</Text>
               {(emojiTargetId !== null
@@ -1157,7 +1163,7 @@ export default function SetupRoutine() {
               })()}
               <View style={{ height: 12 }} />
             </ScrollView>
-          </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
 
@@ -1166,15 +1172,17 @@ export default function SetupRoutine() {
         visible={!!copyTask}
         transparent
         animationType="slide"
-        onRequestClose={() => { if (!copying) setCopyTask(null) }}
+        onRequestClose={copyDrag.close}
       >
         <View style={s.emojiOverlay}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => { if (!copying) setCopyTask(null) }} />
-          <View style={s.emojiSheet}>
-            <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
-            <Text style={[s.emojiHeaderTitle, { marginBottom: 6 }]} numberOfLines={2}>
-              Copy “{copyTask?.text}” to…
-            </Text>
+          <Pressable style={StyleSheet.absoluteFill} onPress={copyDrag.close} />
+          <Animated.View style={[s.emojiSheet, { transform: [{ translateY: copyDrag.dragY }] }]}>
+            <View {...copyDrag.handlePan.panHandlers} style={copyDrag.grabStyle}>
+              <View style={[s.emojiHandle, { backgroundColor: theme.divider }]} />
+              <Text style={[s.emojiHeaderTitle, { marginBottom: 6 }]} numberOfLines={2}>
+                Copy “{copyTask?.text}” to…
+              </Text>
+            </View>
             <Text style={s.copyHint}>
               The task goes to the end of the routine you pick, with its icon, time goal and steps. Photos aren't copied.
             </Text>
@@ -1198,7 +1206,7 @@ export default function SetupRoutine() {
                 ))}
               </ScrollView>
             )}
-          </View>
+          </Animated.View>
         </View>
       </Modal>
 

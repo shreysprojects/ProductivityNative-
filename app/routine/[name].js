@@ -27,6 +27,7 @@ import AIRoutineModal from '../../components/AIRoutineModal'
 import ImageViewerModal from '../../components/ImageViewerModal'
 import MuscleMap from '../../components/MuscleMap'
 import ExerciseVideo from '../../components/ExerciseVideo'
+import { useSheetDrag } from '../../lib/useSheetDrag'
 import { supabase } from '../../lib/supabase'
 import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
 import { autoLogSpan } from '../../lib/timeLogging'
@@ -1323,6 +1324,7 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
   const [musclesByGroup, setMusclesByGroup] = useState({})
   const [loading, setLoading] = useState(true)
   const [detailLog, setDetailLog] = useState(null)
+  const detailDrag = useSheetDrag(() => setDetailLog(null), { visible: !!detailLog })
   const [detailMuscles, setDetailMuscles] = useState({ primary: [], secondary: [] })
   const [monthCount, setMonthCount] = useState(12)
 
@@ -1434,12 +1436,12 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
         {/* Detail overlay */}
         {detailLog && (
           <>
-            <Pressable
-              style={hcs.detailOverlay}
-              onPress={() => setDetailLog(null)}
-            />
-            <View style={[hcs.detailSheet, { backgroundColor: theme.card }]}>
-              <View style={[wcs.handle, { backgroundColor: theme.divider }]} />
+            <Animated.View pointerEvents="none" style={[hcs.detailOverlay, { opacity: detailDrag.backdrop }]} />
+            <Pressable style={StyleSheet.absoluteFill} onPress={detailDrag.close} />
+            <Animated.View style={[hcs.detailSheet, { backgroundColor: theme.card, transform: [{ translateY: detailDrag.dragY }] }]}>
+              <View {...detailDrag.handlePan.panHandlers} style={detailDrag.grabStyle}>
+                <View style={[wcs.handle, { backgroundColor: theme.divider }]} />
+              </View>
               <View style={wcs.sheetHeader}>
                 <View style={{ flex: 1 }}>
                   <Text style={[wcs.sheetTitle, { color: theme.text }]}>{detailLog.muscleGroup}</Text>
@@ -1501,7 +1503,7 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
               <Pressable style={[wcs.closeBtn, { backgroundColor: accentColor }]} onPress={() => setDetailLog(null)}>
                 <Text style={wcs.closeBtnText}>Close</Text>
               </Pressable>
-            </View>
+            </Animated.View>
           </>
         )}
       </View>
@@ -1513,6 +1515,7 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
   const [weekLogs, setWeekLogs] = useState([])
   const [weekMuscles, setWeekMuscles] = useState({})
   const [detailLog, setDetailLog] = useState(null)
+  const detailDrag = useSheetDrag(() => setDetailLog(null), { visible: !!detailLog })
   const [detailMuscles, setDetailMuscles] = useState({ primary: [], secondary: [] })
   const [historyVisible, setHistoryVisible] = useState(false)
   const { unit } = useTheme()
@@ -1640,11 +1643,14 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
         </View>
       ))}
 
-      <Modal visible={!!detailLog} transparent animationType="slide" onRequestClose={() => setDetailLog(null)}>
+      <Modal visible={!!detailLog} transparent animationType="slide" onRequestClose={detailDrag.close}>
         <View style={wcs.modalOverlay}>
-          <Pressable style={wcs.modalBg} onPress={() => setDetailLog(null)} />
-          <View style={[wcs.sheet, { backgroundColor: theme.card }]}>
-            <View style={[wcs.handle, { backgroundColor: theme.divider }]} />
+          <Animated.View pointerEvents="none" style={[wcs.modalBg, { opacity: detailDrag.backdrop }]} />
+          <Pressable style={StyleSheet.absoluteFill} onPress={detailDrag.close} />
+          <Animated.View style={[wcs.sheet, { backgroundColor: theme.card, transform: [{ translateY: detailDrag.dragY }] }]}>
+            <View {...detailDrag.handlePan.panHandlers} style={detailDrag.grabStyle}>
+              <View style={[wcs.handle, { backgroundColor: theme.divider }]} />
+            </View>
             {detailLog && (
               <>
                 <View style={wcs.sheetHeader}>
@@ -1705,10 +1711,10 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
                 </ScrollView>
               </>
             )}
-            <Pressable style={[wcs.closeBtn, { backgroundColor: accentColor }]} onPress={() => setDetailLog(null)}>
+            <Pressable style={[wcs.closeBtn, { backgroundColor: accentColor }]} onPress={detailDrag.close}>
               <Text style={wcs.closeBtnText}>Close</Text>
             </Pressable>
-          </View>
+          </Animated.View>
         </View>
       </Modal>
       <WorkoutHistoryModal
