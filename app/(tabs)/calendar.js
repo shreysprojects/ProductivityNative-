@@ -698,17 +698,32 @@ export default function CalendarScreen() {
     await saveTask(user.id, updated)
   }
 
+  // A scan is a fresh timetable: it REPLACES the class schedule, so stale
+  // classes from last term can't pile up next to the new ones.
   async function handleImportClasses(items) {
-    setScanOpen(false)
-    const saved = items.map(i => ({ ...i, id: genId(), semesterStart: null, semesterEnd: null }))
-    setScheduleItems(prev => [...prev, ...saved])
-    for (const item of saved) await saveScheduleItem(user.id, item)
-    setViewMode('week')
-    setWeekPane('schedule')
-    setLogDay(today)
+    const previous = scheduleItems
+    const doImport = async () => {
+      setScanOpen(false)
+      const saved = items.map(i => ({ ...i, id: genId(), semesterStart: null, semesterEnd: null }))
+      setScheduleItems(saved)
+      for (const item of previous) await deleteScheduleItem(user.id, item.id)
+      for (const item of saved) await saveScheduleItem(user.id, item)
+      setViewMode('week')
+      setWeekPane('schedule')
+      setLogDay(today)
+      Alert.alert(
+        'Schedule updated',
+        `Your schedule now has ${saved.length} recurring class${saved.length === 1 ? '' : 'es'}.`
+      )
+    }
+    if (previous.length === 0) { await doImport(); return }
     Alert.alert(
-      'Classes added',
-      `${saved.length} recurring class${saved.length === 1 ? '' : 'es'} added to your schedule.`
+      'Replace your schedule?',
+      `This removes the ${previous.length} class${previous.length === 1 ? '' : 'es'} currently on your schedule and adds the ${items.length} scanned one${items.length === 1 ? '' : 's'}.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Replace', style: 'destructive', onPress: () => { doImport() } },
+      ]
     )
   }
 
