@@ -46,3 +46,5 @@ supabase/.temp/
 # generated native folders
 /ios
 /android
+
+/APP_AUDIT_REPORT.md
