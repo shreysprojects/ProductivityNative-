@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal } from 'react-native'
+import { View, Text, TextInput, Pressable, StyleSheet, Alert, Modal, KeyboardAvoidingView, Platform } from 'react-native'
 import DraggableFlatList, { ScaleDecorator } from 'react-native-draggable-flatlist'
 import { router, useLocalSearchParams } from 'expo-router'
 import { useAuth } from '../lib/AuthContext'
@@ -579,7 +579,7 @@ export default function SetupRoutine() {
   )
 
   return (
-    <View style={s.page}>
+    <KeyboardAvoidingView style={s.page} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <DraggableFlatList
         data={tasks}
         keyExtractor={item => String(item.id)}
@@ -621,7 +621,7 @@ export default function SetupRoutine() {
           </View>
         </Pressable>
       </Modal>
-    </View>
+    </KeyboardAvoidingView>
   )
 }
 

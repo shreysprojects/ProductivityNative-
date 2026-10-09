@@ -14,7 +14,8 @@
       "usesAppleSignIn": true
     },
     "android": {
-      "package": "com.shreyj.productivityapp"
+      "package": "com.shreyj.productivityapp",
+      "softwareKeyboardLayoutMode": "resize"
     },
     "web": {
       "bundler": "metro",

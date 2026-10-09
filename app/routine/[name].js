@@ -24,6 +24,7 @@ import {
 import AIRoutineModal from '../../components/AIRoutineModal'
 import MuscleMap from '../../components/MuscleMap'
 import { supabase } from '../../lib/supabase'
+import { getFitPhotos, getPhotoPasscode, setPhotoPasscode } from '../../lib/photoStorage'
 import { maybePromptReview } from '../../lib/review'
 
 const CELL_W = Math.floor((Dimensions.get('window').width - 20 - 24) / 7)
@@ -936,6 +937,128 @@ function MonthCalendar({ year, month, logMap, accentColor, theme, onDayPress, mu
   )
 }
 
+// ── Progress photo viewer (optionally passcode-protected) ──────────────────
+
+function FitPhotoSection({ userId, date, theme, accentColor }) {
+  const [photoUri, setPhotoUri] = useState(null)
+  const [hasPass, setHasPass] = useState(false)
+  const [locked, setLocked] = useState(false)
+  const [codeInput, setCodeInput] = useState('')
+  const [settingCode, setSettingCode] = useState(false)
+  const [newCode, setNewCode] = useState('')
+
+  useEffect(() => {
+    let active = true
+    Promise.all([getFitPhotos(userId), getPhotoPasscode(userId)]).then(([map, pass]) => {
+      if (!active) return
+      setPhotoUri(map[date] ?? null)
+      setHasPass(!!pass)
+      setLocked(!!pass && !!map[date])
+      setCodeInput(''); setSettingCode(false); setNewCode('')
+    })
+    return () => { active = false }
+  }, [userId, date])
+
+  if (!photoUri) return null
+
+  async function tryUnlock() {
+    const pass = await getPhotoPasscode(userId)
+    if (codeInput === pass) { setLocked(false); setCodeInput('') }
+    else { setCodeInput(''); Alert.alert('Wrong passcode', 'Please try again.') }
+  }
+
+  async function saveNewCode() {
+    if (newCode.length !== 4) return
+    await setPhotoPasscode(userId, newCode)
+    setHasPass(true); setSettingCode(false); setNewCode('')
+    Alert.alert('Passcode set 🔒', 'Your progress photos are now protected.')
+  }
+
+  async function removePass() {
+    await setPhotoPasscode(userId, null)
+    setHasPass(false)
+  }
+
+  return (
+    <View style={fp.wrap}>
+      <Text style={[fp.label, { color: theme.subtext }]}>PROGRESS PHOTO</Text>
+      {locked ? (
+        <View style={[fp.lockBox, { borderColor: theme.cardBorder, backgroundColor: theme.isDark ? '#ffffff06' : '#00000004' }]}>
+          <Text style={{ fontSize: 26 }}>🔒</Text>
+          <Text style={[fp.lockText, { color: theme.subtext }]}>Enter your passcode to view</Text>
+          <View style={fp.codeRow}>
+            <TextInput
+              style={[fp.codeInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+              value={codeInput} onChangeText={setCodeInput}
+              keyboardType="number-pad" maxLength={4} secureTextEntry
+              placeholder="••••" placeholderTextColor={theme.muted}
+            />
+            <Pressable
+              style={[fp.codeBtn, { backgroundColor: accentColor, opacity: codeInput.length === 4 ? 1 : 0.4 }]}
+              onPress={tryUnlock} disabled={codeInput.length !== 4}
+            >
+              <Text style={fp.codeBtnText}>Unlock</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : (
+        <>
+          <Image source={{ uri: photoUri }} style={fp.photo} contentFit="cover" />
+          {settingCode ? (
+            <View style={[fp.codeRow, { marginTop: 10 }]}>
+              <TextInput
+                style={[fp.codeInput, { color: theme.text, borderColor: theme.cardBorder, backgroundColor: theme.bg }]}
+                value={newCode} onChangeText={setNewCode}
+                keyboardType="number-pad" maxLength={4} secureTextEntry
+                placeholder="4-digit code" placeholderTextColor={theme.muted}
+                autoFocus
+              />
+              <Pressable
+                style={[fp.codeBtn, { backgroundColor: accentColor, opacity: newCode.length === 4 ? 1 : 0.4 }]}
+                onPress={saveNewCode} disabled={newCode.length !== 4}
+              >
+                <Text style={fp.codeBtnText}>Set</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <View style={fp.actionsRow}>
+              {hasPass ? (
+                <Pressable onPress={removePass} hitSlop={8}>
+                  <Text style={[fp.actionText, { color: theme.muted }]}>🔓 Remove passcode</Text>
+                </Pressable>
+              ) : (
+                <Pressable onPress={() => setSettingCode(true)} hitSlop={8}>
+                  <Text style={[fp.actionText, { color: accentColor }]}>🔒 Protect with passcode</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+        </>
+      )}
+    </View>
+  )
+}
+
+const fp = StyleSheet.create({
+  wrap: { marginBottom: 14 },
+  label: { fontSize: 11, fontWeight: '800', letterSpacing: 1, marginBottom: 8 },
+  photo: { width: '100%', height: 280, borderRadius: 16 },
+  lockBox: {
+    borderRadius: 16, borderWidth: 1.5, borderStyle: 'dashed',
+    alignItems: 'center', paddingVertical: 22, gap: 8,
+  },
+  lockText: { fontSize: 13, fontWeight: '600' },
+  codeRow: { flexDirection: 'row', gap: 8, alignItems: 'center', justifyContent: 'center' },
+  codeInput: {
+    borderWidth: 1.5, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 9,
+    fontSize: 18, fontWeight: '700', letterSpacing: 6, minWidth: 110, textAlign: 'center',
+  },
+  codeBtn: { paddingHorizontal: 16, paddingVertical: 11, borderRadius: 12 },
+  codeBtnText: { color: '#fff', fontWeight: '800', fontSize: 14 },
+  actionsRow: { flexDirection: 'row', justifyContent: 'center', paddingTop: 10 },
+  actionText: { fontSize: 13, fontWeight: '700' },
+})
+
 function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
   const { unit } = useTheme()
   const [logMap, setLogMap] = useState({})
@@ -1072,6 +1195,7 @@ function WorkoutHistoryModal({ visible, onClose, userId, accentColor, theme }) {
               )}
 
               <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 360 }}>
+                <FitPhotoSection userId={userId} date={detailLog.date} theme={theme} accentColor={accentColor} />
                 {(detailLog.exercises ?? []).map((ex, i) => (
                   <View key={ex.exerciseId ?? i} style={[wcs.exBlock, { borderBottomColor: theme.divider }]}>
                     <View style={wcs.exNameRow}>
@@ -1270,6 +1394,7 @@ function WorkoutWeekCalendar({ userId, theme, accentColor }) {
                 )}
 
                 <ScrollView showsVerticalScrollIndicator={false} style={{ maxHeight: 420 }}>
+                  <FitPhotoSection userId={userId} date={detailLog.date} theme={theme} accentColor={accentColor} />
                   {(detailLog.exercises ?? []).map((ex, i) => (
                     <View key={ex.exerciseId ?? i} style={[wcs.exBlock, { borderBottomColor: theme.divider }]}>
                       <View style={wcs.exNameRow}>
@@ -1857,151 +1982,6 @@ export default function RoutineScreen() {
               </View>
             </View>
 
-            {/* Section label */}
-            <View style={s.previewSectionRow}>
-              <Text style={{ fontSize: 16 }}>📋</Text>
-              <Text style={[s.previewSectionLabel, { color: theme.subtext }]}>YOUR TASKS</Text>
-            </View>
-
-            {template.map((task, i) => (
-              <View key={task.id} style={[s.previewTask, {
-                backgroundColor: theme.card,
-                borderColor: theme.isDark ? theme.cardBorder : card.color + '28',
-                shadowColor: card.color,
-              }]}>
-                <View style={[s.previewNum, { backgroundColor: card.color }]}>
-                  <Text style={s.previewNumText}>{i + 1}</Text>
-                </View>
-                <View style={[s.previewTaskIcon, { backgroundColor: card.color + '18' }]}>
-                  <Text style={{ fontSize: 20 }}>{task.emoji || taskIcon(task.text)}</Text>
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[s.previewTaskText, { color: theme.text }]}>{task.text}</Text>
-                  {(task.subTasks?.length > 0 || (task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0) && (
-                    <View style={s.previewTaskMeta}>
-                      {task.subTasks?.length > 0 && (
-                        <Text style={[s.previewSub, { color: card.color }]}>{task.subTasks.length} steps</Text>
-                      )}
-                      {(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0 && (
-                        <View style={[s.previewGoalChip, { backgroundColor: card.color + '18' }]}>
-                          <Text style={[s.previewGoalText, { color: card.color }]}>⏱ {fmtGoalSecs(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60)}</Text>
-                        </View>
-                      )}
-                    </View>
-                  )}
-                </View>
-                {(() => {
-                  const step = run?.steps?.find(st => st.id === task.id)
-                  const done = !!step?.completedAt
-                  return (
-                    <Pressable
-                      onPress={() => handlePreviewToggle(task.id)}
-                      hitSlop={10}
-                      style={[s.previewTaskCheck, {
-                        borderColor: done ? card.color : (theme.isDark ? '#ffffff28' : '#d1d5db'),
-                        alignItems: 'center', justifyContent: 'center',
-                      }, done && { backgroundColor: card.color }]}
-                    >
-                      {done && <Text style={{ color: '#fff', fontWeight: '800', fontSize: 13 }}>✓</Text>}
-                    </Pressable>
-                  )
-                })()}
-              </View>
-            ))}
-
-            <Animated.View style={{ transform: [{ scale: startBtnScale }] }}>
-              <Pressable
-                style={[s.startBtn, { backgroundColor: card.color, shadowColor: card.color }]}
-                onPressIn={startBtnPressIn}
-                onPressOut={startBtnPressOut}
-                onPress={handleStart}
-              >
-                <Text style={s.startBtnSparkle}>✦</Text>
-                <Text style={s.startBtnText}>{card.emoji}  Start {name} Routine  →</Text>
-                <Text style={s.startBtnSparkle}>✦</Text>
-              </Pressable>
-            </Animated.View>
-          </>
-        )}
-
-        {/* ── Morning: Goals + Weight + Looks ── */}
-        {isMorning && (
-          <>
-            {!morningSettings.hideTodo && (
-              <MorningTodoList
-                userId={user.id}
-                theme={theme}
-                color={card.color}
-                onHide={async () => {
-                  const ns = { ...morningSettings, hideTodo: true }
-                  await saveMorningSettings(user.id, ns)
-                  setMorningSettings(ns)
-                }}
-              />
-            )}
-            {!morningSettings.hideWeight && (
-              <WeightTracker
-                userId={user.id}
-                theme={theme}
-                color={card.color}
-                morningSettings={morningSettings}
-                onUpdateSettings={setMorningSettings}
-              />
-            )}
-            {!morningSettings.hideLooks && (
-              <LooksSection
-                userId={user.id}
-                theme={theme}
-                onHide={async () => {
-                  const ns = { ...morningSettings, hideLooks: true }
-                  await saveMorningSettings(user.id, ns)
-                  setMorningSettings(ns)
-                }}
-              />
-            )}
-            {(morningSettings.hideTodo || morningSettings.hideWeight || morningSettings.hideLooks) && (
-              <View style={s.hiddenPillsRow}>
-                {morningSettings.hideTodo && (
-                  <Pressable
-                    style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
-                    onPress={async () => {
-                      const ns = { ...morningSettings, hideTodo: false }
-                      await saveMorningSettings(user.id, ns)
-                      setMorningSettings(ns)
-                    }}
-                  >
-                    <Text style={[s.hiddenPillText, { color: card.color }]}>+ Show goals</Text>
-                  </Pressable>
-                )}
-                {morningSettings.hideWeight && (
-                  <Pressable
-                    style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
-                    onPress={async () => {
-                      const ns = { ...morningSettings, hideWeight: false }
-                      await saveMorningSettings(user.id, ns)
-                      setMorningSettings(ns)
-                    }}
-                  >
-                    <Text style={[s.hiddenPillText, { color: card.color }]}>+ Show weight tracker</Text>
-                  </Pressable>
-                )}
-                {morningSettings.hideLooks && (
-                  <Pressable
-                    style={[s.hiddenPill, { borderColor: LOOKS_COLOR + '40', backgroundColor: LOOKS_COLOR + '10' }]}
-                    onPress={async () => {
-                      const ns = { ...morningSettings, hideLooks: false }
-                      await saveMorningSettings(user.id, ns)
-                      setMorningSettings(ns)
-                    }}
-                  >
-                    <Text style={[s.hiddenPillText, { color: LOOKS_COLOR }]}>+ Show looks</Text>
-                  </Pressable>
-                )}
-              </View>
-            )}
-          </>
-        )}
-
         {/* ── Fitness: My Workouts section ── */}
         {isFitness && (
           <View style={[s.workoutSection, { borderTopColor: theme.divider }]}>
@@ -2206,6 +2186,152 @@ export default function RoutineScreen() {
             </Modal>
           </View>
         )}
+
+            {/* Section label */}
+            <View style={s.previewSectionRow}>
+              <Text style={{ fontSize: 16 }}>📋</Text>
+              <Text style={[s.previewSectionLabel, { color: theme.subtext }]}>YOUR TASKS</Text>
+            </View>
+
+            {template.map((task, i) => (
+              <View key={task.id} style={[s.previewTask, {
+                backgroundColor: theme.card,
+                borderColor: theme.isDark ? theme.cardBorder : card.color + '28',
+                shadowColor: card.color,
+              }]}>
+                <View style={[s.previewNum, { backgroundColor: card.color }]}>
+                  <Text style={s.previewNumText}>{i + 1}</Text>
+                </View>
+                <View style={[s.previewTaskIcon, { backgroundColor: card.color + '18' }]}>
+                  <Text style={{ fontSize: 20 }}>{task.emoji || taskIcon(task.text)}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.previewTaskText, { color: theme.text }]}>{task.text}</Text>
+                  {(task.subTasks?.length > 0 || (task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0) && (
+                    <View style={s.previewTaskMeta}>
+                      {task.subTasks?.length > 0 && (
+                        <Text style={[s.previewSub, { color: card.color }]}>{task.subTasks.length} steps</Text>
+                      )}
+                      {(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0 && (
+                        <View style={[s.previewGoalChip, { backgroundColor: card.color + '18' }]}>
+                          <Text style={[s.previewGoalText, { color: card.color }]}>⏱ {fmtGoalSecs(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60)}</Text>
+                        </View>
+                      )}
+                    </View>
+                  )}
+                </View>
+                {(() => {
+                  const step = run?.steps?.find(st => st.id === task.id)
+                  const done = !!step?.completedAt
+                  return (
+                    <Pressable
+                      onPress={() => handlePreviewToggle(task.id)}
+                      hitSlop={10}
+                      style={[s.previewTaskCheck, {
+                        borderColor: done ? card.color : (theme.isDark ? '#ffffff28' : '#d1d5db'),
+                        alignItems: 'center', justifyContent: 'center',
+                      }, done && { backgroundColor: card.color }]}
+                    >
+                      {done && <Text style={{ color: '#fff', fontWeight: '800', fontSize: 13 }}>✓</Text>}
+                    </Pressable>
+                  )
+                })()}
+              </View>
+            ))}
+
+            <Animated.View style={{ transform: [{ scale: startBtnScale }] }}>
+              <Pressable
+                style={[s.startBtn, { backgroundColor: card.color, shadowColor: card.color }]}
+                onPressIn={startBtnPressIn}
+                onPressOut={startBtnPressOut}
+                onPress={handleStart}
+              >
+                <Text style={s.startBtnSparkle}>✦</Text>
+                <Text style={s.startBtnText}>{card.emoji}  Start {name} Routine  →</Text>
+                <Text style={s.startBtnSparkle}>✦</Text>
+              </Pressable>
+            </Animated.View>
+          </>
+        )}
+
+        {/* ── Morning: Goals + Weight + Looks ── */}
+        {isMorning && (
+          <>
+            {!morningSettings.hideTodo && (
+              <MorningTodoList
+                userId={user.id}
+                theme={theme}
+                color={card.color}
+                onHide={async () => {
+                  const ns = { ...morningSettings, hideTodo: true }
+                  await saveMorningSettings(user.id, ns)
+                  setMorningSettings(ns)
+                }}
+              />
+            )}
+            {!morningSettings.hideWeight && (
+              <WeightTracker
+                userId={user.id}
+                theme={theme}
+                color={card.color}
+                morningSettings={morningSettings}
+                onUpdateSettings={setMorningSettings}
+              />
+            )}
+            {!morningSettings.hideLooks && (
+              <LooksSection
+                userId={user.id}
+                theme={theme}
+                onHide={async () => {
+                  const ns = { ...morningSettings, hideLooks: true }
+                  await saveMorningSettings(user.id, ns)
+                  setMorningSettings(ns)
+                }}
+              />
+            )}
+            {(morningSettings.hideTodo || morningSettings.hideWeight || morningSettings.hideLooks) && (
+              <View style={s.hiddenPillsRow}>
+                {morningSettings.hideTodo && (
+                  <Pressable
+                    style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
+                    onPress={async () => {
+                      const ns = { ...morningSettings, hideTodo: false }
+                      await saveMorningSettings(user.id, ns)
+                      setMorningSettings(ns)
+                    }}
+                  >
+                    <Text style={[s.hiddenPillText, { color: card.color }]}>+ Show goals</Text>
+                  </Pressable>
+                )}
+                {morningSettings.hideWeight && (
+                  <Pressable
+                    style={[s.hiddenPill, { borderColor: card.color + '40', backgroundColor: card.color + '10' }]}
+                    onPress={async () => {
+                      const ns = { ...morningSettings, hideWeight: false }
+                      await saveMorningSettings(user.id, ns)
+                      setMorningSettings(ns)
+                    }}
+                  >
+                    <Text style={[s.hiddenPillText, { color: card.color }]}>+ Show weight tracker</Text>
+                  </Pressable>
+                )}
+                {morningSettings.hideLooks && (
+                  <Pressable
+                    style={[s.hiddenPill, { borderColor: LOOKS_COLOR + '40', backgroundColor: LOOKS_COLOR + '10' }]}
+                    onPress={async () => {
+                      const ns = { ...morningSettings, hideLooks: false }
+                      await saveMorningSettings(user.id, ns)
+                      setMorningSettings(ns)
+                    }}
+                  >
+                    <Text style={[s.hiddenPillText, { color: LOOKS_COLOR }]}>+ Show looks</Text>
+                  </Pressable>
+                )}
+              </View>
+            )}
+          </>
+        )}
+
       </ScrollView>
 
       <AIRoutineModal

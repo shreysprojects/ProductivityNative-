@@ -2,6 +2,7 @@ import { useState, useCallback, useLayoutEffect, useEffect } from 'react'
 import {
   View, Text, Pressable, StyleSheet, FlatList, Modal,
   Alert, ActivityIndicator, ScrollView, TextInput, Switch, Share,
+  KeyboardAvoidingView, Platform,
 } from 'react-native'
 import { Image } from 'expo-image'
 import { router, useFocusEffect, useNavigation } from 'expo-router'
@@ -9,6 +10,7 @@ import { useAuth } from '../../lib/AuthContext'
 import { useTheme } from '../../lib/ThemeContext'
 import { supabase } from '../../lib/supabase'
 import { getRoutineNames, getRoutineTemplate } from '../../lib/storage'
+import { routineTheme } from '../../lib/themes'
 import { updateBio } from '../../lib/profileStorage'
 import { getUserGoals } from '../../lib/goalsStorage'
 import { getProductivitySessions } from '../../lib/productivityStorage'
@@ -358,7 +360,7 @@ function RoutineCard({ item, currentUserId, theme, onDelete, onReport }) {
 
       <View style={[ec.routineSection, { borderTopColor: theme.divider }]}>
         <View style={[ec.routinePill, { backgroundColor: theme.isDark ? 'rgba(99,102,241,0.18)' : '#eef2ff' }]}>
-          <Text style={ec.routinePillText}>{item.routine_name}</Text>
+          <Text style={ec.routinePillText}>{routineTheme(item.routine_name).emoji}  {item.routine_name}</Text>
         </View>
         <View style={ec.routineMeta}>
           {durStr && <Text style={[ec.routineMetaText, { color: theme.subtext }]}>⏱  {durStr}</Text>}
@@ -820,7 +822,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <View style={ec.overlay}>
+      <KeyboardAvoidingView style={ec.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <Pressable style={ec.overlayBg} onPress={onClose} />
         <View style={[ec.sheet, { backgroundColor: theme.card }]}>
           <View style={[ec.handle, { backgroundColor: theme.divider }]} />
@@ -882,7 +884,7 @@ function PostModal({ visible, theme, userId, userEmail, profile, unit, onClose, 
             </Pressable>
           </ScrollView>
         </View>
-      </View>
+      </KeyboardAvoidingView>
     </Modal>
   )
 }
@@ -1153,7 +1155,10 @@ export default function ExploreScreen() {
   }
 
   return (
-    <View style={[ec.page, { backgroundColor: theme.bg }]}>
+    <KeyboardAvoidingView
+      style={[ec.page, { backgroundColor: theme.bg }]}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       {/* Top tab bar */}
       <View style={[ec.topTabBar, { backgroundColor: theme.header, borderBottomColor: theme.divider }]}>
         <Pressable style={ec.topTab} onPress={() => setActiveTopTab('community')}>
@@ -1245,7 +1250,7 @@ export default function ExploreScreen() {
         onClose={() => setPostModalVisible(false)}
         onPost={() => { setPostModalVisible(false); fetchFeed() }}
       />
-    </View>
+    </KeyboardAvoidingView>
   )
 }
 
