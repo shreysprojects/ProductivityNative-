@@ -1545,9 +1545,18 @@ const wcs = StyleSheet.create({
   closeBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
 })
 
+function fmtRoutineDuration(tasks) {
+  const secs = tasks.reduce((s, t) => s + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
+  if (secs === 0) return `${tasks.length} task${tasks.length !== 1 ? 's' : ''}`
+  const mins = Math.round(secs / 60)
+  if (mins >= 60) return `~${Math.floor(mins / 60)}h${mins % 60 ? ' ' + (mins % 60) + 'm' : ''}`
+  if (mins >= 1) return `~${mins} min`
+  return `~${secs}s`
+}
+
 export default function RoutineScreen() {
   const { name } = useLocalSearchParams()
-  const { user } = useAuth()
+  const { user, profile } = useAuth()
   const { theme } = useTheme()
   const card = routineTheme(name)
   const isFitness = name === 'Fitness'
@@ -1594,6 +1603,25 @@ export default function RoutineScreen() {
   const startBtnScale = useRef(new Animated.Value(1)).current
   const doneAnim      = useRef(new Animated.Value(0)).current
 
+  // Morning greeting chooser: shown once when opening Morning before anything
+  // has been started today. { mainTime, altTime } or null.
+  const [chooser, setChooser] = useState(null)
+  const chooserAnim = useRef(new Animated.Value(0)).current
+
+  useEffect(() => {
+    if (chooser) {
+      chooserAnim.setValue(0)
+      Animated.timing(chooserAnim, { toValue: 1, duration: 650, useNativeDriver: true }).start()
+    }
+  }, [chooser])
+
+  function chooseVariant(v) {
+    Animated.timing(chooserAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => {
+      setChooser(null)
+      if (v === 'alt') switchVariant('alt')
+    })
+  }
+
   const load = useCallback(async () => {
     if (!user || !name) return
     // First open only: if today's progress lives on the alternative (and not
@@ -1607,6 +1635,18 @@ export default function RoutineScreen() {
       if (!mainRun && altRun) {
         setVariant('alt')
         return // variant change re-triggers load with the alt storage name
+      }
+      // Morning: greet + ask which version of the routine to do today,
+      // but only before anything has been started.
+      if (isMorning && !mainRun && !altRun) {
+        const [mainTmpl, altTmpl] = await Promise.all([
+          getRoutineTemplate(user.id, name),
+          getRoutineTemplate(user.id, altRoutineName(name)),
+        ])
+        setChooser({
+          mainTime: fmtRoutineDuration(mainTmpl),
+          altTime: altTmpl.length > 0 ? fmtRoutineDuration(altTmpl) : 'Not set up yet',
+        })
       }
     }
     const promises = [
@@ -2558,6 +2598,50 @@ export default function RoutineScreen() {
         theme={theme}
         color={card.color}
       />
+
+      {/* ── Morning greeting + Main/Alternative chooser ── */}
+      {chooser && (
+        <Animated.View
+          style={[s.chooserOverlay, {
+            backgroundColor: theme.bg,
+            opacity: chooserAnim.interpolate({ inputRange: [0, 0.15], outputRange: [0, 1], extrapolate: 'clamp' }),
+          }]}
+        >
+          <Animated.Text style={[s.chooserGreeting, {
+            color: theme.text,
+            opacity: chooserAnim.interpolate({ inputRange: [0.1, 0.45], outputRange: [0, 1], extrapolate: 'clamp' }),
+            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.1, 0.45], outputRange: [26, 0], extrapolate: 'clamp' }) }],
+          }]}>
+            ☀️ Good morning {(profile?.name?.trim() || 'there').split(' ')[0]}!
+          </Animated.Text>
+          <Animated.Text style={[s.chooserSub, {
+            color: theme.subtext,
+            opacity: chooserAnim.interpolate({ inputRange: [0.3, 0.65], outputRange: [0, 1], extrapolate: 'clamp' }),
+            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.3, 0.65], outputRange: [18, 0], extrapolate: 'clamp' }) }],
+          }]}>
+            How would you like to do your routine today?
+          </Animated.Text>
+          <Animated.View style={[s.chooserBtnRow, {
+            opacity: chooserAnim.interpolate({ inputRange: [0.5, 1], outputRange: [0, 1], extrapolate: 'clamp' }),
+            transform: [{ translateY: chooserAnim.interpolate({ inputRange: [0.5, 1], outputRange: [22, 0], extrapolate: 'clamp' }) }],
+          }]}>
+            <Pressable
+              style={[s.chooserBtn, { backgroundColor: card.color, shadowColor: card.color }]}
+              onPress={() => chooseVariant('main')}
+            >
+              <Text style={s.chooserBtnLabel}>Main</Text>
+              <Text style={s.chooserBtnTime}>⏱ {chooser.mainTime}</Text>
+            </Pressable>
+            <Pressable
+              style={[s.chooserBtn, s.chooserBtnOutline, { borderColor: card.color, backgroundColor: theme.card }]}
+              onPress={() => chooseVariant('alt')}
+            >
+              <Text style={[s.chooserBtnLabel, { color: card.color }]}>Alternative</Text>
+              <Text style={[s.chooserBtnTime, { color: theme.subtext }]}>⏱ {chooser.altTime}</Text>
+            </Pressable>
+          </Animated.View>
+        </Animated.View>
+      )}
     </View>
   )
 }
@@ -2698,6 +2782,23 @@ const s = StyleSheet.create({
   },
   altEmptyBtnFill: { borderWidth: 0 },
   altEmptyBtnText: { fontSize: 13, fontWeight: '700' },
+
+  chooserOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center', justifyContent: 'center',
+    paddingHorizontal: 28, zIndex: 20,
+  },
+  chooserGreeting: { fontSize: 30, fontWeight: '800', letterSpacing: -0.5, textAlign: 'center' },
+  chooserSub: { fontSize: 15, marginTop: 12, marginBottom: 30, textAlign: 'center', lineHeight: 21 },
+  chooserBtnRow: { flexDirection: 'row', gap: 12, alignSelf: 'stretch' },
+  chooserBtn: {
+    flex: 1, borderRadius: 18, paddingVertical: 18,
+    alignItems: 'center', gap: 4,
+    shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.25, shadowRadius: 12, elevation: 6,
+  },
+  chooserBtnOutline: { borderWidth: 2, shadowOpacity: 0 },
+  chooserBtnLabel: { fontSize: 17, fontWeight: '800', color: '#fff', letterSpacing: -0.2 },
+  chooserBtnTime: { fontSize: 12.5, fontWeight: '600', color: '#ffffffcc' },
 
   content: { padding: 16, paddingBottom: 64 },
 
