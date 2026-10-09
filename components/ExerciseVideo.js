@@ -6,20 +6,24 @@ import { WebView } from '@expo/dom-webview'
 // A YouTube demo video for an exercise.
 //
 // Shows the video's thumbnail with a play button first (plain image, always
-// renders), and only builds the inline player when tapped. The player loads
-// YouTube's own embed page as the webview's document rather than an iframe
-// inside a local page: YouTube refuses embeds that arrive without a referrer,
-// and a page served from file:// (a published bundle) has none. That refusal
-// is the "Video player configuration error" (153).
+// renders), and only builds the inline player when tapped.
+//
+// YouTube refuses an embed whose request has no Referer header: that is the
+// "Video player configuration error" (153). A webview loading YouTube's embed
+// URL directly sends none, and neither does a page served from a local file.
+// So the player loads a tiny page of ours on a real https origin (the
+// `player` edge function) that frames the video; the iframe request then
+// carries that origin as its referrer and YouTube plays it.
 //
 // The page pings back once it has loaded; if no ping arrives the box says so
-// and offers YouTube instead of sitting black. Links out of the player, such
-// as "Watch on YouTube", are caught inside the page and handed to the phone,
-// since the webview cannot open new windows. @expo/dom-webview ships with
-// SDK 57, so none of this needs a native rebuild.
+// and offers YouTube instead of sitting black. The webview cannot open new
+// windows, so the player's own "Watch on YouTube" link is inert; the button
+// under the box is the way out. @expo/dom-webview ships with SDK 57, so none
+// of this needs a native rebuild.
 
 const COLOR = '#6366f1'
 const LOAD_TIMEOUT_MS = 8000
+const PLAYER_PAGE = `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/player`
 
 const PAGE_SCRIPT = `
 (function () {
@@ -79,7 +83,7 @@ export default function ExerciseVideo({ videoId, height = 210, style }) {
         ) : (
           <View style={v.fill}>
             <WebView
-              source={{ uri: `https://www.youtube.com/embed/${videoId}?playsinline=1&rel=0&modestbranding=1&autoplay=1` }}
+              source={{ uri: `${PLAYER_PAGE}?v=${encodeURIComponent(videoId)}` }}
               style={v.web}
               allowsInlineMediaPlayback
               mediaPlaybackRequiresUserAction={false}
