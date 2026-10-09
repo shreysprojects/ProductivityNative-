@@ -4,6 +4,7 @@ import {
   ActivityIndicator, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
 } from 'react-native'
 import { mapNutriments } from './BarcodeScanner'
+import AIFoodEstimate from './AIFoodEstimate'
 
 // ── USDA FoodData Central normalization ────────────────────────────────────
 function normalizeUSDA(food) {
@@ -169,6 +170,9 @@ export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd,
   const [selected, setSelected] = useState(null)
   const [baseMacros, setBaseMacros] = useState(null)
   const [servings, setServings] = useState('1')
+  // "Ask AI": the databases don't know home-cooked or unbranded food, so the
+  // typed query can instead go to the estimator under the search bar.
+  const [aiMode, setAiMode] = useState(false)
 
   const search = async () => {
     if (!query.trim()) return
@@ -230,33 +234,66 @@ export default function FoodSearch({ section, sectionLabel, sectionColor, onAdd,
             <Pressable onPress={onClose} hitSlop={10}>
               <Text style={fs.cancel}>Cancel</Text>
             </Pressable>
-            <Text style={fs.headerTitle}>Search Foods</Text>
+            <Text style={fs.headerTitle}>{aiMode ? 'Ask AI' : 'Search Foods'}</Text>
             <View style={{ width: 56 }} />
           </View>
 
-          <View style={fs.searchBar}>
-            <TextInput
-              style={fs.searchInput}
-              placeholder="e.g. Greek yogurt, chicken breast…"
-              placeholderTextColor="#bbb"
-              value={query}
-              onChangeText={setQuery}
-              onSubmitEditing={search}
-              returnKeyType="search"
-              autoFocus={!selected}
-            />
-            <Pressable
-              style={[fs.searchBtn, { backgroundColor: query.trim() ? sectionColor : '#e5e7eb' }]}
-              onPress={search}
-              disabled={!query.trim() || loading}
-            >
-              <Text style={[fs.searchBtnText, { color: query.trim() ? '#fff' : '#aaa' }]}>
-                {loading ? '…' : 'Search'}
-              </Text>
-            </Pressable>
-          </View>
+          {!aiMode && (
+            <View style={fs.searchBar}>
+              <TextInput
+                style={fs.searchInput}
+                placeholder="e.g. Greek yogurt, chicken breast…"
+                placeholderTextColor="#bbb"
+                value={query}
+                onChangeText={setQuery}
+                onSubmitEditing={search}
+                returnKeyType="search"
+                autoFocus={!selected}
+              />
+              <Pressable
+                style={[fs.searchBtn, { backgroundColor: query.trim() ? sectionColor : '#e5e7eb' }]}
+                onPress={search}
+                disabled={!query.trim() || loading}
+              >
+                <Text style={[fs.searchBtnText, { color: query.trim() ? '#fff' : '#aaa' }]}>
+                  {loading ? '…' : 'Search'}
+                </Text>
+              </Pressable>
+            </View>
+          )}
 
-          {selected && baseMacros ? (
+          {/* The AI route sits right under the search bar, taking the same query */}
+          {!aiMode && !selected && (
+            <Pressable
+              style={[fs.aiRow, !query.trim() && fs.aiRowDisabled]}
+              onPress={() => setAiMode(true)}
+              disabled={!query.trim()}
+            >
+              <Text style={fs.aiRowIcon}>✨</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={fs.aiRowTitle} numberOfLines={1}>
+                  {query.trim() ? `Ask AI about “${query.trim()}”` : 'Ask AI to estimate a food'}
+                </Text>
+                <Text style={fs.aiRowDesc}>
+                  {query.trim()
+                    ? 'Answer a couple of questions, add a photo if you like, get every macro.'
+                    : 'Type what you ate first, then ask the AI to estimate it.'}
+                </Text>
+              </View>
+              <Text style={[fs.aiRowArrow, { color: query.trim() ? sectionColor : '#ccc' }]}>›</Text>
+            </Pressable>
+          )}
+
+          {aiMode ? (
+            <AIFoodEstimate
+              query={query.trim()}
+              section={section}
+              sectionLabel={sectionLabel}
+              sectionColor={sectionColor}
+              onAdd={onAdd}
+              onBack={() => setAiMode(false)}
+            />
+          ) : selected && baseMacros ? (
             <ProductDetail
               product={selected}
               baseMacros={baseMacros}
@@ -350,6 +387,17 @@ const fs = StyleSheet.create({
   searchInput: { flex: 1, borderWidth: 1.5, borderColor: '#e0e7ff', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 11, fontSize: 15, color: '#111', backgroundColor: '#fafbff' },
   searchBtn: { borderRadius: 12, paddingHorizontal: 16, alignItems: 'center', justifyContent: 'center', minWidth: 72 },
   searchBtnText: { fontWeight: '700', fontSize: 15 },
+
+  aiRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    marginHorizontal: 14, marginBottom: 6, padding: 12,
+    borderRadius: 14, backgroundColor: '#f5f3ff', borderWidth: 1, borderColor: '#e0e7ff',
+  },
+  aiRowDisabled: { opacity: 0.55 },
+  aiRowIcon: { fontSize: 20 },
+  aiRowTitle: { fontSize: 14, fontWeight: '700', color: '#111', marginBottom: 2 },
+  aiRowDesc: { fontSize: 12, color: '#888', lineHeight: 16 },
+  aiRowArrow: { fontSize: 24, fontWeight: '300' },
 
   list: { paddingHorizontal: 14, paddingTop: 8, paddingBottom: 40 },
   centered: { alignItems: 'center', paddingTop: 60, paddingHorizontal: 32 },
