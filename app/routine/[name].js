@@ -20,7 +20,7 @@ import {
   getDayTodos, saveDayTodos, getWorkoutLog, getAllWorkoutLogs, today, getRoutineSettings,
   getWeightLogs, saveWeightLog, getMorningSettings, saveMorningSettings,
   getLooksData, saveLooksData, quickCheckToggle,
-  setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine,
+  setLooksInRoutine, syncIntegratedTasks, altRoutineName, wipeAltRoutine, taskGoalSecs,
 } from '../../lib/storage'
 import AIRoutineModal from '../../components/AIRoutineModal'
 import MuscleMap from '../../components/MuscleMap'
@@ -648,7 +648,28 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
       const { data, error } = await supabase.functions.invoke('openai-proxy', {
         body: { action: 'analyze_looks', base64 },
       })
-      if (error) throw new Error(error.message ?? 'Request failed')
+      if (error) {
+        // Limits/flags/oversized photos come back as non-2xx, so the reason is on the error body.
+        let detail = null
+        try { detail = await error.context?.json() } catch {}
+        if (detail?.error === 'daily_limit') {
+          Alert.alert('Daily limit reached', detail.reason)
+          return
+        }
+        if (detail?.error === 'image_too_large') {
+          Alert.alert('Photo too large', detail.reason)
+          return
+        }
+        if (detail?.error === 'flagged') {
+          Alert.alert('Inappropriate Image', 'Please only upload appropriate photos for skin analysis.')
+          return
+        }
+        if (detail?.error === 'moderation_unavailable') {
+          Alert.alert('Try again', detail.reason)
+          return
+        }
+        throw new Error(detail?.reason ?? error.message ?? 'Request failed')
+      }
       if (data?.error === 'daily_limit') {
         Alert.alert('Daily limit reached', data.reason)
         return
@@ -862,8 +883,11 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
           <Pressable style={lks.disclaimerBg} onPress={() => setShowDisclaimer(false)} />
           <View style={[lks.disclaimerCard, { backgroundColor: theme.card }]}>
             <Text style={[lks.disclaimerTitle, { color: theme.text }]}>AI Skin Analysis</Text>
+            <Text style={[lks.disclaimerBody, { color: theme.subtext, marginBottom: 12 }]}>
+              By continuing, you agree that your photo is sent securely to our AI provider (OpenAI) for a one-time analysis. It is not stored after the analysis, and it is used only to generate your skincare and haircare suggestions.
+            </Text>
             <Text style={[lks.disclaimerBody, { color: theme.subtext }]}>
-              By continuing, you understand this feature is for general self-care guidance only. For serious, painful, or worsening skin concerns, please speak with a dermatologist or healthcare professional.
+              This feature is for general self-care guidance only. For serious, painful, or worsening skin concerns, please speak with a dermatologist or healthcare professional.
             </Text>
             <View style={lks.disclaimerBtns}>
               <Pressable
@@ -876,7 +900,7 @@ function LooksSection({ userId, theme, onHide, integrated, onToggleIntegrate }) 
                 style={[lks.disclaimerConfirmBtn, { backgroundColor: LOOKS_COLOR }]}
                 onPress={startAnalysis}
               >
-                <Text style={lks.disclaimerConfirmText}>Continue →</Text>
+                <Text style={lks.disclaimerConfirmText}>Agree & continue →</Text>
               </Pressable>
             </View>
           </View>
@@ -1546,12 +1570,61 @@ const wcs = StyleSheet.create({
 })
 
 function fmtRoutineDuration(tasks) {
-  const secs = tasks.reduce((s, t) => s + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0)
+  const secs = tasks.reduce((s, t) => s + taskGoalSecs(t), 0)
   if (secs === 0) return `${tasks.length} task${tasks.length !== 1 ? 's' : ''}`
   const mins = Math.round(secs / 60)
   if (mins >= 60) return `~${Math.floor(mins / 60)}h${mins % 60 ? ' ' + (mins % 60) + 'm' : ''}`
   if (mins >= 1) return `~${mins} min`
   return `~${secs}s`
+}
+
+// Single-field name prompt. `prompt` is { title, message, placeholder,
+// initialValue, onSubmit } or null when closed.
+function NamePromptModal({ prompt, theme, color, onClose }) {
+  const [value, setValue] = useState('')
+
+  useEffect(() => {
+    if (prompt) setValue(prompt.initialValue ?? '')
+  }, [prompt])
+
+  function submit() {
+    const submitted = value
+    const handler = prompt?.onSubmit
+    onClose()
+    handler?.(submitted)
+  }
+
+  return (
+    <Modal visible={!!prompt} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={s.promptOverlay}>
+        <Pressable style={s.promptBg} onPress={onClose} />
+        <View style={[s.promptCard, { backgroundColor: theme.card }]}>
+          <Text style={[s.promptTitle, { color: theme.text }]}>{prompt?.title}</Text>
+          {prompt?.message ? (
+            <Text style={[s.promptMessage, { color: theme.subtext }]}>{prompt.message}</Text>
+          ) : null}
+          <TextInput
+            style={[s.promptInput, { color: theme.text, backgroundColor: theme.input, borderColor: theme.inputBorder }]}
+            value={value}
+            onChangeText={setValue}
+            placeholder={prompt?.placeholder}
+            placeholderTextColor={theme.muted}
+            autoFocus
+            returnKeyType="done"
+            onSubmitEditing={submit}
+          />
+          <View style={s.promptBtns}>
+            <Pressable style={[s.promptCancelBtn, { borderColor: theme.cardBorder }]} onPress={onClose}>
+              <Text style={[s.promptCancelText, { color: theme.subtext }]}>Cancel</Text>
+            </Pressable>
+            <Pressable style={[s.promptSaveBtn, { backgroundColor: color }]} onPress={submit}>
+              <Text style={s.promptSaveText}>Save</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
 }
 
 export default function RoutineScreen() {
@@ -1574,6 +1647,8 @@ export default function RoutineScreen() {
   const [template, setTemplate] = useState([])
   const [run, setRun] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(false)
+  const [namePrompt, setNamePrompt] = useState(null)
   const [routineDesc, setRoutineDesc] = useState('')
   const [gymSplit, setGymSplit] = useState(null)
   const [morningSettings, setMorningSettings] = useState({ hideTodo: false, hideWeight: false, hideLooks: false, weightGoal: null, targetWeight: null })
@@ -1635,59 +1710,79 @@ export default function RoutineScreen() {
 
   const load = useCallback(async () => {
     if (!user || !name) return
-    // First open only: if today's progress lives on the alternative (and not
-    // the main), land on the Alternative tab so the user sees where they left off.
-    if (!autoPickedVariant.current) {
-      autoPickedVariant.current = true
-      const [mainRun, altRun] = await Promise.all([
-        getTodayRun(user.id, name),
-        getTodayRun(user.id, altRoutineName(name)),
-      ])
-      if (!mainRun && altRun) {
-        setChooserPending(false)
-        setVariant('alt')
-        return // variant change re-triggers load with the alt storage name
-      }
-      // Morning: greet + ask which version of the routine to do today,
-      // but only before anything has been started.
-      if (isMorning && !mainRun && !altRun) {
-        const [mainTmpl, altTmpl] = await Promise.all([
-          getRoutineTemplate(user.id, name),
-          getRoutineTemplate(user.id, altRoutineName(name)),
+    // Set when this pass hands off to a re-run under the other variant: the
+    // loading state has to stay up so the old variant never flashes in between.
+    let handedOff = false
+    setError(false)
+    try {
+      // First open only: if today's progress lives on the alternative (and not
+      // the main), land on the Alternative tab so the user sees where they left off.
+      if (!autoPickedVariant.current) {
+        autoPickedVariant.current = true
+        const [mainRun, altRun] = await Promise.all([
+          getTodayRun(user.id, name),
+          getTodayRun(user.id, altRoutineName(name)),
         ])
-        setChooser({
-          mainTime: fmtRoutineDuration(mainTmpl),
-          altTime: altTmpl.length > 0 ? fmtRoutineDuration(altTmpl) : 'Not set up yet',
-        })
-      } else {
-        setChooserPending(false)
+        if (!mainRun && altRun) {
+          setChooserPending(false)
+          setVariant('alt')
+          handedOff = true
+          return // variant change re-triggers load with the alt storage name
+        }
+        // Morning: greet + ask which version of the routine to do today,
+        // but only before anything has been started.
+        if (isMorning && !mainRun && !altRun) {
+          const [mainTmpl, altTmpl] = await Promise.all([
+            getRoutineTemplate(user.id, name),
+            getRoutineTemplate(user.id, altRoutineName(name)),
+          ])
+          setChooser({
+            mainTime: fmtRoutineDuration(mainTmpl),
+            altTime: altTmpl.length > 0 ? fmtRoutineDuration(altTmpl) : 'Not set up yet',
+          })
+        } else {
+          setChooserPending(false)
+        }
       }
+      const promises = [
+        getRoutineTemplate(user.id, storageName),
+        getTodayRun(user.id, storageName),
+        isFitness ? getGymSplit(user.id) : Promise.resolve(null),
+        getRoutineSettings(user.id, name),
+      ]
+      let [tmpl, todayRun, split, rSettings] = await Promise.all(promises)
+      setRoutineDesc(rSettings?.description ?? '')
+      if (isMorning && !isAlt) {
+        tmpl = await syncIntegratedTasks(user.id, name, tmpl)
+        // Re-read: syncing Looks tasks in also folds them into a run that is
+        // already underway, which the copy read above predates.
+        todayRun = await getTodayRun(user.id, storageName)
+      }
+      setTemplate(tmpl)
+      setRun(todayRun)
+      if (isFitness) {
+        setGymSplit(split ?? null)
+        const routines = await getWorkoutRoutineList(user.id)
+        setAllRoutines(routines)
+      }
+      if (isMorning) {
+        const ms = await getMorningSettings(user.id)
+        setMorningSettings(ms)
+      }
+      Animated.timing(contentFade, { toValue: 1, duration: 160, useNativeDriver: true }).start()
+    } catch {
+      setError(true)
+    } finally {
+      if (!handedOff) setLoading(false)
     }
-    const promises = [
-      getRoutineTemplate(user.id, storageName),
-      getTodayRun(user.id, storageName),
-      isFitness ? getGymSplit(user.id) : Promise.resolve(null),
-      getRoutineSettings(user.id, name),
-    ]
-    let [tmpl, todayRun, split, rSettings] = await Promise.all(promises)
-    setRoutineDesc(rSettings?.description ?? '')
-    if (isMorning && !isAlt) {
-      tmpl = await syncIntegratedTasks(user.id, name, tmpl)
-    }
-    setTemplate(tmpl)
-    setRun(todayRun)
-    if (isFitness) {
-      setGymSplit(split ?? null)
-      const routines = await getWorkoutRoutineList(user.id)
-      setAllRoutines(routines)
-    }
-    if (isMorning) {
-      const ms = await getMorningSettings(user.id)
-      setMorningSettings(ms)
-    }
-    setLoading(false)
-    Animated.timing(contentFade, { toValue: 1, duration: 160, useNativeDriver: true }).start()
   }, [user, name, storageName, isAlt, isFitness, isMorning])
+
+  function retryLoad() {
+    autoPickedVariant.current = false
+    setError(false)
+    setLoading(true)
+    load()
+  }
 
   useFocusEffect(useCallback(() => { load() }, [load]))
 
@@ -1803,6 +1898,9 @@ export default function RoutineScreen() {
   async function applyAITasks(tasks) {
     await saveRoutineTemplate(user.id, storageName, tasks)
     setTemplate(tasks)
+    // Saving folds the new tasks into a run that's underway; pull the result
+    // back so the steps on screen match what was just saved.
+    setRun(await getTodayRun(user.id, storageName))
   }
 
   // Clear the alternative back to its empty state. Past completed days stay.
@@ -1863,16 +1961,17 @@ export default function RoutineScreen() {
   }
 
   function createNewRoutine() {
-    Alert.prompt(
-      'New Workout',
-      'Name your workout (e.g. Push Day, Full Body)',
-      routineName => {
+    setNamePrompt({
+      title: 'New Workout',
+      message: 'Name your workout (e.g. Push Day, Full Body)',
+      placeholder: 'Push Day',
+      initialValue: '',
+      onSubmit: routineName => {
         const trimmed = routineName?.trim()
         if (!trimmed) return
         router.push('/workout-library?muscleGroup=' + encodeURIComponent(trimmed))
       },
-      'plain-text',
-    )
+    })
   }
 
   async function openRoutinePreview(routine) {
@@ -1903,10 +2002,12 @@ export default function RoutineScreen() {
   }
 
   function promptRenameRoutine(oldName) {
-    Alert.prompt(
-      'Rename Workout',
-      `New name for "${oldName}"`,
-      async newName => {
+    setNamePrompt({
+      title: 'Rename Workout',
+      message: `New name for "${oldName}"`,
+      placeholder: oldName,
+      initialValue: oldName,
+      onSubmit: async newName => {
         const clean = newName?.trim()
         if (!clean || clean === oldName) return
         try {
@@ -1916,9 +2017,7 @@ export default function RoutineScreen() {
           Alert.alert('Rename failed', e.message)
         }
       },
-      'plain-text',
-      oldName,
-    )
+    })
   }
 
   function openWorkoutMenu(routineName) {
@@ -1947,6 +2046,18 @@ export default function RoutineScreen() {
           <Text style={[s.modeBtnText, { color: viewMode === 'checklist' ? '#fff' : theme.subtext }]}>
             Checklist
           </Text>
+        </Pressable>
+      </View>
+    )
+  }
+
+  if (error) {
+    return (
+      <View style={[s.page, s.errorWrap, { backgroundColor: theme.bg }]}>
+        <Text style={[s.errorTitle, { color: theme.text }]}>Something went wrong loading this routine.</Text>
+        <Text style={[s.errorSub, { color: theme.subtext }]}>Check your connection and try again.</Text>
+        <Pressable style={[s.errorBtn, { backgroundColor: card.color }]} onPress={retryLoad}>
+          <Text style={s.errorBtnText}>Retry</Text>
         </Pressable>
       </View>
     )
@@ -2159,8 +2270,8 @@ export default function RoutineScreen() {
                   </View>
                   <Text style={s.previewBannerCountText}>
                     {template.length} task{template.length !== 1 ? 's' : ''}
-                    {template.some(t => (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60) > 0)
-                      ? `  ·  ${fmtGoalSecs(template.reduce((sum, t) => sum + (t.timeGoalSecs ?? (t.timeGoalMins ?? 0) * 60), 0))} goal`
+                    {template.some(t => taskGoalSecs(t) > 0)
+                      ? `  ·  ${fmtGoalSecs(template.reduce((sum, t) => sum + taskGoalSecs(t), 0))} goal`
                       : ''}
                   </Text>
                 </View>
@@ -2473,14 +2584,14 @@ export default function RoutineScreen() {
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={[s.previewTaskText, { color: theme.text }]}>{task.text}</Text>
-                  {(task.subTasks?.length > 0 || (task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0) && (
+                  {(task.subTasks?.length > 0 || taskGoalSecs(task) > 0) && (
                     <View style={s.previewTaskMeta}>
                       {task.subTasks?.length > 0 && (
                         <Text style={[s.previewSub, { color: card.color }]}>{task.subTasks.length} steps</Text>
                       )}
-                      {(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60) > 0 && (
+                      {taskGoalSecs(task) > 0 && (
                         <View style={[s.previewGoalChip, { backgroundColor: card.color + '18' }]}>
-                          <Text style={[s.previewGoalText, { color: card.color }]}>⏱ {fmtGoalSecs(task.timeGoalSecs ?? (task.timeGoalMins ?? 0) * 60)}</Text>
+                          <Text style={[s.previewGoalText, { color: card.color }]}>⏱ {fmtGoalSecs(taskGoalSecs(task))}</Text>
                         </View>
                       )}
                     </View>
@@ -2620,6 +2731,13 @@ export default function RoutineScreen() {
         onApplyTasks={applyAITasks}
         theme={theme}
         color={card.color}
+      />
+
+      <NamePromptModal
+        prompt={namePrompt}
+        theme={theme}
+        color={card.color}
+        onClose={() => setNamePrompt(null)}
       />
 
       {/* ── Morning greeting + Main/Alternative chooser ── */}
@@ -3105,6 +3223,32 @@ const s = StyleSheet.create({
   clItemText: { fontSize: 17, fontWeight: '600' },
   clItemDone: { textDecorationLine: 'line-through', opacity: 0.38 },
   clSubCount: { fontSize: 12, fontWeight: '600', marginTop: 3 },
+
+  errorWrap: { alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 },
+  errorTitle: { fontSize: 17, fontWeight: '700', textAlign: 'center', letterSpacing: -0.2 },
+  errorSub: { fontSize: 14, textAlign: 'center', marginTop: 8, lineHeight: 20 },
+  errorBtn: { borderRadius: 14, paddingVertical: 13, paddingHorizontal: 40, marginTop: 22 },
+  errorBtnText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+
+  promptOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 28 },
+  promptBg: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)' },
+  promptCard: {
+    borderRadius: 24, padding: 24, width: '100%',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2, shadowRadius: 24, elevation: 12,
+  },
+  promptTitle: { fontSize: 18, fontWeight: '800', letterSpacing: -0.3 },
+  promptMessage: { fontSize: 14, lineHeight: 20, marginTop: 8 },
+  promptInput: {
+    borderRadius: 12, borderWidth: 1.5,
+    paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 15, fontWeight: '600', marginTop: 16,
+  },
+  promptBtns: { flexDirection: 'row', gap: 10, marginTop: 18 },
+  promptCancelBtn: { flex: 1, borderRadius: 12, paddingVertical: 13, alignItems: 'center', borderWidth: 1.5 },
+  promptCancelText: { fontWeight: '600', fontSize: 14 },
+  promptSaveBtn: { flex: 2, borderRadius: 12, paddingVertical: 13, alignItems: 'center' },
+  promptSaveText: { color: '#fff', fontWeight: '700', fontSize: 14 },
 })
 
 // ── Weight tracker styles ──────────────────────────────────────────────────
